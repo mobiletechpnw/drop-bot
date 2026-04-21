@@ -14,6 +14,7 @@ Manager/Admin commands (bot deletes your message silently, confirms via DM):
   !addstock <item> <qty> <price>   — Add item, e.g. !addstock PRE ETB 1 $100
   !removestockitem <item>          — Remove an item from staging
   !release                         — Post the drop publicly and open claiming
+  !autoclose on/off                — Toggle auto-close when sold out (default: on)
   !claimlist                       — See who claimed what
   !enddrop                         — Close drop, post final list, DM all claimers
 
@@ -38,12 +39,11 @@ intents.message_content = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
 # ── PER-SERVER STATE ──────────────────────────────────────────────────────────
-# All state is keyed by guild_id so multiple servers are fully independent
 
 # server_admins[guild_id] = user_id
 server_admins = {}
 
-# server_managers[guild_id] = set of user_ids (includes admin)
+# server_managers[guild_id] = set of user_ids
 server_managers = defaultdict(set)
 
 # session_state[guild_id] = "closed" | "staging" | "live"
@@ -55,11 +55,15 @@ stock = defaultdict(dict)
 # claims[guild_id][item_key] = [{"user": member, "qty": int, "time": datetime}, ...]
 claims = defaultdict(lambda: defaultdict(list))
 
-# stock_message[guild_id] = Message (the live embed)
+# stock_message[guild_id] = Message
 stock_message = {}
 
 # pinned_message[guild_id] = Message
 pinned_message = {}
+
+# autoclose[guild_id] = True | False (default True)
+autoclose = defaultdict(lambda: True)
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -77,6 +81,17 @@ def is_manager(guild_id, user_id):
 
 def is_admin(guild_id, user_id):
     return server_admins.get(guild_id) == user_id
+
+
+def all_sold_out(guild_id):
+    """Returns True if every item in the drop has zero remaining."""
+    if not stock[guild_id]:
+        return False
+    for key, info in stock[guild_id].items():
+        claimed = sum(c["qty"] for c in claims[guild_id][key])
+        if info["qty"] - claimed > 0:
+            return False
+    return True
 
 
 def build_stock_embed(guild_id):
@@ -121,6 +136,38 @@ async def update_stock_embed(guild_id):
             stock_message.pop(guild_id, None)
 
 
+async def close_drop(channel, guild_id):
+    """Shared drop-closing logic used by both !enddrop and autoclose."""
+    session_state[guild_id] = "closed"
+
+    # Unpin stock embed
+    pin = pinned_message.pop(guild_id, None)
+    if pin:
+        try:
+            await pin.unpin()
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    # Post final claim list
+    embed = build_claimlist_embed(guild_id, title="🔴  Drop CLOSED — Final Claim List")
+    await channel.send(embed=embed)
+
+    # DM every claimer their summary
+    claimer_totals = defaultdict(list)
+    for key, claim_list in claims[guild_id].items():
+        for c in claim_list:
+            subtotal = c["qty"] * stock[guild_id][key]["price"]
+            claimer_totals[c["user"]].append((stock[guild_id][key]["display"], c["qty"], subtotal))
+
+    for user, items in claimer_totals.items():
+        total = sum(subtotal for _, _, subtotal in items)
+        lines = "\n".join(f"• **{display}**  ×{qty}  — ${subtotal:.2f}" for display, qty, subtotal in items)
+        try:
+            await user.send(f"🧾  **Drop closed! Here's your order summary:**\n{lines}\n**Total owed: ${total:.2f}**\n\nPlease send payment to complete your order!")
+        except discord.Forbidden:
+            pass
+
+
 async def silent(ctx):
     try:
         await ctx.message.delete()
@@ -131,13 +178,6 @@ async def silent(ctx):
 async def dm(ctx, message):
     try:
         await ctx.author.send(message)
-    except discord.Forbidden:
-        pass
-
-
-async def dm_user(user, message):
-    try:
-        await user.send(message)
     except discord.Forbidden:
         pass
 
@@ -219,8 +259,9 @@ async def cmd_drop(ctx):
     claims[guild_id] = defaultdict(list)
     stock_message.pop(guild_id, None)
     pinned_message.pop(guild_id, None)
+    autoclose[guild_id] = True  # reset to default on each new drop
     await silent(ctx)
-    await dm(ctx, "✅  Drop session started! Load items with `!addstock <item> <qty> <price>`, then `!release` to go live.")
+    await dm(ctx, "✅  Drop session started! Load items with `!addstock <item> <qty> <price>`, then `!release` to go live.\n💡  Auto-close is **ON** — drop will close automatically when sold out. Use `!autoclose off` to disable.")
 
 
 @bot.command(name="addstock")
@@ -272,6 +313,23 @@ async def cmd_removestockitem(ctx, *, item_name=""):
     await dm(ctx, f"🗑️  **{removed['display']}** removed from stock.")
 
 
+@bot.command(name="autoclose")
+async def cmd_autoclose(ctx, toggle: str = ""):
+    guild_id = ctx.guild.id
+    if not is_manager(guild_id, ctx.author.id):
+        return
+    await silent(ctx)
+    if toggle.lower() == "on":
+        autoclose[guild_id] = True
+        await dm(ctx, "✅  Auto-close is now **ON** — drop will close automatically when sold out.")
+    elif toggle.lower() == "off":
+        autoclose[guild_id] = False
+        await dm(ctx, "✅  Auto-close is now **OFF** — use `!enddrop` to close manually.")
+    else:
+        status = "ON" if autoclose[guild_id] else "OFF"
+        await dm(ctx, f"Auto-close is currently **{status}**. Use `!autoclose on` or `!autoclose off` to change.")
+
+
 @bot.command(name="release")
 async def cmd_release(ctx):
     guild_id = ctx.guild.id
@@ -304,31 +362,7 @@ async def cmd_enddrop(ctx):
     if session_state[guild_id] != "live":
         await dm(ctx, "⚠️  No active drop to end.")
         return
-    session_state[guild_id] = "closed"
-
-    # Unpin stock embed
-    pin = pinned_message.pop(guild_id, None)
-    if pin:
-        try:
-            await pin.unpin()
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-
-    # Post final claim list
-    embed = build_claimlist_embed(guild_id, title="🔴  Drop CLOSED — Final Claim List")
-    await ctx.send(embed=embed)
-
-    # DM every claimer their summary
-    claimer_totals = defaultdict(list)
-    for key, claim_list in claims[guild_id].items():
-        for c in claim_list:
-            subtotal = c["qty"] * stock[guild_id][key]["price"]
-            claimer_totals[c["user"]].append((stock[guild_id][key]["display"], c["qty"], subtotal))
-
-    for user, items in claimer_totals.items():
-        total = sum(subtotal for _, _, subtotal in items)
-        lines = "\n".join(f"• **{display}**  ×{qty}  — ${subtotal:.2f}" for display, qty, subtotal in items)
-        await dm_user(user, f"🧾  **Drop closed! Here's your order summary:**\n{lines}\n**Total owed: ${total:.2f}**\n\nPlease send payment to complete your order!")
+    await close_drop(ctx.channel, guild_id)
 
 
 @bot.command(name="claimlist")
@@ -407,6 +441,11 @@ async def cmd_claim(ctx, *, args=""):
     total_cost = qty * info["price"]
     await ctx.send(f"✅  **{ctx.author.display_name}** claimed **{qty}x {info['display']}** — ${total_cost:.2f}  •  {new_remaining} left")
     await update_stock_embed(guild_id)
+
+    # Auto-close if everything is sold out
+    if autoclose[guild_id] and all_sold_out(guild_id):
+        await ctx.send("🎉  **Everything is claimed!** Closing the drop...")
+        await close_drop(ctx.channel, guild_id)
 
 
 @bot.command(name="unclaim")
