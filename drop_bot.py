@@ -23,14 +23,13 @@ import discord
 from discord.ext import commands
 from collections import defaultdict
 import datetime
+import os
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-import os
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-OWNER_ID   = int(os.environ["OWNER_ID"])   # your Discord user ID (integer)
+OWNER_ID   = int(os.environ["OWNER_ID"])
 PREFIX     = "!"
 # ─────────────────────────────────────────────────────────────────────────────
-
 intents = discord.Intents.default()
 intents.message_content = True
 
