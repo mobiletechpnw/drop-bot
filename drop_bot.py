@@ -1,22 +1,18 @@
 """
 Vault & Pine Drop Bot
 =====================
-Commands (owner only unless noted):
-  !drop               — Start a new drop session
-  !addstock <item> <qty> <price>  — Add item to current drop
-                                    e.g. !addstock gardevoir 3 85
-  !stock              — Show current inventory (anyone)
-  !enddrop            — End the session and print final claim list
+Owner commands (bot deletes your message silently, confirms via DM):
+  !drop                            — Start a new drop session
+  !addstock <item> <qty> <price>   — Add item, e.g. !addstock PRE ETB 1 $100
+                                     Price can be $100 or 100
+  !release                         — Post the drop publicly and open claiming
+  !claimlist                       — See who claimed what (owner only)
+  !enddrop                         — Close the drop and post final claim list
 
-Commands (anyone):
-  !claim <item> <qty> — Claim item(s), e.g. !claim gardevoir 1
-  !myclaims           — See your own claims
-
-Setup:
-  1. pip install discord.py
-  2. Replace BOT_TOKEN with your bot token from discord.dev
-  3. Replace OWNER_ID with your Discord user ID (right-click yourself > Copy ID)
-  4. Run: python drop_bot.py
+Public commands (anyone):
+  !claim <item> <qty>              — e.g. !claim PRE ETB 1
+  !stock                           — Show current inventory
+  !myclaims                        — See your own claims and total
 """
 
 import discord
@@ -27,54 +23,56 @@ import os
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
-PREFIX     = "!"
+OWNER_ID  = int(os.environ.get("OWNER_ID", "0"))
+PREFIX    = "!"
 # ─────────────────────────────────────────────────────────────────────────────
 
 intents = discord.Intents.default()
 intents.message_content = True
- 
+
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
- 
+
 # ── STATE ─────────────────────────────────────────────────────────────────────
-drop_active = False
- 
+# "staging" = !drop used, owner loading stock, not visible to public
+# "live"    = !release used, claiming is open
+# "closed"  = no active session
+session_state = "closed"
+
 # stock[item_key] = {"display": str, "qty": int, "price": float}
 stock = {}
- 
-# claims[item_key] = [ {"user": member, "qty": int, "time": datetime}, ... ]
+
+# claims[item_key] = [{"user": member, "qty": int, "time": datetime}, ...]
 claims = defaultdict(list)
 # ─────────────────────────────────────────────────────────────────────────────
- 
- 
-def item_key(name: str) -> str:
-    """Normalize item name for dict lookups."""
+
+
+def normalize(name: str) -> str:
     return name.lower().strip()
- 
- 
+
+
+def parse_price(price_str: str) -> float:
+    return float(price_str.lstrip("$"))
+
+
 def build_stock_embed() -> discord.Embed:
     embed = discord.Embed(
-        title="🛒  Current Drop Stock",
+        title="🛒  Drop Stock",
         color=discord.Color.gold(),
         timestamp=datetime.datetime.utcnow()
     )
-    if not stock:
-        embed.description = "No items added yet."
-        return embed
- 
     for key, info in stock.items():
-        qty_left = info["qty"] - sum(c["qty"] for c in claims[key])
-        status = f"${info['price']:.2f} each  •  **{qty_left}** of {info['qty']} left"
+        claimed = sum(c["qty"] for c in claims[key])
+        qty_left = info["qty"] - claimed
+        status = f"**${info['price']:.2f}** each  •  **{qty_left}** of {info['qty']} remaining"
         if qty_left <= 0:
-            status += "  🚫 SOLD OUT"
+            status += "  🚫 **SOLD OUT**"
         embed.add_field(name=info["display"], value=status, inline=False)
- 
     return embed
- 
- 
-def build_claimlist_embed() -> discord.Embed:
+
+
+def build_claimlist_embed(title="📋  Claim List") -> discord.Embed:
     embed = discord.Embed(
-        title="📋  Claim List",
+        title=title,
         color=discord.Color.blurple(),
         timestamp=datetime.datetime.utcnow()
     )
@@ -83,9 +81,10 @@ def build_claimlist_embed() -> discord.Embed:
         if not claim_list:
             continue
         any_claims = True
-        lines = []
-        for c in claim_list:
-            lines.append(f"• {c['user'].display_name}  ×{c['qty']}")
+        lines = [
+            f"• **{c['user'].display_name}**  ×{c['qty']}  — ${c['qty'] * stock[key]['price']:.2f}"
+            for c in claim_list
+        ]
         embed.add_field(
             name=stock[key]["display"] if key in stock else key,
             value="\n".join(lines),
@@ -94,156 +93,190 @@ def build_claimlist_embed() -> discord.Embed:
     if not any_claims:
         embed.description = "No claims yet."
     return embed
- 
- 
+
+
+async def silent(ctx):
+    """Try to delete the owner's command message."""
+    try:
+        await ctx.message.delete()
+    except (discord.Forbidden, discord.NotFound):
+        pass
+
+
+async def dm(ctx, message):
+    """DM the owner a confirmation or error."""
+    try:
+        await ctx.author.send(message)
+    except discord.Forbidden:
+        pass
+
+
 # ── EVENTS ────────────────────────────────────────────────────────────────────
- 
+
 @bot.event
 async def on_ready():
     print(f"✅  Logged in as {bot.user} ({bot.user.id})")
- 
- 
+
+
 # ── OWNER COMMANDS ────────────────────────────────────────────────────────────
- 
+
 @bot.command(name="drop")
 async def cmd_drop(ctx):
     if ctx.author.id != OWNER_ID:
         return
-    global drop_active, stock, claims
-    drop_active = False  # not open to public until !release
+    global session_state, stock, claims
+    session_state = "staging"
     stock = {}
     claims = defaultdict(list)
-    await ctx.message.delete()
-    # Silent confirmation via DM only
-    await ctx.author.send("✅  Drop session started. Use `!addstock` to load items, then `!release` to go live.")
- 
- 
+    await silent(ctx)
+    await dm(ctx, "✅  Drop session started! Load items with `!addstock <item> <qty> <price>`, then `!release` to go live.")
+
+
 @bot.command(name="addstock")
 async def cmd_addstock(ctx, *, args: str = ""):
     if ctx.author.id != OWNER_ID:
         return
-    if stock is None or (not stock and not drop_active):
-        await ctx.author.send("⚠️  No active drop session. Use `!drop` first.")
-        await ctx.message.delete()
+    await silent(ctx)
+
+    if session_state == "closed":
+        await dm(ctx, "⚠️  No drop session active. Use `!drop` first.")
         return
- 
-    parts = args.rsplit(maxsplit=2)
+
+    parts = args.split()
     if len(parts) < 3:
-        await ctx.author.send("Usage: `!addstock <item name> <qty> <price>`\nExample: `!addstock gardevoir poster 3 85`")
-        await ctx.message.delete()
+        await dm(ctx, "Usage: `!addstock <item name> <qty> <price>`\nExample: `!addstock PRE ETB 1 100`")
         return
- 
-    item_name, qty_str, price_str = parts[0], parts[1], parts[2]
- 
+
+    price_str = parts[-1]
+    qty_str   = parts[-2]
+    item_name = " ".join(parts[:-2])
+
     try:
         qty   = int(qty_str)
-        price = float(price_str)
+        price = parse_price(price_str)
     except ValueError:
-        await ctx.author.send("⚠️  Qty must be a whole number and price a number. Example: `!addstock gardevoir 3 85`")
-        await ctx.message.delete()
+        await dm(ctx, f"⚠️  Couldn't read qty/price from `{qty_str}` / `{price_str}`\nFormat: `!addstock PRE ETB 1 100`")
         return
- 
-    key = item_key(item_name)
-    stock[key] = {"display": item_name.title(), "qty": qty, "price": price}
- 
-    await ctx.message.delete()
-    await ctx.author.send(f"✅  Loaded **{item_name.title()}** — {qty} @ ${price:.2f} each.")
- 
- 
+
+    key = normalize(item_name)
+    stock[key] = {"display": item_name.upper(), "qty": qty, "price": price}
+    await dm(ctx, f"✅  **{item_name.upper()}** — {qty} @ ${price:.2f} each added.")
+
+
 @bot.command(name="release")
 async def cmd_release(ctx):
     if ctx.author.id != OWNER_ID:
         return
-    if not stock:
-        await ctx.author.send("⚠️  No stock loaded. Use `!addstock` first.")
-        await ctx.message.delete()
+    await silent(ctx)
+
+    if session_state == "closed":
+        await dm(ctx, "⚠️  No drop session active. Use `!drop` first.")
         return
-    global drop_active
-    drop_active = True
-    await ctx.message.delete()
+    if not stock:
+        await dm(ctx, "⚠️  No stock loaded. Use `!addstock` first.")
+        return
+
+    global session_state
+    session_state = "live"
     await ctx.send(embed=build_stock_embed())
-    await ctx.send("🟢  **Drop is LIVE!** Use `!claim <item> <qty>` to grab yours — first come first served!")
- 
- 
+    await ctx.send("🟢  **Drop is LIVE!**  Use `!claim <item> <qty>` to grab yours — first come, first served!")
+
+
 @bot.command(name="enddrop")
 async def cmd_enddrop(ctx):
     if ctx.author.id != OWNER_ID:
         return
-    global drop_active
-    if not drop_active:
-        await ctx.author.send("⚠️  No active drop.")
-        await ctx.message.delete()
+    await silent(ctx)
+
+    if session_state != "live":
+        await dm(ctx, "⚠️  No active drop to end.")
         return
-    drop_active = False
-    await ctx.message.delete()
-    embed = build_claimlist_embed()
-    embed.title = "🔴  Drop CLOSED — Final Claim List"
+
+    global session_state
+    session_state = "closed"
+    embed = build_claimlist_embed(title="🔴  Drop CLOSED — Final Claim List")
     await ctx.send(embed=embed)
- 
- 
+
+
+@bot.command(name="claimlist")
+async def cmd_claimlist(ctx):
+    if ctx.author.id != OWNER_ID:
+        return
+    await silent(ctx)
+    if session_state == "closed":
+        await dm(ctx, "No active drop.")
+        return
+    await ctx.send(embed=build_claimlist_embed())
+
+
 # ── PUBLIC COMMANDS ───────────────────────────────────────────────────────────
- 
+
 @bot.command(name="stock")
 async def cmd_stock(ctx):
-    if not drop_active:
+    if session_state != "live":
         await ctx.send("No drop is currently active.")
         return
     await ctx.send(embed=build_stock_embed())
- 
- 
+
+
 @bot.command(name="claim")
 async def cmd_claim(ctx, *, args: str = ""):
-    if not drop_active:
+    if session_state != "live":
         await ctx.send("⚠️  No active drop right now.")
         return
- 
-    parts = args.rsplit(maxsplit=1)
-    if len(parts) == 2:
-        item_name, qty_str = parts
-        try:
-            qty = int(qty_str)
-        except ValueError:
-            item_name = args
-            qty = 1
-    elif len(parts) == 1:
-        item_name = parts[0]
-        qty = 1
-    else:
-        await ctx.send("Usage: `!claim <item> <qty>`  e.g. `!claim gardevoir 1`")
+
+    parts = args.split()
+    if not parts:
+        await ctx.send("Usage: `!claim <item> <qty>`  e.g. `!claim PRE ETB 1`")
         return
- 
+
+    # Last token is qty if it's a number, otherwise default qty to 1
+    try:
+        qty = int(parts[-1])
+        item_name = " ".join(parts[:-1])
+    except ValueError:
+        qty = 1
+        item_name = " ".join(parts)
+
+    if not item_name:
+        await ctx.send("Usage: `!claim <item> <qty>`  e.g. `!claim PRE ETB 1`")
+        return
+
     if qty < 1:
         await ctx.send("⚠️  Qty must be at least 1.")
         return
- 
-    key = item_key(item_name)
- 
-    # fuzzy match — find closest key
+
+    key = normalize(item_name)
+
+    # Exact match, then fuzzy
     if key not in stock:
-        matches = [k for k in stock if item_name.lower() in k or k in item_name.lower()]
+        matches = [k for k in stock if normalize(item_name) in k or k in normalize(item_name)]
         if len(matches) == 1:
             key = matches[0]
+        elif len(matches) > 1:
+            names = ", ".join(f"`{stock[k]['display']}`" for k in matches)
+            await ctx.send(f"⚠️  Multiple matches: {names} — be more specific.")
+            return
         else:
             names = ", ".join(f"`{s['display']}`" for s in stock.values())
             await ctx.send(f"⚠️  Item not found. Available: {names}")
             return
- 
+
     info = stock[key]
     already_claimed = sum(c["qty"] for c in claims[key])
     remaining = info["qty"] - already_claimed
- 
+
     if remaining <= 0:
         await ctx.send(f"😔  **{info['display']}** is sold out!")
         return
- 
+
     if qty > remaining:
         await ctx.send(
             f"⚠️  Only **{remaining}** of **{info['display']}** left. "
-            f"You asked for {qty}. Want to claim {remaining} instead? Try `!claim {info['display']} {remaining}`"
+            f"Try `!claim {info['display']} {remaining}` to grab what's left."
         )
         return
- 
-    # Check if this user already has a claim for this item and add to it
+
     existing = next((c for c in claims[key] if c["user"].id == ctx.author.id), None)
     if existing:
         existing["qty"] += qty
@@ -253,22 +286,22 @@ async def cmd_claim(ctx, *, args: str = ""):
             "qty": qty,
             "time": datetime.datetime.utcnow()
         })
- 
+
     new_remaining = remaining - qty
     total_cost = qty * info["price"]
- 
+
     await ctx.send(
         f"✅  **{ctx.author.display_name}** claimed **{qty}x {info['display']}** "
-        f"(${total_cost:.2f} total)  •  {new_remaining} left"
+        f"— ${total_cost:.2f}  •  {new_remaining} left"
     )
- 
- 
+
+
 @bot.command(name="myclaims")
 async def cmd_myclaims(ctx):
-    if not drop_active:
+    if session_state != "live":
         await ctx.send("No active drop.")
         return
- 
+
     user_claims = []
     total = 0.0
     for key, claim_list in claims.items():
@@ -276,27 +309,17 @@ async def cmd_myclaims(ctx):
             if c["user"].id == ctx.author.id:
                 subtotal = c["qty"] * stock[key]["price"]
                 total += subtotal
-                user_claims.append(f"• {stock[key]['display']}  ×{c['qty']}  — ${subtotal:.2f}")
- 
+                user_claims.append(f"• **{stock[key]['display']}**  ×{c['qty']}  — ${subtotal:.2f}")
+
     if not user_claims:
-        await ctx.send("You haven't claimed anything yet.")
+        await ctx.send("You haven't claimed anything in this drop yet.")
         return
- 
+
     lines = "\n".join(user_claims)
     await ctx.send(
-        f"**Your claims, {ctx.author.display_name}:**\n{lines}\n"
+        f"**{ctx.author.display_name}'s claims:**\n{lines}\n"
         f"**Total owed: ${total:.2f}**"
     )
- 
- 
-@bot.command(name="claimlist")
-async def cmd_claimlist(ctx):
-    if ctx.author.id != OWNER_ID:
-        return
-    if not drop_active:
-        await ctx.send("No active drop.")
-        return
-    await ctx.send(embed=build_claimlist_embed())
- 
- 
+
+
 bot.run(BOT_TOKEN)
