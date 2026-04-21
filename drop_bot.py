@@ -9,21 +9,22 @@ Admin only:
   !removemanager @user             — Revoke manager role
   !managers                        — List current admin and managers
 
-Manager/Admin commands (bot deletes your message silently, confirms via DM):
-  !drop                            — Start a new drop session
+Manager/Admin commands:
+  Run in your server channel OR in a DM with the bot after starting a drop.
+  !drop                            — Start a new drop session (must run in server)
   !addstock <item> <qty> <price> [limit <n>]
                                    — Add item, e.g.:
                                      !addstock PRE ETB 1 $100
-                                     !addstock PRE ETB 1 $100 limit 1
+                                     !addstock PRE ETB 3 $100 limit 1
   !removestockitem <item>          — Remove an item from staging
   !release                         — Post the drop publicly and open claiming
   !autoclose on/off                — Toggle auto-close when sold out (default: on)
   !claimlist                       — See who claimed what
   !enddrop                         — Close drop, post final list, DM all claimers
 
-Public commands (anyone):
+Public commands (anyone, in server only):
   !claim <item> <qty>              — e.g. !claim PRE ETB 1
-  !unclaim <item> <qty>            — Drop some or all of your claim, e.g. !unclaim PRE ETB 1
+  !unclaim <item> <qty>            — Drop some or all of your claim
   !stock                           — Show current inventory
   !myclaims                        — See your own claims and total
 """
@@ -57,6 +58,10 @@ stock_message = {}
 pinned_message = {}
 autoclose = defaultdict(lambda: True)
 
+# manager_session[user_id] = {"guild_id": int, "channel": TextChannel}
+# Tracks which server+channel a manager started their drop from, so DM commands work
+manager_session = {}
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -88,6 +93,28 @@ def all_sold_out(guild_id):
 
 def user_claimed_qty(guild_id, key, user_id):
     return sum(c["qty"] for c in claims[guild_id][key] if c["user"].id == user_id)
+
+
+def get_manager_context(ctx):
+    """
+    Returns (guild_id, drop_channel) for a manager command.
+    Works whether the command is run in a server channel or a DM.
+    Returns (None, None) if not authorized.
+    """
+    if ctx.guild:
+        guild_id = ctx.guild.id
+        if not is_manager(guild_id, ctx.author.id):
+            return None, None
+        return guild_id, ctx.channel
+    else:
+        # DM — look up their active session
+        session = manager_session.get(ctx.author.id)
+        if not session:
+            return None, None
+        guild_id = session["guild_id"]
+        if not is_manager(guild_id, ctx.author.id):
+            return None, None
+        return guild_id, session["channel"]
 
 
 def build_stock_embed(guild_id):
@@ -171,10 +198,6 @@ async def dm(ctx, message):
         pass
 
 
-def guild_only(ctx):
-    return ctx.guild is not None
-
-
 @bot.event
 async def on_ready():
     print(f"✅  Logged in as {bot.user} ({bot.user.id})")
@@ -184,7 +207,7 @@ async def on_ready():
 
 @bot.command(name="setup")
 async def cmd_setup(ctx):
-    if not guild_only(ctx):
+    if not ctx.guild:
         await ctx.author.send("⚠️  Please run `!setup` in your server, not in a DM.")
         return
     guild_id = ctx.guild.id
@@ -198,7 +221,7 @@ async def cmd_setup(ctx):
 
 @bot.command(name="addmanager")
 async def cmd_addmanager(ctx):
-    if not guild_only(ctx):
+    if not ctx.guild:
         return
     guild_id = ctx.guild.id
     if not is_admin(guild_id, ctx.author.id):
@@ -214,7 +237,7 @@ async def cmd_addmanager(ctx):
 
 @bot.command(name="removemanager")
 async def cmd_removemanager(ctx):
-    if not guild_only(ctx):
+    if not ctx.guild:
         return
     guild_id = ctx.guild.id
     if not is_admin(guild_id, ctx.author.id):
@@ -233,7 +256,7 @@ async def cmd_removemanager(ctx):
 
 @bot.command(name="managers")
 async def cmd_managers(ctx):
-    if not guild_only(ctx):
+    if not ctx.guild:
         return
     guild_id = ctx.guild.id
     if guild_id not in server_admins:
@@ -253,8 +276,8 @@ async def cmd_managers(ctx):
 
 @bot.command(name="drop")
 async def cmd_drop(ctx):
-    if not guild_only(ctx):
-        await ctx.author.send("⚠️  Please run drop commands in your server channel, not in a DM.")
+    if not ctx.guild:
+        await ctx.author.send("⚠️  `!drop` must be run in a server channel. After that you can use all other commands via DM.")
         return
     guild_id = ctx.guild.id
     if not is_manager(guild_id, ctx.author.id):
@@ -265,21 +288,23 @@ async def cmd_drop(ctx):
     stock_message.pop(guild_id, None)
     pinned_message.pop(guild_id, None)
     autoclose[guild_id] = True
+    # Remember this manager's active drop channel for DM commands
+    manager_session[ctx.author.id] = {"guild_id": guild_id, "channel": ctx.channel}
     await silent(ctx)
-    await dm(ctx, "✅  Drop session started! Load items with `!addstock <item> <qty> <price>` (add `limit <n>` to cap per-user), then `!release` to go live.\n💡  Auto-close is **ON**.")
+    await dm(ctx, f"✅  Drop session started for **{ctx.guild.name}**!\nYou can now use `!addstock`, `!removestockitem`, `!release`, `!claimlist`, `!autoclose`, and `!enddrop` from this DM or in the server.\n\n💡  Auto-close is **ON**.")
 
 
 @bot.command(name="addstock")
 async def cmd_addstock(ctx, *, args=""):
-    if not guild_only(ctx):
-        await ctx.author.send("⚠️  Please run drop commands in your server channel, not in a DM.")
+    guild_id, drop_channel = get_manager_context(ctx)
+    if guild_id is None:
+        if not ctx.guild:
+            await ctx.author.send("⚠️  No active drop session found. Run `!drop` in your server first.")
         return
-    guild_id = ctx.guild.id
-    if not is_manager(guild_id, ctx.author.id):
-        return
-    await silent(ctx)
+    if ctx.guild:
+        await silent(ctx)
     if session_state[guild_id] == "closed":
-        await dm(ctx, "⚠️  No drop session active. Use `!drop` first.")
+        await dm(ctx, "⚠️  No drop session active. Use `!drop` in your server first.")
         return
 
     # Parse optional "limit N" at the end
@@ -310,19 +335,19 @@ async def cmd_addstock(ctx, *, args=""):
 
     key = normalize(item_name)
     stock[guild_id][key] = {"display": item_name.upper(), "qty": qty, "price": price, "limit": limit}
-
     limit_str = f"  •  max **{limit}** per person" if limit else "  •  no per-person limit"
     await dm(ctx, f"✅  **{item_name.upper()}** — {qty} @ ${price:.2f} each{limit_str}.")
 
 
 @bot.command(name="removestockitem")
 async def cmd_removestockitem(ctx, *, item_name=""):
-    if not guild_only(ctx):
+    guild_id, drop_channel = get_manager_context(ctx)
+    if guild_id is None:
+        if not ctx.guild:
+            await ctx.author.send("⚠️  No active drop session found. Run `!drop` in your server first.")
         return
-    guild_id = ctx.guild.id
-    if not is_manager(guild_id, ctx.author.id):
-        return
-    await silent(ctx)
+    if ctx.guild:
+        await silent(ctx)
     if not item_name:
         await dm(ctx, "Usage: `!removestockitem <item name>`")
         return
@@ -341,12 +366,13 @@ async def cmd_removestockitem(ctx, *, item_name=""):
 
 @bot.command(name="autoclose")
 async def cmd_autoclose(ctx, toggle: str = ""):
-    if not guild_only(ctx):
+    guild_id, drop_channel = get_manager_context(ctx)
+    if guild_id is None:
+        if not ctx.guild:
+            await ctx.author.send("⚠️  No active drop session found. Run `!drop` in your server first.")
         return
-    guild_id = ctx.guild.id
-    if not is_manager(guild_id, ctx.author.id):
-        return
-    await silent(ctx)
+    if ctx.guild:
+        await silent(ctx)
     if toggle.lower() == "on":
         autoclose[guild_id] = True
         await dm(ctx, "✅  Auto-close is now **ON**.")
@@ -360,12 +386,13 @@ async def cmd_autoclose(ctx, toggle: str = ""):
 
 @bot.command(name="release")
 async def cmd_release(ctx):
-    if not guild_only(ctx):
+    guild_id, drop_channel = get_manager_context(ctx)
+    if guild_id is None:
+        if not ctx.guild:
+            await ctx.author.send("⚠️  No active drop session found. Run `!drop` in your server first.")
         return
-    guild_id = ctx.guild.id
-    if not is_manager(guild_id, ctx.author.id):
-        return
-    await silent(ctx)
+    if ctx.guild:
+        await silent(ctx)
     if session_state[guild_id] == "closed":
         await dm(ctx, "⚠️  No drop session active. Use `!drop` first.")
         return
@@ -373,49 +400,53 @@ async def cmd_release(ctx):
         await dm(ctx, "⚠️  No stock loaded. Use `!addstock` first.")
         return
     session_state[guild_id] = "live"
-    msg = await ctx.send(embed=build_stock_embed(guild_id))
+    msg = await drop_channel.send(embed=build_stock_embed(guild_id))
     stock_message[guild_id] = msg
-    await ctx.send("🟢  **Drop is LIVE!**  Use `!claim <item> <qty>` to grab yours — first come, first served!")
+    await drop_channel.send("🟢  **Drop is LIVE!**  Use `!claim <item> <qty>` to grab yours — first come, first served!")
     try:
         await msg.pin()
         pinned_message[guild_id] = msg
     except (discord.Forbidden, discord.HTTPException):
         pass
+    await dm(ctx, "🟢  Drop is live!")
 
 
 @bot.command(name="enddrop")
 async def cmd_enddrop(ctx):
-    if not guild_only(ctx):
+    guild_id, drop_channel = get_manager_context(ctx)
+    if guild_id is None:
+        if not ctx.guild:
+            await ctx.author.send("⚠️  No active drop session found. Run `!drop` in your server first.")
         return
-    guild_id = ctx.guild.id
-    if not is_manager(guild_id, ctx.author.id):
-        return
-    await silent(ctx)
+    if ctx.guild:
+        await silent(ctx)
     if session_state[guild_id] != "live":
         await dm(ctx, "⚠️  No active drop to end.")
         return
-    await close_drop(ctx.channel, guild_id)
+    await close_drop(drop_channel, guild_id)
 
 
 @bot.command(name="claimlist")
 async def cmd_claimlist(ctx):
-    if not guild_only(ctx):
+    guild_id, drop_channel = get_manager_context(ctx)
+    if guild_id is None:
+        if not ctx.guild:
+            await ctx.author.send("⚠️  No active drop session found. Run `!drop` in your server first.")
         return
-    guild_id = ctx.guild.id
-    if not is_manager(guild_id, ctx.author.id):
-        return
-    await silent(ctx)
+    if ctx.guild:
+        await silent(ctx)
     if session_state[guild_id] == "closed":
         await dm(ctx, "No active drop.")
         return
-    await ctx.send(embed=build_claimlist_embed(guild_id))
+    embed = build_claimlist_embed(guild_id)
+    await ctx.author.send(embed=embed)
 
 
 # ── PUBLIC COMMANDS ───────────────────────────────────────────────────────────
 
 @bot.command(name="stock")
 async def cmd_stock(ctx):
-    if not guild_only(ctx):
+    if not ctx.guild:
         await ctx.author.send("⚠️  Please use this command in your server channel.")
         return
     guild_id = ctx.guild.id
@@ -427,7 +458,7 @@ async def cmd_stock(ctx):
 
 @bot.command(name="claim")
 async def cmd_claim(ctx, *, args=""):
-    if not guild_only(ctx):
+    if not ctx.guild:
         await ctx.author.send("⚠️  Please use `!claim` in your server channel, not in a DM.")
         return
     guild_id = ctx.guild.id
@@ -472,8 +503,6 @@ async def cmd_claim(ctx, *, args=""):
     if qty > remaining:
         await ctx.send(f"⚠️  Only **{remaining}** of **{info['display']}** left. Try `!claim {info['display']} {remaining}`")
         return
-
-    # Per-user limit check
     if info["limit"] is not None:
         already_user = user_claimed_qty(guild_id, key, ctx.author.id)
         allowed = info["limit"] - already_user
@@ -483,7 +512,6 @@ async def cmd_claim(ctx, *, args=""):
         if qty > allowed:
             await ctx.send(f"⚠️  You can only claim **{allowed}** more of **{info['display']}** (limit: {info['limit']} per person). Try `!claim {info['display']} {allowed}`")
             return
-
     existing = next((c for c in claims[guild_id][key] if c["user"].id == ctx.author.id), None)
     if existing:
         existing["qty"] += qty
@@ -500,7 +528,7 @@ async def cmd_claim(ctx, *, args=""):
 
 @bot.command(name="unclaim")
 async def cmd_unclaim(ctx, *, args=""):
-    if not guild_only(ctx):
+    if not ctx.guild:
         return
     guild_id = ctx.guild.id
     if session_state[guild_id] != "live":
@@ -509,20 +537,16 @@ async def cmd_unclaim(ctx, *, args=""):
     if not args:
         await ctx.send("Usage: `!unclaim <item> <qty>`  e.g. `!unclaim PRE ETB 1`")
         return
-
-    # Parse optional qty from end
     parts = args.split()
     try:
         qty = int(parts[-1])
         item_name = " ".join(parts[:-1])
     except ValueError:
-        qty = None  # unclaim all
+        qty = None
         item_name = " ".join(parts)
-
     if not item_name:
         await ctx.send("Usage: `!unclaim <item> <qty>`  e.g. `!unclaim PRE ETB 1`")
         return
-
     key = normalize(item_name)
     if key not in stock[guild_id]:
         matches = [k for k in stock[guild_id] if normalize(item_name) in k or k in normalize(item_name)]
@@ -532,14 +556,11 @@ async def cmd_unclaim(ctx, *, args=""):
             names = ", ".join(f"`{s['display']}`" for s in stock[guild_id].values())
             await ctx.send(f"⚠️  Item not found. Available: {names}")
             return
-
     existing = next((c for c in claims[guild_id][key] if c["user"].id == ctx.author.id), None)
     if not existing:
         await ctx.send("You don't have a claim on that item.")
         return
-
     if qty is None or qty >= existing["qty"]:
-        # Remove entire claim
         claims[guild_id][key].remove(existing)
         await ctx.send(f"↩️  **{ctx.author.display_name}** removed their entire claim on **{stock[guild_id][key]['display']}**.")
     else:
@@ -548,13 +569,12 @@ async def cmd_unclaim(ctx, *, args=""):
             return
         existing["qty"] -= qty
         await ctx.send(f"↩️  **{ctx.author.display_name}** removed **{qty}x {stock[guild_id][key]['display']}** from their claim. ({existing['qty']} still claimed)")
-
     await update_stock_embed(guild_id)
 
 
 @bot.command(name="myclaims")
 async def cmd_myclaims(ctx):
-    if not guild_only(ctx):
+    if not ctx.guild:
         await ctx.author.send("⚠️  Please use `!myclaims` in your server channel.")
         return
     guild_id = ctx.guild.id
