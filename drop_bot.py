@@ -25,8 +25,9 @@ from collections import defaultdict
 import datetime
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
-OWNER_ID   = 123456789012345678   # your Discord user ID (integer)
+import os
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+OWNER_ID   = int(os.environ["OWNER_ID"])   # your Discord user ID (integer)
 PREFIX     = "!"
 # ─────────────────────────────────────────────────────────────────────────────
 
