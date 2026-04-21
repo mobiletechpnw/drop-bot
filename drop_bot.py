@@ -5,12 +5,14 @@ Owner commands (bot deletes your message silently, confirms via DM):
   !drop                            — Start a new drop session
   !addstock <item> <qty> <price>   — Add item, e.g. !addstock PRE ETB 1 $100
                                      Price can be $100 or 100
+  !removestockitem <item>          — Remove an item from staging
   !release                         — Post the drop publicly and open claiming
   !claimlist                       — See who claimed what (owner only)
-  !enddrop                         — Close the drop and post final claim list
+  !enddrop                         — Close drop, post final list, DM all claimers
 
 Public commands (anyone):
   !claim <item> <qty>              — e.g. !claim PRE ETB 1
+  !unclaim <item>                  — Drop your claim on an item
   !stock                           — Show current inventory
   !myclaims                        — See your own claims and total
 """
@@ -33,6 +35,8 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 session_state = "closed"
 stock = {}
 claims = defaultdict(list)
+stock_message = None  # tracks the live stock embed message for auto-updating
+pinned_message = None  # tracks the pinned message
 
 
 def normalize(name):
@@ -69,6 +73,16 @@ def build_claimlist_embed(title="📋  Claim List"):
     return embed
 
 
+async def update_stock_embed():
+    """Edit the live stock message in place."""
+    global stock_message
+    if stock_message:
+        try:
+            await stock_message.edit(embed=build_stock_embed())
+        except (discord.NotFound, discord.Forbidden):
+            stock_message = None
+
+
 async def silent(ctx):
     try:
         await ctx.message.delete()
@@ -83,19 +97,30 @@ async def dm(ctx, message):
         pass
 
 
+async def dm_user(user, message):
+    try:
+        await user.send(message)
+    except discord.Forbidden:
+        pass
+
+
 @bot.event
 async def on_ready():
     print(f"✅  Logged in as {bot.user} ({bot.user.id})")
 
 
+# ── OWNER COMMANDS ────────────────────────────────────────────────────────────
+
 @bot.command(name="drop")
 async def cmd_drop(ctx):
-    global session_state, stock, claims
+    global session_state, stock, claims, stock_message, pinned_message
     if ctx.author.id != OWNER_ID:
         return
     session_state = "staging"
     stock = {}
     claims = defaultdict(list)
+    stock_message = None
+    pinned_message = None
     await silent(ctx)
     await dm(ctx, "✅  Drop session started! Load items with `!addstock <item> <qty> <price>`, then `!release` to go live.")
 
@@ -127,9 +152,32 @@ async def cmd_addstock(ctx, *, args=""):
     await dm(ctx, f"✅  **{item_name.upper()}** — {qty} @ ${price:.2f} each added.")
 
 
+@bot.command(name="removestockitem")
+async def cmd_removestockitem(ctx, *, item_name=""):
+    global stock
+    if ctx.author.id != OWNER_ID:
+        return
+    await silent(ctx)
+    if not item_name:
+        await dm(ctx, "Usage: `!removestockitem <item name>`")
+        return
+    key = normalize(item_name)
+    if key not in stock:
+        # fuzzy match
+        matches = [k for k in stock if normalize(item_name) in k or k in normalize(item_name)]
+        if len(matches) == 1:
+            key = matches[0]
+        else:
+            names = ", ".join(f"`{s['display']}`" for s in stock.values())
+            await dm(ctx, f"⚠️  Item not found. Current stock: {names}")
+            return
+    removed = stock.pop(key)
+    await dm(ctx, f"🗑️  **{removed['display']}** removed from stock.")
+
+
 @bot.command(name="release")
 async def cmd_release(ctx):
-    global session_state
+    global session_state, stock_message, pinned_message
     if ctx.author.id != OWNER_ID:
         return
     await silent(ctx)
@@ -140,13 +188,20 @@ async def cmd_release(ctx):
         await dm(ctx, "⚠️  No stock loaded. Use `!addstock` first.")
         return
     session_state = "live"
-    await ctx.send(embed=build_stock_embed())
+    # Post stock embed and save reference for live updates
+    stock_message = await ctx.send(embed=build_stock_embed())
     await ctx.send("🟢  **Drop is LIVE!**  Use `!claim <item> <qty>` to grab yours — first come, first served!")
+    # Auto-pin the stock embed
+    try:
+        await stock_message.pin()
+        pinned_message = stock_message
+    except (discord.Forbidden, discord.HTTPException):
+        pass
 
 
 @bot.command(name="enddrop")
 async def cmd_enddrop(ctx):
-    global session_state
+    global session_state, pinned_message
     if ctx.author.id != OWNER_ID:
         return
     await silent(ctx)
@@ -154,8 +209,35 @@ async def cmd_enddrop(ctx):
         await dm(ctx, "⚠️  No active drop to end.")
         return
     session_state = "closed"
+
+    # Unpin the stock embed
+    if pinned_message:
+        try:
+            await pinned_message.unpin()
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        pinned_message = None
+
+    # Post final claim list
     embed = build_claimlist_embed(title="🔴  Drop CLOSED — Final Claim List")
     await ctx.send(embed=embed)
+
+    # DM every claimer their summary
+    claimer_totals = defaultdict(list)
+    for key, claim_list in claims.items():
+        for c in claim_list:
+            subtotal = c["qty"] * stock[key]["price"]
+            claimer_totals[c["user"]].append(f"• **{stock[key]['display']}**  ×{c['qty']}  — ${subtotal:.2f}")
+
+    for user, lines in claimer_totals.items():
+        total = sum(
+            c["qty"] * stock[key]["price"]
+            for key, claim_list in claims.items()
+            for c in claim_list
+            if c["user"].id == user.id
+        )
+        summary = "\n".join(lines)
+        await dm_user(user, f"🧾  **Drop closed! Here's your order summary:**\n{summary}\n**Total owed: ${total:.2f}**\n\nPlease send payment to complete your order!")
 
 
 @bot.command(name="claimlist")
@@ -168,6 +250,8 @@ async def cmd_claimlist(ctx):
         return
     await ctx.send(embed=build_claimlist_embed())
 
+
+# ── PUBLIC COMMANDS ───────────────────────────────────────────────────────────
 
 @bot.command(name="stock")
 async def cmd_stock(ctx):
@@ -228,6 +312,33 @@ async def cmd_claim(ctx, *, args=""):
     new_remaining = remaining - qty
     total_cost = qty * info["price"]
     await ctx.send(f"✅  **{ctx.author.display_name}** claimed **{qty}x {info['display']}** — ${total_cost:.2f}  •  {new_remaining} left")
+    await update_stock_embed()
+
+
+@bot.command(name="unclaim")
+async def cmd_unclaim(ctx, *, item_name=""):
+    if session_state != "live":
+        await ctx.send("⚠️  No active drop right now.")
+        return
+    if not item_name:
+        await ctx.send("Usage: `!unclaim <item>`  e.g. `!unclaim PRE ETB`")
+        return
+    key = normalize(item_name)
+    if key not in stock:
+        matches = [k for k in stock if normalize(item_name) in k or k in normalize(item_name)]
+        if len(matches) == 1:
+            key = matches[0]
+        else:
+            names = ", ".join(f"`{s['display']}`" for s in stock.values())
+            await ctx.send(f"⚠️  Item not found. Available: {names}")
+            return
+    existing = next((c for c in claims[key] if c["user"].id == ctx.author.id), None)
+    if not existing:
+        await ctx.send("You don't have a claim on that item.")
+        return
+    claims[key].remove(existing)
+    await ctx.send(f"↩️  **{ctx.author.display_name}** removed their claim on **{stock[key]['display']}**.")
+    await update_stock_embed()
 
 
 @bot.command(name="myclaims")
