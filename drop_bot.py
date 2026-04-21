@@ -11,7 +11,10 @@ Admin only:
 
 Manager/Admin commands (bot deletes your message silently, confirms via DM):
   !drop                            — Start a new drop session
-  !addstock <item> <qty> <price>   — Add item, e.g. !addstock PRE ETB 1 $100
+  !addstock <item> <qty> <price> [limit <n>]
+                                   — Add item, e.g.:
+                                     !addstock PRE ETB 1 $100
+                                     !addstock PRE ETB 1 $100 limit 1
   !removestockitem <item>          — Remove an item from staging
   !release                         — Post the drop publicly and open claiming
   !autoclose on/off                — Toggle auto-close when sold out (default: on)
@@ -20,7 +23,7 @@ Manager/Admin commands (bot deletes your message silently, confirms via DM):
 
 Public commands (anyone):
   !claim <item> <qty>              — e.g. !claim PRE ETB 1
-  !unclaim <item>                  — Drop your claim on an item
+  !unclaim <item> <qty>            — Drop some or all of your claim, e.g. !unclaim PRE ETB 1
   !stock                           — Show current inventory
   !myclaims                        — See your own claims and total
 """
@@ -43,8 +46,13 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 server_admins = {}
 server_managers = defaultdict(set)
 session_state = defaultdict(lambda: "closed")
+
+# stock[guild_id][item_key] = {"display": str, "qty": int, "price": float, "limit": int or None}
 stock = defaultdict(dict)
+
+# claims[guild_id][item_key] = [{"user": member, "qty": int, "time": datetime}, ...]
 claims = defaultdict(lambda: defaultdict(list))
+
 stock_message = {}
 pinned_message = {}
 autoclose = defaultdict(lambda: True)
@@ -78,12 +86,17 @@ def all_sold_out(guild_id):
     return True
 
 
+def user_claimed_qty(guild_id, key, user_id):
+    return sum(c["qty"] for c in claims[guild_id][key] if c["user"].id == user_id)
+
+
 def build_stock_embed(guild_id):
     embed = discord.Embed(title="🛒  Drop Stock", color=discord.Color.gold(), timestamp=datetime.datetime.utcnow())
     for key, info in stock[guild_id].items():
         claimed = sum(c["qty"] for c in claims[guild_id][key])
         qty_left = info["qty"] - claimed
-        status = f"**${info['price']:.2f}** each  •  **{qty_left}** of {info['qty']} remaining"
+        limit_str = f"  •  max {info['limit']} per person" if info["limit"] else ""
+        status = f"**${info['price']:.2f}** each  •  **{qty_left}** of {info['qty']} remaining{limit_str}"
         if qty_left <= 0:
             status += "  🚫 **SOLD OUT**"
         embed.add_field(name=info["display"], value=status, inline=False)
@@ -159,7 +172,6 @@ async def dm(ctx, message):
 
 
 def guild_only(ctx):
-    """Returns False if command is run in a DM — prevents crashes."""
     return ctx.guild is not None
 
 
@@ -254,7 +266,7 @@ async def cmd_drop(ctx):
     pinned_message.pop(guild_id, None)
     autoclose[guild_id] = True
     await silent(ctx)
-    await dm(ctx, "✅  Drop session started! Load items with `!addstock <item> <qty> <price>`, then `!release` to go live.\n💡  Auto-close is **ON** — drop will close automatically when sold out. Use `!autoclose off` to disable.")
+    await dm(ctx, "✅  Drop session started! Load items with `!addstock <item> <qty> <price>` (add `limit <n>` to cap per-user), then `!release` to go live.\n💡  Auto-close is **ON**.")
 
 
 @bot.command(name="addstock")
@@ -269,22 +281,38 @@ async def cmd_addstock(ctx, *, args=""):
     if session_state[guild_id] == "closed":
         await dm(ctx, "⚠️  No drop session active. Use `!drop` first.")
         return
+
+    # Parse optional "limit N" at the end
+    limit = None
     parts = args.split()
+    if len(parts) >= 2 and parts[-2].lower() == "limit":
+        try:
+            limit = int(parts[-1])
+            parts = parts[:-2]
+        except ValueError:
+            await dm(ctx, "⚠️  Limit must be a whole number. Example: `!addstock PRE ETB 1 100 limit 1`")
+            return
+
     if len(parts) < 3:
-        await dm(ctx, "Usage: `!addstock <item name> <qty> <price>`\nExample: `!addstock PRE ETB 1 100`")
+        await dm(ctx, "Usage: `!addstock <item name> <qty> <price> [limit <n>]`\nExamples:\n`!addstock PRE ETB 1 100`\n`!addstock PRE ETB 3 100 limit 1`")
         return
+
     price_str = parts[-1]
     qty_str = parts[-2]
     item_name = " ".join(parts[:-2])
+
     try:
         qty = int(qty_str)
         price = parse_price(price_str)
     except ValueError:
-        await dm(ctx, f"⚠️  Couldn't read qty/price from `{qty_str}` / `{price_str}`\nFormat: `!addstock PRE ETB 1 100`")
+        await dm(ctx, f"⚠️  Couldn't read qty/price from `{qty_str}` / `{price_str}`")
         return
+
     key = normalize(item_name)
-    stock[guild_id][key] = {"display": item_name.upper(), "qty": qty, "price": price}
-    await dm(ctx, f"✅  **{item_name.upper()}** — {qty} @ ${price:.2f} each added.")
+    stock[guild_id][key] = {"display": item_name.upper(), "qty": qty, "price": price, "limit": limit}
+
+    limit_str = f"  •  max **{limit}** per person" if limit else "  •  no per-person limit"
+    await dm(ctx, f"✅  **{item_name.upper()}** — {qty} @ ${price:.2f} each{limit_str}.")
 
 
 @bot.command(name="removestockitem")
@@ -321,13 +349,13 @@ async def cmd_autoclose(ctx, toggle: str = ""):
     await silent(ctx)
     if toggle.lower() == "on":
         autoclose[guild_id] = True
-        await dm(ctx, "✅  Auto-close is now **ON** — drop will close automatically when sold out.")
+        await dm(ctx, "✅  Auto-close is now **ON**.")
     elif toggle.lower() == "off":
         autoclose[guild_id] = False
         await dm(ctx, "✅  Auto-close is now **OFF** — use `!enddrop` to close manually.")
     else:
         status = "ON" if autoclose[guild_id] else "OFF"
-        await dm(ctx, f"Auto-close is currently **{status}**. Use `!autoclose on` or `!autoclose off` to change.")
+        await dm(ctx, f"Auto-close is currently **{status}**. Use `!autoclose on` or `!autoclose off`.")
 
 
 @bot.command(name="release")
@@ -444,6 +472,18 @@ async def cmd_claim(ctx, *, args=""):
     if qty > remaining:
         await ctx.send(f"⚠️  Only **{remaining}** of **{info['display']}** left. Try `!claim {info['display']} {remaining}`")
         return
+
+    # Per-user limit check
+    if info["limit"] is not None:
+        already_user = user_claimed_qty(guild_id, key, ctx.author.id)
+        allowed = info["limit"] - already_user
+        if allowed <= 0:
+            await ctx.send(f"⚠️  You've already claimed the max of **{info['limit']}** for **{info['display']}**.")
+            return
+        if qty > allowed:
+            await ctx.send(f"⚠️  You can only claim **{allowed}** more of **{info['display']}** (limit: {info['limit']} per person). Try `!claim {info['display']} {allowed}`")
+            return
+
     existing = next((c for c in claims[guild_id][key] if c["user"].id == ctx.author.id), None)
     if existing:
         existing["qty"] += qty
@@ -459,16 +499,30 @@ async def cmd_claim(ctx, *, args=""):
 
 
 @bot.command(name="unclaim")
-async def cmd_unclaim(ctx, *, item_name=""):
+async def cmd_unclaim(ctx, *, args=""):
     if not guild_only(ctx):
         return
     guild_id = ctx.guild.id
     if session_state[guild_id] != "live":
         await ctx.send("⚠️  No active drop right now.")
         return
-    if not item_name:
-        await ctx.send("Usage: `!unclaim <item>`  e.g. `!unclaim PRE ETB`")
+    if not args:
+        await ctx.send("Usage: `!unclaim <item> <qty>`  e.g. `!unclaim PRE ETB 1`")
         return
+
+    # Parse optional qty from end
+    parts = args.split()
+    try:
+        qty = int(parts[-1])
+        item_name = " ".join(parts[:-1])
+    except ValueError:
+        qty = None  # unclaim all
+        item_name = " ".join(parts)
+
+    if not item_name:
+        await ctx.send("Usage: `!unclaim <item> <qty>`  e.g. `!unclaim PRE ETB 1`")
+        return
+
     key = normalize(item_name)
     if key not in stock[guild_id]:
         matches = [k for k in stock[guild_id] if normalize(item_name) in k or k in normalize(item_name)]
@@ -478,12 +532,23 @@ async def cmd_unclaim(ctx, *, item_name=""):
             names = ", ".join(f"`{s['display']}`" for s in stock[guild_id].values())
             await ctx.send(f"⚠️  Item not found. Available: {names}")
             return
+
     existing = next((c for c in claims[guild_id][key] if c["user"].id == ctx.author.id), None)
     if not existing:
         await ctx.send("You don't have a claim on that item.")
         return
-    claims[guild_id][key].remove(existing)
-    await ctx.send(f"↩️  **{ctx.author.display_name}** removed their claim on **{stock[guild_id][key]['display']}**.")
+
+    if qty is None or qty >= existing["qty"]:
+        # Remove entire claim
+        claims[guild_id][key].remove(existing)
+        await ctx.send(f"↩️  **{ctx.author.display_name}** removed their entire claim on **{stock[guild_id][key]['display']}**.")
+    else:
+        if qty < 1:
+            await ctx.send("⚠️  Qty must be at least 1.")
+            return
+        existing["qty"] -= qty
+        await ctx.send(f"↩️  **{ctx.author.display_name}** removed **{qty}x {stock[guild_id][key]['display']}** from their claim. ({existing['qty']} still claimed)")
+
     await update_stock_embed(guild_id)
 
 
