@@ -165,6 +165,7 @@ async def cmd_addstock(ctx, *, args: str = ""):
 
 @bot.command(name="release")
 async def cmd_release(ctx):
+   global session_state
     if ctx.author.id != OWNER_ID:
         return
     await silent(ctx)
@@ -176,7 +177,7 @@ async def cmd_release(ctx):
         await dm(ctx, "⚠️  No stock loaded. Use `!addstock` first.")
         return
 
-    global session_state
+   
     session_state = "live"
     await ctx.send(embed=build_stock_embed())
     await ctx.send("🟢  **Drop is LIVE!**  Use `!claim <item> <qty>` to grab yours — first come, first served!")
