@@ -1,1 +1,1 @@
-worker: python drop_bot.py
+worker: python -u drop_bot.py
