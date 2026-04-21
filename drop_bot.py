@@ -1,3 +1,20 @@
+"""
+Vault & Pine Drop Bot
+=====================
+Owner commands (bot deletes your message silently, confirms via DM):
+  !drop                            — Start a new drop session
+  !addstock <item> <qty> <price>   — Add item, e.g. !addstock PRE ETB 1 $100
+                                     Price can be $100 or 100
+  !release                         — Post the drop publicly and open claiming
+  !claimlist                       — See who claimed what (owner only)
+  !enddrop                         — Close the drop and post final claim list
+
+Public commands (anyone):
+  !claim <item> <qty>              — e.g. !claim PRE ETB 1
+  !stock                           — Show current inventory
+  !myclaims                        — See your own claims and total
+"""
+
 import discord
 from discord.ext import commands
 from collections import defaultdict
