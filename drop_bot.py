@@ -16,15 +16,19 @@ Manager/Admin commands:
                                    — Add item, e.g.:
                                      !addstock PRE ETB 1 $100
                                      !addstock PRE ETB 3 $100 limit 1
+  !editstock <item> <qty> <price>  — Edit qty/price of an existing item
   !removestockitem <item>          — Remove an item from staging
+  !preview                         — DM yourself the stock embed before releasing
+  !countdown <minutes>             — Post a public hype countdown, e.g. !countdown 5
   !release                         — Post the drop publicly and open claiming
   !autoclose on/off                — Toggle auto-close when sold out (default: on)
-  !claimlist                       — See who claimed what
+  !claimlist                       — DM yourself the current claim list
   !enddrop                         — Close drop, post final list, DM all claimers
 
 Public commands (anyone, in server only):
   !claim <item> <qty>              — e.g. !claim PRE ETB 1
   !unclaim <item> <qty>            — Drop some or all of your claim
+  !waitlist <item>                 — Join the waitlist if an item is sold out
   !stock                           — Show current inventory
   !myclaims                        — See your own claims and total
 """
@@ -33,6 +37,7 @@ import discord
 from discord.ext import commands
 from collections import defaultdict
 import datetime
+import asyncio
 import os
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -54,12 +59,14 @@ stock = defaultdict(dict)
 # claims[guild_id][item_key] = [{"user": member, "qty": int, "time": datetime}, ...]
 claims = defaultdict(lambda: defaultdict(list))
 
+# waitlist[guild_id][item_key] = [user, user, ...]
+waitlist = defaultdict(lambda: defaultdict(list))
+
 stock_message = {}
 pinned_message = {}
 autoclose = defaultdict(lambda: True)
 
 # manager_session[user_id] = {"guild_id": int, "channel": TextChannel}
-# Tracks which server+channel a manager started their drop from, so DM commands work
 manager_session = {}
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -96,18 +103,12 @@ def user_claimed_qty(guild_id, key, user_id):
 
 
 def get_manager_context(ctx):
-    """
-    Returns (guild_id, drop_channel) for a manager command.
-    Works whether the command is run in a server channel or a DM.
-    Returns (None, None) if not authorized.
-    """
     if ctx.guild:
         guild_id = ctx.guild.id
         if not is_manager(guild_id, ctx.author.id):
             return None, None
         return guild_id, ctx.channel
     else:
-        # DM — look up their active session
         session = manager_session.get(ctx.author.id)
         if not session:
             return None, None
@@ -151,6 +152,21 @@ def build_claimlist_embed(guild_id, title="📋  Claim List"):
     return embed
 
 
+def build_howto_embed():
+    embed = discord.Embed(
+        title="📖  How to Claim",
+        color=discord.Color.green(),
+        description="Welcome to the drop! Here's how it works:"
+    )
+    embed.add_field(name="!claim <item> <qty>", value="Grab an item — e.g. `!claim PRE ETB 1`", inline=False)
+    embed.add_field(name="!stock", value="See what's still available", inline=False)
+    embed.add_field(name="!myclaims", value="See what you've claimed and your total owed", inline=False)
+    embed.add_field(name="!unclaim <item> <qty>", value="Drop some or all of a claim", inline=False)
+    embed.add_field(name="!waitlist <item>", value="Join the waitlist if something is sold out — you'll be notified if it opens up", inline=False)
+    embed.set_footer(text="First come, first served — when it's gone, it's gone!")
+    return embed
+
+
 async def update_stock_embed(guild_id):
     msg = stock_message.get(guild_id)
     if msg:
@@ -158,6 +174,23 @@ async def update_stock_embed(guild_id):
             await msg.edit(embed=build_stock_embed(guild_id))
         except (discord.NotFound, discord.Forbidden):
             stock_message.pop(guild_id, None)
+
+
+async def notify_waitlist(guild_id, key, qty_freed):
+    """Notify waitlist users when stock becomes available after an unclaim."""
+    wl = waitlist[guild_id][key]
+    if not wl or qty_freed <= 0:
+        return
+    item_display = stock[guild_id][key]["display"] if key in stock[guild_id] else key
+    notified = 0
+    for user in wl[:qty_freed]:
+        try:
+            await user.send(f"🔔  **{item_display}** is available again! Head back to the server and use `!claim {item_display} 1` before it's gone!")
+            notified += 1
+        except discord.Forbidden:
+            pass
+    # Remove notified users from waitlist
+    waitlist[guild_id][key] = wl[qty_freed:]
 
 
 async def close_drop(channel, guild_id):
@@ -285,13 +318,13 @@ async def cmd_drop(ctx):
     session_state[guild_id] = "staging"
     stock[guild_id] = {}
     claims[guild_id] = defaultdict(list)
+    waitlist[guild_id] = defaultdict(list)
     stock_message.pop(guild_id, None)
     pinned_message.pop(guild_id, None)
     autoclose[guild_id] = True
-    # Remember this manager's active drop channel for DM commands
     manager_session[ctx.author.id] = {"guild_id": guild_id, "channel": ctx.channel}
     await silent(ctx)
-    await dm(ctx, f"✅  Drop session started for **{ctx.guild.name}**!\nYou can now use `!addstock`, `!removestockitem`, `!release`, `!claimlist`, `!autoclose`, and `!enddrop` from this DM or in the server.\n\n💡  Auto-close is **ON**.")
+    await dm(ctx, f"✅  Drop session started for **{ctx.guild.name}**!\nYou can now use `!addstock`, `!editstock`, `!removestockitem`, `!preview`, `!countdown`, `!release`, `!claimlist`, `!autoclose`, and `!enddrop` from this DM or in the server.\n\n💡  Auto-close is **ON**.")
 
 
 @bot.command(name="addstock")
@@ -306,8 +339,6 @@ async def cmd_addstock(ctx, *, args=""):
     if session_state[guild_id] == "closed":
         await dm(ctx, "⚠️  No drop session active. Use `!drop` in your server first.")
         return
-
-    # Parse optional "limit N" at the end
     limit = None
     parts = args.split()
     if len(parts) >= 2 and parts[-2].lower() == "limit":
@@ -317,26 +348,64 @@ async def cmd_addstock(ctx, *, args=""):
         except ValueError:
             await dm(ctx, "⚠️  Limit must be a whole number. Example: `!addstock PRE ETB 1 100 limit 1`")
             return
-
     if len(parts) < 3:
         await dm(ctx, "Usage: `!addstock <item name> <qty> <price> [limit <n>]`\nExamples:\n`!addstock PRE ETB 1 100`\n`!addstock PRE ETB 3 100 limit 1`")
         return
-
     price_str = parts[-1]
     qty_str = parts[-2]
     item_name = " ".join(parts[:-2])
-
     try:
         qty = int(qty_str)
         price = parse_price(price_str)
     except ValueError:
         await dm(ctx, f"⚠️  Couldn't read qty/price from `{qty_str}` / `{price_str}`")
         return
-
     key = normalize(item_name)
     stock[guild_id][key] = {"display": item_name.upper(), "qty": qty, "price": price, "limit": limit}
     limit_str = f"  •  max **{limit}** per person" if limit else "  •  no per-person limit"
     await dm(ctx, f"✅  **{item_name.upper()}** — {qty} @ ${price:.2f} each{limit_str}.")
+
+
+@bot.command(name="editstock")
+async def cmd_editstock(ctx, *, args=""):
+    guild_id, drop_channel = get_manager_context(ctx)
+    if guild_id is None:
+        if not ctx.guild:
+            await ctx.author.send("⚠️  No active drop session found. Run `!drop` in your server first.")
+        return
+    if ctx.guild:
+        await silent(ctx)
+    if session_state[guild_id] == "closed":
+        await dm(ctx, "⚠️  No drop session active.")
+        return
+    parts = args.split()
+    if len(parts) < 3:
+        await dm(ctx, "Usage: `!editstock <item name> <qty> <price>`\nExample: `!editstock PRE ETB 2 110`")
+        return
+    price_str = parts[-1]
+    qty_str = parts[-2]
+    item_name = " ".join(parts[:-2])
+    try:
+        qty = int(qty_str)
+        price = parse_price(price_str)
+    except ValueError:
+        await dm(ctx, f"⚠️  Couldn't read qty/price from `{qty_str}` / `{price_str}`")
+        return
+    key = normalize(item_name)
+    if key not in stock[guild_id]:
+        matches = [k for k in stock[guild_id] if normalize(item_name) in k or k in normalize(item_name)]
+        if len(matches) == 1:
+            key = matches[0]
+        else:
+            names = ", ".join(f"`{s['display']}`" for s in stock[guild_id].values())
+            await dm(ctx, f"⚠️  Item not found. Current stock: {names}")
+            return
+    stock[guild_id][key]["qty"] = qty
+    stock[guild_id][key]["price"] = price
+    # Update live embed if drop is already released
+    if session_state[guild_id] == "live":
+        await update_stock_embed(guild_id)
+    await dm(ctx, f"✅  **{stock[guild_id][key]['display']}** updated — {qty} @ ${price:.2f} each.")
 
 
 @bot.command(name="removestockitem")
@@ -362,6 +431,49 @@ async def cmd_removestockitem(ctx, *, item_name=""):
             return
     removed = stock[guild_id].pop(key)
     await dm(ctx, f"🗑️  **{removed['display']}** removed from stock.")
+
+
+@bot.command(name="preview")
+async def cmd_preview(ctx):
+    guild_id, drop_channel = get_manager_context(ctx)
+    if guild_id is None:
+        if not ctx.guild:
+            await ctx.author.send("⚠️  No active drop session found. Run `!drop` in your server first.")
+        return
+    if ctx.guild:
+        await silent(ctx)
+    if not stock[guild_id]:
+        await dm(ctx, "⚠️  No stock loaded yet. Use `!addstock` first.")
+        return
+    await ctx.author.send(content="👀  **Drop preview — this is what members will see when you !release:**", embed=build_stock_embed(guild_id))
+
+
+@bot.command(name="countdown")
+async def cmd_countdown(ctx, minutes: str = ""):
+    guild_id, drop_channel = get_manager_context(ctx)
+    if guild_id is None:
+        if not ctx.guild:
+            await ctx.author.send("⚠️  No active drop session found. Run `!drop` in your server first.")
+        return
+    if ctx.guild:
+        await silent(ctx)
+    try:
+        mins = int(minutes)
+        if mins < 1 or mins > 60:
+            raise ValueError
+    except ValueError:
+        await dm(ctx, "⚠️  Please provide a number of minutes between 1 and 60. Example: `!countdown 5`")
+        return
+
+    await drop_channel.send(f"⏳  **Drop incoming in {mins} minute{'s' if mins != 1 else ''}!** Get ready to claim — first come, first served! 🔥")
+    await dm(ctx, f"✅  Countdown posted — drop announced in {mins} minute{'s' if mins != 1 else ''}.")
+
+    async def auto_remind():
+        if mins >= 2:
+            await asyncio.sleep((mins - 1) * 60)
+            if session_state[guild_id] != "live":
+                await drop_channel.send("⏰  **1 minute until the drop!** Stay ready!")
+    asyncio.create_task(auto_remind())
 
 
 @bot.command(name="autoclose")
@@ -402,7 +514,8 @@ async def cmd_release(ctx):
     session_state[guild_id] = "live"
     msg = await drop_channel.send(embed=build_stock_embed(guild_id))
     stock_message[guild_id] = msg
-    await drop_channel.send("🟢  **Drop is LIVE!**  Use `!claim <item> <qty>` to grab yours — first come, first served!")
+    await drop_channel.send("🟢  **Drop is LIVE!**  First come, first served!")
+    await drop_channel.send(embed=build_howto_embed())
     try:
         await msg.pin()
         pinned_message[guild_id] = msg
@@ -438,8 +551,7 @@ async def cmd_claimlist(ctx):
     if session_state[guild_id] == "closed":
         await dm(ctx, "No active drop.")
         return
-    embed = build_claimlist_embed(guild_id)
-    await ctx.author.send(embed=embed)
+    await ctx.author.send(embed=build_claimlist_embed(guild_id))
 
 
 # ── PUBLIC COMMANDS ───────────────────────────────────────────────────────────
@@ -498,7 +610,12 @@ async def cmd_claim(ctx, *, args=""):
     already_claimed = sum(c["qty"] for c in claims[guild_id][key])
     remaining = info["qty"] - already_claimed
     if remaining <= 0:
-        await ctx.send(f"😔  **{info['display']}** is sold out!")
+        wl = waitlist[guild_id][key]
+        already_on_wl = any(u.id == ctx.author.id for u in wl)
+        if already_on_wl:
+            await ctx.send(f"😔  **{info['display']}** is sold out and you're already on the waitlist.")
+        else:
+            await ctx.send(f"😔  **{info['display']}** is sold out! Use `!waitlist {info['display']}` to be notified if it opens up.")
         return
     if qty > remaining:
         await ctx.send(f"⚠️  Only **{remaining}** of **{info['display']}** left. Try `!claim {info['display']} {remaining}`")
@@ -561,15 +678,54 @@ async def cmd_unclaim(ctx, *, args=""):
         await ctx.send("You don't have a claim on that item.")
         return
     if qty is None or qty >= existing["qty"]:
+        freed = existing["qty"]
         claims[guild_id][key].remove(existing)
         await ctx.send(f"↩️  **{ctx.author.display_name}** removed their entire claim on **{stock[guild_id][key]['display']}**.")
     else:
         if qty < 1:
             await ctx.send("⚠️  Qty must be at least 1.")
             return
+        freed = qty
         existing["qty"] -= qty
         await ctx.send(f"↩️  **{ctx.author.display_name}** removed **{qty}x {stock[guild_id][key]['display']}** from their claim. ({existing['qty']} still claimed)")
     await update_stock_embed(guild_id)
+    await notify_waitlist(guild_id, key, freed)
+
+
+@bot.command(name="waitlist")
+async def cmd_waitlist(ctx, *, item_name=""):
+    if not ctx.guild:
+        await ctx.author.send("⚠️  Please use `!waitlist` in your server channel.")
+        return
+    guild_id = ctx.guild.id
+    if session_state[guild_id] != "live":
+        await ctx.send("⚠️  No active drop right now.")
+        return
+    if not item_name:
+        await ctx.send("Usage: `!waitlist <item>`  e.g. `!waitlist PRE ETB`")
+        return
+    key = normalize(item_name)
+    if key not in stock[guild_id]:
+        matches = [k for k in stock[guild_id] if normalize(item_name) in k or k in normalize(item_name)]
+        if len(matches) == 1:
+            key = matches[0]
+        else:
+            names = ", ".join(f"`{s['display']}`" for s in stock[guild_id].values())
+            await ctx.send(f"⚠️  Item not found. Available: {names}")
+            return
+    info = stock[guild_id][key]
+    already_claimed = sum(c["qty"] for c in claims[guild_id][key])
+    remaining = info["qty"] - already_claimed
+    if remaining > 0:
+        await ctx.send(f"**{info['display']}** is still available! Use `!claim {info['display']} 1` to grab it.")
+        return
+    already_on_wl = any(u.id == ctx.author.id for u in waitlist[guild_id][key])
+    if already_on_wl:
+        await ctx.send(f"You're already on the waitlist for **{info['display']}**. We'll DM you if it opens up!")
+        return
+    waitlist[guild_id][key].append(ctx.author)
+    pos = len(waitlist[guild_id][key])
+    await ctx.send(f"✅  **{ctx.author.display_name}** added to the waitlist for **{info['display']}** (position #{pos}). You'll be notified if it becomes available!")
 
 
 @bot.command(name="myclaims")
