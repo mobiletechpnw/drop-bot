@@ -1275,13 +1275,13 @@ async def cmd_myclaims(ctx):
 
 @bot.command(name="history")
 async def cmd_history(ctx):
-    guild_id, drop_channel = get_manager_context(ctx)
-    if guild_id is None:
-        if not ctx.guild:
-            await ctx.author.send("⚠️  Please run this in your server or after starting a drop.")
+    if not ctx.guild:
+        await ctx.author.send("⚠️  Please run `!history` in your server channel.")
         return
-    if ctx.guild:
-        await silent(ctx)
+    guild_id = ctx.guild.id
+    if not is_manager(guild_id, ctx.author.id):
+        return
+    await silent(ctx)
 
     import json
     async with db_pool.acquire() as conn:
@@ -1326,13 +1326,13 @@ async def cmd_history(ctx):
 
 @bot.command(name="bump")
 async def cmd_bump(ctx):
-    guild_id, drop_channel = get_manager_context(ctx)
-    if guild_id is None:
-        if not ctx.guild:
-            await ctx.author.send("⚠️  No active drop session found.")
+    if not ctx.guild:
+        await ctx.author.send("⚠️  Please run `!bump` in your server channel.")
         return
-    if ctx.guild:
-        await silent(ctx)
+    guild_id = ctx.guild.id
+    if not is_manager(guild_id, ctx.author.id):
+        return
+    await silent(ctx)
     if not ctx.message.mentions:
         await dm(ctx, "Usage: `!bump @user`")
         return
@@ -1372,13 +1372,14 @@ async def cmd_bump(ctx):
 
 @bot.command(name="remind")
 async def cmd_remind(ctx):
-    guild_id, drop_channel = get_manager_context(ctx)
-    if guild_id is None:
-        if not ctx.guild:
-            await ctx.author.send("⚠️  No active drop session found.")
+    if not ctx.guild:
+        await ctx.author.send("⚠️  Please run `!remind` in your server channel.")
         return
-    if ctx.guild:
-        await silent(ctx)
+    guild_id = ctx.guild.id
+    if not is_manager(guild_id, ctx.author.id):
+        return
+    await silent(ctx)
+    drop_channel = get_drop_channel(ctx.guild) or ctx.channel
 
     # Build list of unpaid claimers
     unpaid_mentions = []
