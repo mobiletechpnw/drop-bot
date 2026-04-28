@@ -48,6 +48,7 @@ PREFIX = "!"
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.reactions = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
 # ── DATABASE ──────────────────────────────────────────────────────────────────
@@ -79,6 +80,17 @@ async def init_db():
                 zelle TEXT,
                 cashapp TEXT,
                 applepay TEXT
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS drop_history (
+                id SERIAL PRIMARY KEY,
+                guild_id BIGINT NOT NULL,
+                closed_at TIMESTAMP NOT NULL,
+                total_revenue NUMERIC NOT NULL,
+                total_items INT NOT NULL,
+                unique_buyers INT NOT NULL,
+                summary JSONB NOT NULL
             )
         """)
     print("✅  Database ready.")
@@ -132,8 +144,16 @@ async def db_remove_manager(guild_id, user_id):
         """, guild_id, user_id)
 
 
-async def db_save_settings(guild_id):
-    s = server_settings.get(guild_id, {})
+async def db_save_drop_history(guild_id, revenue, total_items, unique_buyers, summary):
+    import json
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO drop_history (guild_id, closed_at, total_revenue, total_items, unique_buyers, summary)
+            VALUES ($1, $2, $3, $4, $5, $6)
+        """, guild_id, datetime.datetime.utcnow(), revenue, total_items, unique_buyers, json.dumps(summary))
+
+
+async def db_save_settings(guild_id):    s = server_settings.get(guild_id, {})
     async with db_pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO server_settings (guild_id, drop_channel_id, venmo, zelle, cashapp, applepay)
@@ -167,6 +187,10 @@ payments = defaultdict(lambda: defaultdict(list))
 
 # payment_board_message[guild_id] = Message (the live payment board embed)
 payment_board_message = {}
+
+# pending_payment_messages[message_id] = {"guild_id": int, "buyer_id": int}
+# Maps manager ping messages to the buyer so ✅ reaction confirms them
+pending_payment_messages = {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -363,6 +387,25 @@ async def close_drop(channel, guild_id):
 
     payment_info = build_payment_info(guild_id)
 
+    # Save drop history to database
+    history_summary = {}
+    total_revenue = 0.0
+    total_items = 0
+    buyers = set()
+    for key, claim_list in claims[guild_id].items():
+        if not claim_list:
+            continue
+        item_display = stock[guild_id][key]["display"] if key in stock[guild_id] else key
+        item_price = stock[guild_id][key]["price"] if key in stock[guild_id] else 0
+        item_qty = sum(c["qty"] for c in claim_list)
+        item_revenue = item_qty * item_price
+        total_revenue += item_revenue
+        total_items += item_qty
+        for c in claim_list:
+            buyers.add(c["user"].id)
+        history_summary[item_display] = {"qty": item_qty, "revenue": item_revenue}
+    await db_save_drop_history(guild_id, total_revenue, total_items, len(buyers), history_summary)
+
     # DM every claimer their summary + payment info
     claimer_totals = defaultdict(list)
     for key, claim_list in claims[guild_id].items():
@@ -463,6 +506,58 @@ async def on_ready():
     await init_db()
     await db_load_all()
     print(f"✅  Logged in as {bot.user} ({bot.user.id})")
+
+
+@bot.event
+async def on_reaction_add(reaction, user):
+    """Allow managers to confirm payment by reacting ✅ to the ping message."""
+    if user.bot:
+        return
+    if str(reaction.emoji) != "✅":
+        return
+    msg_id = reaction.message.id
+    if msg_id not in pending_payment_messages:
+        return
+
+    data = pending_payment_messages[msg_id]
+    guild_id = data["guild_id"]
+    buyer_id = data["buyer_id"]
+
+    # Only managers can confirm
+    if not is_manager(guild_id, user.id):
+        return
+
+    # Mark pending payments as confirmed
+    user_pmts = payments[guild_id][buyer_id]
+    pending = [p for p in user_pmts if not p["confirmed"]]
+    if not pending:
+        return
+
+    for p in pending:
+        p["confirmed"] = True
+
+    total_confirmed = sum(p["amount"] for p in pending)
+
+    # Remove from pending so it can't be double-confirmed
+    del pending_payment_messages[msg_id]
+
+    # Update payment board
+    await update_payment_board(guild_id)
+
+    # DM the buyer
+    guild = reaction.message.guild
+    buyer = guild.get_member(buyer_id)
+    if buyer:
+        try:
+            await buyer.send(f"✅  Your payment of **${total_confirmed:.2f}** has been confirmed! Thanks so much — enjoy your order! 🎉")
+        except discord.Forbidden:
+            pass
+
+    # Edit the ping message to show it's been handled
+    try:
+        await reaction.message.edit(content=reaction.message.content + f"\n✅  Confirmed by {user.display_name}")
+    except (discord.Forbidden, discord.NotFound):
+        pass
 
 
 # ── SETUP & MANAGER COMMANDS ──────────────────────────────────────────────────
@@ -927,18 +1022,21 @@ async def cmd_paid(ctx, *, args=""):
         for c in claim_list
     )
     if not has_claims:
-        await ctx.send("⚠️  You don't have any claims in the current drop.")
+        await ctx.author.send("⚠️  You don't have any claims in the current drop.")
+        await silent(ctx)
         return
 
     parts = args.split()
     if len(parts) < 2:
-        await ctx.send("Usage: `!paid <method> <amount>`  e.g. `!paid venmo $125`")
+        await ctx.author.send("Usage: `!paid <method> <amount>`  e.g. `!paid venmo $125`")
+        await silent(ctx)
         return
 
     method = parts[0].lower()
     valid_methods = ["venmo", "zelle", "cashapp", "applepay", "apple"]
     if method not in valid_methods:
-        await ctx.send(f"⚠️  Payment method not recognized. Use: venmo, zelle, cashapp, or applepay")
+        await ctx.author.send("⚠️  Payment method not recognized. Use: venmo, zelle, cashapp, or applepay")
+        await silent(ctx)
         return
     if method == "apple":
         method = "applepay"
@@ -946,8 +1044,12 @@ async def cmd_paid(ctx, *, args=""):
     try:
         amount = parse_price(parts[1])
     except ValueError:
-        await ctx.send(f"⚠️  Couldn't read amount from `{parts[1]}`. Example: `!paid venmo $125`")
+        await ctx.author.send(f"⚠️  Couldn't read amount from `{parts[1]}`. Example: `!paid venmo $125`")
+        await silent(ctx)
         return
+
+    # Delete buyer's message from channel to keep chat clean
+    await silent(ctx)
 
     # Log the payment
     payments[guild_id][ctx.author.id].append({
@@ -967,19 +1069,24 @@ async def cmd_paid(ctx, *, args=""):
     total_paid = sum(p["amount"] for p in payments[guild_id][ctx.author.id])
     remaining = total_owed - total_paid
 
-    await ctx.send(
-        f"💳  **{ctx.author.display_name}** reported **${amount:.2f}** via **{method.title()}**.\n"
+    # DM the buyer their confirmation — not posted in channel
+    await ctx.author.send(
+        f"💳  Payment of **${amount:.2f}** via **{method.title()}** received!\n"
         f"Total owed: ${total_owed:.2f}  •  Total reported: ${total_paid:.2f}"
-        + (f"  •  Still outstanding: **${remaining:.2f}**" if remaining > 0.01 else "  •  ✅ Fully paid!")
+        + (f"  •  Still outstanding: **${remaining:.2f}**" if remaining > 0.01 else "  •  ✅ Fully reported! Waiting on confirmation.")
     )
 
-    # Ping managers
+    # Ping managers with a ✅ reaction they can click to confirm
     drop_ch = get_drop_channel(ctx.guild) or ctx.channel
     manager_mentions = " ".join(f"<@{uid}>" for uid in server_managers[guild_id])
-    await drop_ch.send(
-        f"💰  {manager_mentions} — **{ctx.author.display_name}** reported payment of **${amount:.2f}** via **{method.title()}**. "
-        f"Use `!confirm @{ctx.author.display_name}` to confirm receipt."
+    ping_msg = await drop_ch.send(
+        f"💰  {manager_mentions} — **{ctx.author.display_name}** reported payment of **${amount:.2f}** via **{method.title()}**.\n"
+        f"React ✅ to confirm or use `!confirm @{ctx.author.display_name}`.",
+        allowed_mentions=discord.AllowedMentions(users=True)
     )
+    await ping_msg.add_reaction("✅")
+    # Store message -> buyer mapping so reaction handler knows who to confirm
+    pending_payment_messages[ping_msg.id] = {"guild_id": guild_id, "buyer_id": ctx.author.id}
 
 
 @bot.command(name="claim")
@@ -1164,6 +1271,146 @@ async def cmd_myclaims(ctx):
         return
     lines = "\n".join(user_claims)
     await ctx.send(f"**{ctx.author.display_name}'s claims:**\n{lines}\n**Total owed: ${total:.2f}**")
+
+
+@bot.command(name="history")
+async def cmd_history(ctx):
+    guild_id, drop_channel = get_manager_context(ctx)
+    if guild_id is None:
+        if not ctx.guild:
+            await ctx.author.send("⚠️  Please run this in your server or after starting a drop.")
+        return
+    if ctx.guild:
+        await silent(ctx)
+
+    import json
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT closed_at, total_revenue, total_items, unique_buyers, summary
+            FROM drop_history
+            WHERE guild_id = $1
+            ORDER BY closed_at DESC
+            LIMIT 10
+        """, guild_id)
+
+    if not rows:
+        await ctx.author.send("No drop history yet. History is saved automatically when you run `!enddrop`.")
+        return
+
+    embed = discord.Embed(
+        title="📊  Drop History (Last 10)",
+        color=discord.Color.blurple(),
+        timestamp=datetime.datetime.utcnow()
+    )
+
+    all_revenue = 0.0
+    all_items = 0
+    for i, row in enumerate(rows):
+        summary = json.loads(row["summary"])
+        date_str = row["closed_at"].strftime("%b %d, %Y")
+        item_lines = "\n".join(
+            f"• {item}: ×{data['qty']} — ${data['revenue']:.2f}"
+            for item, data in summary.items()
+        )
+        embed.add_field(
+            name=f"Drop #{len(rows) - i}  •  {date_str}  •  ${row['total_revenue']:.2f}",
+            value=f"{item_lines}\n{row['total_items']} items  •  {row['unique_buyers']} buyer(s)",
+            inline=False
+        )
+        all_revenue += float(row["total_revenue"])
+        all_items += row["total_items"]
+
+    embed.set_footer(text=f"All-time total: ${all_revenue:.2f} across {all_items} items")
+    await ctx.author.send(embed=embed)
+
+
+@bot.command(name="bump")
+async def cmd_bump(ctx):
+    guild_id, drop_channel = get_manager_context(ctx)
+    if guild_id is None:
+        if not ctx.guild:
+            await ctx.author.send("⚠️  No active drop session found.")
+        return
+    if ctx.guild:
+        await silent(ctx)
+    if not ctx.message.mentions:
+        await dm(ctx, "Usage: `!bump @user`")
+        return
+
+    user = ctx.message.mentions[0]
+
+    # Calculate what they owe
+    total_owed = sum(
+        c["qty"] * stock[guild_id][key]["price"]
+        for key, claim_list in claims[guild_id].items()
+        for c in claim_list
+        if c["user"].id == user.id
+    )
+    if total_owed == 0:
+        await dm(ctx, f"⚠️  **{user.display_name}** doesn't have any claims.")
+        return
+
+    confirmed = sum(p["amount"] for p in payments[guild_id][user.id] if p["confirmed"])
+    remaining = total_owed - confirmed
+
+    if remaining <= 0.01:
+        await dm(ctx, f"✅  **{user.display_name}** is already fully paid!")
+        return
+
+    payment_info = build_payment_info(guild_id)
+
+    try:
+        await user.send(
+            f"👋  Hey! Just a friendly reminder that you have an outstanding balance of **${remaining:.2f}** from the recent drop.\n\n"
+            f"**Send payment using one of these methods:**\n{payment_info}\n\n"
+            f"Once sent, run `!paid <method> <amount>` in the server to let us know. Thanks!"
+        )
+        await dm(ctx, f"✅  Bump sent to **{user.display_name}** — they owe **${remaining:.2f}**.")
+    except discord.Forbidden:
+        await dm(ctx, f"⚠️  Couldn't DM **{user.display_name}** — their DMs may be closed.")
+
+
+@bot.command(name="remind")
+async def cmd_remind(ctx):
+    guild_id, drop_channel = get_manager_context(ctx)
+    if guild_id is None:
+        if not ctx.guild:
+            await ctx.author.send("⚠️  No active drop session found.")
+        return
+    if ctx.guild:
+        await silent(ctx)
+
+    # Build list of unpaid claimers
+    unpaid_mentions = []
+    for key, claim_list in claims[guild_id].items():
+        for c in claim_list:
+            uid = c["user"].id
+            total_owed = sum(
+                cc["qty"] * stock[guild_id][k]["price"]
+                for k, cl in claims[guild_id].items()
+                for cc in cl
+                if cc["user"].id == uid
+            )
+            confirmed = sum(p["amount"] for p in payments[guild_id][uid] if p["confirmed"])
+            if total_owed - confirmed > 0.01:
+                mention = f"<@{uid}>"
+                if mention not in unpaid_mentions:
+                    unpaid_mentions.append(mention)
+
+    if not unpaid_mentions:
+        await dm(ctx, "✅  Everyone has been confirmed — no outstanding payments!")
+        return
+
+    payment_info = build_payment_info(guild_id)
+    mentions_str = " ".join(unpaid_mentions)
+
+    await drop_channel.send(
+        f"⏰  **Payment Reminder** — {mentions_str}\n\n"
+        f"You have an outstanding balance from the recent drop. Please send payment using one of these methods:\n"
+        f"{payment_info}\n\n"
+        f"Once sent, type `!paid <method> <amount>` to confirm. Thanks!"
+    )
+    await dm(ctx, f"✅  Reminder posted for {len(unpaid_mentions)} unpaid buyer(s).")
 
 
 bot.run(BOT_TOKEN)
