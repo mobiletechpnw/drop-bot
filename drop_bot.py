@@ -23,13 +23,16 @@ Manager/Admin commands (server or DM after !drop):
   !claimlist
   !unpaid                          — List buyers who haven't been confirmed yet
   !confirm @user                   — Mark a buyer as fully paid
+  !bump @user                      — DM a buyer a payment reminder
+  !remind                          — Tag all unpaid buyers in the drop channel
+  !history                         — View last 10 drop summaries
   !enddrop
 
 Public commands (anyone, in server only):
   !claim <item> <qty>
   !unclaim <item> <qty>
   !waitlist <item>
-  !paid <method> <amount>          — e.g. !paid venmo $125 — works during and after drop
+  !paid <method> <amount>          — works during and after drop
   !stock
   !myclaims
 """
@@ -39,6 +42,7 @@ from discord.ext import commands
 from collections import defaultdict
 import datetime
 import asyncio
+import json
 import os
 import asyncpg
 
@@ -48,12 +52,14 @@ PREFIX = "!"
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.reactions = True
+intents.guild_reactions = True
+intents.dm_reactions = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
 # ── DATABASE ──────────────────────────────────────────────────────────────────
 
 db_pool = None
+
 
 async def init_db():
     global db_pool
@@ -145,7 +151,6 @@ async def db_remove_manager(guild_id, user_id):
 
 
 async def db_save_drop_history(guild_id, revenue, total_items, unique_buyers, summary):
-    import json
     async with db_pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO drop_history (guild_id, closed_at, total_revenue, total_items, unique_buyers, summary)
@@ -153,7 +158,8 @@ async def db_save_drop_history(guild_id, revenue, total_items, unique_buyers, su
         """, guild_id, datetime.datetime.utcnow(), revenue, total_items, unique_buyers, json.dumps(summary))
 
 
-async def db_save_settings(guild_id):    s = server_settings.get(guild_id, {})
+async def db_save_settings(guild_id):
+    s = server_settings.get(guild_id, {})
     async with db_pool.acquire() as conn:
         await conn.execute("""
             INSERT INTO server_settings (guild_id, drop_channel_id, venmo, zelle, cashapp, applepay)
@@ -172,7 +178,7 @@ async def db_save_settings(guild_id):    s = server_settings.get(guild_id, {})
 
 server_admins = {}
 server_managers = defaultdict(set)
-server_settings = {}  # guild_id -> {drop_channel_id, venmo, zelle, cashapp, applepay}
+server_settings = {}
 session_state = defaultdict(lambda: "closed")
 stock = defaultdict(dict)
 claims = defaultdict(lambda: defaultdict(list))
@@ -181,16 +187,13 @@ stock_message = {}
 pinned_message = {}
 autoclose = defaultdict(lambda: True)
 manager_session = {}
-
-# payments[guild_id][user_id] = [{"method": str, "amount": float, "time": datetime, "confirmed": bool}, ...]
 payments = defaultdict(lambda: defaultdict(list))
-
-# payment_board_message[guild_id] = Message (the live payment board embed)
 payment_board_message = {}
-
-# pending_payment_messages[message_id] = {"guild_id": int, "buyer_id": int}
-# Maps manager ping messages to the buyer so ✅ reaction confirms them
 pending_payment_messages = {}
+
+# Snapshot of stock prices at drop close for bump/remind to reference after stock resets
+# last_drop_snapshot[guild_id] = {"claims": {...}, "stock": {...}}
+last_drop_snapshot = {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -242,7 +245,6 @@ def get_manager_context(ctx):
 
 
 def get_drop_channel(guild):
-    """Get the configured drop channel for a guild."""
     s = server_settings.get(guild.id, {})
     channel_id = s.get("drop_channel_id")
     if channel_id:
@@ -251,7 +253,6 @@ def get_drop_channel(guild):
 
 
 def build_payment_info(guild_id):
-    """Build a formatted payment info string from server settings."""
     s = server_settings.get(guild_id, {})
     lines = []
     if s.get("venmo"):
@@ -263,6 +264,18 @@ def build_payment_info(guild_id):
     if s.get("applepay"):
         lines.append(f"🍎  Apple Pay: **{s['applepay']}**")
     return "\n".join(lines) if lines else "No payment info configured."
+
+
+def get_user_total_owed(guild_id, user_id):
+    """Calculate total owed using live stock if available, else last snapshot."""
+    stock_ref = stock[guild_id] if stock[guild_id] else last_drop_snapshot.get(guild_id, {}).get("stock", {})
+    claims_ref = claims[guild_id] if claims[guild_id] else last_drop_snapshot.get(guild_id, {}).get("claims", {})
+    return sum(
+        c["qty"] * stock_ref[key]["price"]
+        for key, claim_list in claims_ref.items()
+        for c in claim_list
+        if c["user"].id == user_id and key in stock_ref
+    )
 
 
 def build_stock_embed(guild_id):
@@ -281,17 +294,19 @@ def build_stock_embed(guild_id):
 def build_claimlist_embed(guild_id, title="📋  Claim List"):
     embed = discord.Embed(title=title, color=discord.Color.blurple(), timestamp=datetime.datetime.utcnow())
     any_claims = False
-    for key, claim_list in claims[guild_id].items():
+    stock_ref = stock[guild_id] if stock[guild_id] else last_drop_snapshot.get(guild_id, {}).get("stock", {})
+    claims_ref = claims[guild_id] if claims[guild_id] else last_drop_snapshot.get(guild_id, {}).get("claims", {})
+    for key, claim_list in claims_ref.items():
         if not claim_list:
             continue
         any_claims = True
         lines = [
-            f"• **{c['user'].display_name}**  ×{c['qty']}  — ${c['qty'] * stock[guild_id][key]['price']:.2f}"
-            for c in claim_list
+            f"• **{c['user'].display_name}**  ×{c['qty']}  — ${c['qty'] * stock_ref[key]['price']:.2f}"
+            for c in claim_list if key in stock_ref
         ]
         embed.add_field(
-            name=stock[guild_id][key]["display"] if key in stock[guild_id] else key,
-            value="\n".join(lines),
+            name=stock_ref[key]["display"] if key in stock_ref else key,
+            value="\n".join(lines) if lines else "—",
             inline=False
         )
     if not any_claims:
@@ -316,7 +331,6 @@ def build_howto_embed():
 
 
 def build_payment_board_embed(guild_id):
-    """Build the live payment board showing confirmed payments."""
     embed = discord.Embed(
         title="💳  Payment Board",
         color=discord.Color.green(),
@@ -338,7 +352,6 @@ def build_payment_board_embed(guild_id):
 
 
 async def update_payment_board(guild_id):
-    """Edit the payment board message in place."""
     msg = payment_board_message.get(guild_id)
     if msg:
         try:
@@ -378,14 +391,11 @@ async def close_drop(channel, guild_id):
         except (discord.Forbidden, discord.HTTPException):
             pass
 
-    embed = build_claimlist_embed(guild_id, title="🔴  Drop CLOSED — Final Claim List")
-    await channel.send(embed=embed)
-
-    # Post payment board in drop channel
-    board_msg = await channel.send(embed=build_payment_board_embed(guild_id))
-    payment_board_message[guild_id] = board_msg
-
-    payment_info = build_payment_info(guild_id)
+    # Save snapshot before anything gets cleared
+    last_drop_snapshot[guild_id] = {
+        "stock": dict(stock[guild_id]),
+        "claims": {k: list(v) for k, v in claims[guild_id].items()}
+    }
 
     # Save drop history to database
     history_summary = {}
@@ -406,7 +416,14 @@ async def close_drop(channel, guild_id):
         history_summary[item_display] = {"qty": item_qty, "revenue": item_revenue}
     await db_save_drop_history(guild_id, total_revenue, total_items, len(buyers), history_summary)
 
-    # DM every claimer their summary + payment info
+    embed = build_claimlist_embed(guild_id, title="🔴  Drop CLOSED — Final Claim List")
+    await channel.send(embed=embed)
+
+    board_msg = await channel.send(embed=build_payment_board_embed(guild_id))
+    payment_board_message[guild_id] = board_msg
+
+    payment_info = build_payment_info(guild_id)
+
     claimer_totals = defaultdict(list)
     for key, claim_list in claims[guild_id].items():
         for c in claim_list:
@@ -444,7 +461,6 @@ async def dm(ctx, message):
 
 
 async def collect_payment_info(user, guild_id):
-    """Walk the admin through setting up payment info via DM."""
     def check(m):
         return m.author.id == user.id and isinstance(m.channel, discord.DMChannel)
 
@@ -475,20 +491,19 @@ async def collect_payment_info(user, guild_id):
 
 
 async def collect_drop_channel(user, guild):
-    """Ask the admin which channel drops should go in."""
     def check(m):
         return m.author.id == user.id and isinstance(m.channel, discord.DMChannel)
 
     await user.send(
-        f"📢  Which channel should drops be posted in?\n"
-        f"Please **mention the channel** in your server (e.g. `#drops`)."
+        "📢  Which channel should drops be posted in?\n"
+        "Please **mention the channel** in your server (e.g. `#drops`)."
     )
 
     try:
         msg = await bot.wait_for("message", check=check, timeout=120)
         if msg.channel_mentions:
             channel = msg.channel_mentions[0]
-            if guild_id not in server_settings:
+            if guild.id not in server_settings:
                 server_settings[guild.id] = {}
             server_settings[guild.id]["drop_channel_id"] = channel.id
             await db_save_settings(guild.id)
@@ -501,6 +516,8 @@ async def collect_drop_channel(user, guild):
     return None
 
 
+# ── EVENTS ────────────────────────────────────────────────────────────────────
+
 @bot.event
 async def on_ready():
     await init_db()
@@ -510,7 +527,6 @@ async def on_ready():
 
 @bot.event
 async def on_reaction_add(reaction, user):
-    """Allow managers to confirm payment by reacting ✅ to the ping message."""
     if user.bot:
         return
     if str(reaction.emoji) != "✅":
@@ -523,11 +539,9 @@ async def on_reaction_add(reaction, user):
     guild_id = data["guild_id"]
     buyer_id = data["buyer_id"]
 
-    # Only managers can confirm
     if not is_manager(guild_id, user.id):
         return
 
-    # Mark pending payments as confirmed
     user_pmts = payments[guild_id][buyer_id]
     pending = [p for p in user_pmts if not p["confirmed"]]
     if not pending:
@@ -537,14 +551,10 @@ async def on_reaction_add(reaction, user):
         p["confirmed"] = True
 
     total_confirmed = sum(p["amount"] for p in pending)
-
-    # Remove from pending so it can't be double-confirmed
     del pending_payment_messages[msg_id]
 
-    # Update payment board
     await update_payment_board(guild_id)
 
-    # DM the buyer
     guild = reaction.message.guild
     buyer = guild.get_member(buyer_id)
     if buyer:
@@ -553,9 +563,8 @@ async def on_reaction_add(reaction, user):
         except discord.Forbidden:
             pass
 
-    # Edit the ping message to show it's been handled
     try:
-        await reaction.message.edit(content=reaction.message.content + f"\n✅  Confirmed by {user.display_name}")
+        await reaction.message.edit(content=reaction.message.content + f"\n✅  Confirmed by **{user.display_name}**")
     except (discord.Forbidden, discord.NotFound):
         pass
 
@@ -576,8 +585,6 @@ async def cmd_setup(ctx):
     await db_set_admin(guild_id, ctx.author.id)
     await db_add_manager(guild_id, ctx.author.id)
     await ctx.send(f"✅  **{ctx.author.display_name}** is now the drop admin! Check your DMs to finish setup.")
-
-    # Walk through drop channel + payment info setup via DM
     await collect_drop_channel(ctx.author, ctx.guild)
     await collect_payment_info(ctx.author, guild_id)
 
@@ -678,10 +685,7 @@ async def cmd_drop(ctx):
     guild_id = ctx.guild.id
     if not is_manager(guild_id, ctx.author.id):
         return
-
-    # Use configured drop channel if set, otherwise use current channel
     drop_ch = get_drop_channel(ctx.guild) or ctx.channel
-
     session_state[guild_id] = "staging"
     stock[guild_id] = {}
     claims[guild_id] = defaultdict(list)
@@ -693,7 +697,7 @@ async def cmd_drop(ctx):
     autoclose[guild_id] = True
     manager_session[ctx.author.id] = {"guild_id": guild_id, "channel": drop_ch}
     await silent(ctx)
-    await dm(ctx, f"✅  Drop session started for **{ctx.guild.name}**! Drop will post in **#{drop_ch.name}**.\n\nYou can now use `!addstock`, `!editstock`, `!removestockitem`, `!preview`, `!countdown`, `!release`, `!claimlist`, `!autoclose`, and `!enddrop` from this DM or in the server.\n\n💡  Auto-close is **ON**.")
+    await dm(ctx, f"✅  Drop session started for **{ctx.guild.name}**! Drop will post in **#{drop_ch.name}**.\n\nCommands available now: `!addstock`, `!editstock`, `!removestockitem`, `!preview`, `!countdown`, `!release`, `!claimlist`, `!autoclose`, `!enddrop`\n\n💡  Auto-close is **ON**.")
 
 
 @bot.command(name="addstock")
@@ -740,7 +744,7 @@ async def cmd_editstock(ctx, *, args=""):
     guild_id, drop_channel = get_manager_context(ctx)
     if guild_id is None:
         if not ctx.guild:
-            await ctx.author.send("⚠️  No active drop session found. Run `!drop` first.")
+            await ctx.author.send("⚠️  No active drop session found.")
         return
     if ctx.guild:
         await silent(ctx)
@@ -923,20 +927,24 @@ async def cmd_claimlist(ctx):
 
 @bot.command(name="unpaid")
 async def cmd_unpaid(ctx):
-    guild_id, drop_channel = get_manager_context(ctx)
-    if guild_id is None:
-        if not ctx.guild:
-            await ctx.author.send("⚠️  No active drop session found.")
+    if not ctx.guild:
+        await ctx.author.send("⚠️  Please run `!unpaid` in your server channel.")
         return
-    if ctx.guild:
-        await silent(ctx)
+    guild_id = ctx.guild.id
+    if not is_manager(guild_id, ctx.author.id):
+        return
+    await silent(ctx)
 
-    # Build list of claimers who have not been fully confirmed
+    stock_ref = stock[guild_id] if stock[guild_id] else last_drop_snapshot.get(guild_id, {}).get("stock", {})
+    claims_ref = claims[guild_id] if claims[guild_id] else last_drop_snapshot.get(guild_id, {}).get("claims", {})
+
     claimer_totals = {}
-    for key, claim_list in claims[guild_id].items():
+    for key, claim_list in claims_ref.items():
         for c in claim_list:
             uid = c["user"].id
-            subtotal = c["qty"] * stock[guild_id][key]["price"]
+            if key not in stock_ref:
+                continue
+            subtotal = c["qty"] * stock_ref[key]["price"]
             if uid not in claimer_totals:
                 claimer_totals[uid] = {"user": c["user"], "total": 0.0}
             claimer_totals[uid]["total"] += subtotal
@@ -951,8 +959,7 @@ async def cmd_unpaid(ctx):
     if not unpaid_lines:
         await ctx.author.send("✅  All claimers have been confirmed!")
         return
-
-    await ctx.author.send(f"⏳  **Unpaid claimers:**\n" + "\n".join(unpaid_lines))
+    await ctx.author.send("⏳  **Unpaid claimers:**\n" + "\n".join(unpaid_lines))
 
 
 @bot.command(name="confirm")
@@ -967,30 +974,20 @@ async def cmd_confirm(ctx):
     if not ctx.message.mentions:
         await dm(ctx, "Usage: `!confirm @user`")
         return
-
     user = ctx.message.mentions[0]
-
-    # Mark all their pending payments as confirmed
     user_pmts = payments[guild_id][user.id]
     pending = [p for p in user_pmts if not p["confirmed"]]
     if not pending:
         await dm(ctx, f"⚠️  No pending payments found for **{user.display_name}**.")
         return
-
     for p in pending:
         p["confirmed"] = True
-
     total_confirmed = sum(p["amount"] for p in pending)
-
-    # Update payment board
     await update_payment_board(guild_id)
-
-    # DM the buyer
     try:
         await user.send(f"✅  Your payment of **${total_confirmed:.2f}** has been confirmed! Thanks so much — enjoy your order! 🎉")
     except discord.Forbidden:
         pass
-
     await dm(ctx, f"✅  Confirmed **${total_confirmed:.2f}** from **{user.display_name}**.")
 
 
@@ -1015,10 +1012,11 @@ async def cmd_paid(ctx, *, args=""):
         return
     guild_id = ctx.guild.id
 
-    # !paid works during AND after drop — just needs claims to exist
+    # Check claims from live drop OR last snapshot
+    claims_ref = claims[guild_id] if claims[guild_id] else last_drop_snapshot.get(guild_id, {}).get("claims", {})
     has_claims = any(
         c["user"].id == ctx.author.id
-        for claim_list in claims[guild_id].values()
+        for claim_list in claims_ref.values()
         for c in claim_list
     )
     if not has_claims:
@@ -1048,10 +1046,8 @@ async def cmd_paid(ctx, *, args=""):
         await silent(ctx)
         return
 
-    # Delete buyer's message from channel to keep chat clean
     await silent(ctx)
 
-    # Log the payment
     payments[guild_id][ctx.author.id].append({
         "method": method,
         "amount": amount,
@@ -1059,24 +1055,16 @@ async def cmd_paid(ctx, *, args=""):
         "confirmed": False
     })
 
-    # Calculate what they owe
-    total_owed = sum(
-        c["qty"] * stock[guild_id][key]["price"]
-        for key, claim_list in claims[guild_id].items()
-        for c in claim_list
-        if c["user"].id == ctx.author.id
-    )
+    total_owed = get_user_total_owed(guild_id, ctx.author.id)
     total_paid = sum(p["amount"] for p in payments[guild_id][ctx.author.id])
     remaining = total_owed - total_paid
 
-    # DM the buyer their confirmation — not posted in channel
     await ctx.author.send(
         f"💳  Payment of **${amount:.2f}** via **{method.title()}** received!\n"
         f"Total owed: ${total_owed:.2f}  •  Total reported: ${total_paid:.2f}"
         + (f"  •  Still outstanding: **${remaining:.2f}**" if remaining > 0.01 else "  •  ✅ Fully reported! Waiting on confirmation.")
     )
 
-    # Ping managers with a ✅ reaction they can click to confirm
     drop_ch = get_drop_channel(ctx.guild) or ctx.channel
     manager_mentions = " ".join(f"<@{uid}>" for uid in server_managers[guild_id])
     ping_msg = await drop_ch.send(
@@ -1085,7 +1073,6 @@ async def cmd_paid(ctx, *, args=""):
         allowed_mentions=discord.AllowedMentions(users=True)
     )
     await ping_msg.add_reaction("✅")
-    # Store message -> buyer mapping so reaction handler knows who to confirm
     pending_payment_messages[ping_msg.id] = {"guild_id": guild_id, "buyer_id": ctx.author.id}
 
 
@@ -1255,17 +1242,23 @@ async def cmd_myclaims(ctx):
         await ctx.author.send("⚠️  Please use `!myclaims` in your server channel.")
         return
     guild_id = ctx.guild.id
-    if session_state[guild_id] != "live":
+
+    # Works during live drop and after it closes
+    stock_ref = stock[guild_id] if stock[guild_id] else last_drop_snapshot.get(guild_id, {}).get("stock", {})
+    claims_ref = claims[guild_id] if claims[guild_id] else last_drop_snapshot.get(guild_id, {}).get("claims", {})
+
+    if not stock_ref and not claims_ref:
         await ctx.send("No active drop.")
         return
+
     user_claims = []
     total = 0.0
-    for key, claim_list in claims[guild_id].items():
+    for key, claim_list in claims_ref.items():
         for c in claim_list:
-            if c["user"].id == ctx.author.id:
-                subtotal = c["qty"] * stock[guild_id][key]["price"]
+            if c["user"].id == ctx.author.id and key in stock_ref:
+                subtotal = c["qty"] * stock_ref[key]["price"]
                 total += subtotal
-                user_claims.append(f"• **{stock[guild_id][key]['display']}**  ×{c['qty']}  — ${subtotal:.2f}")
+                user_claims.append(f"• **{stock_ref[key]['display']}**  ×{c['qty']}  — ${subtotal:.2f}")
     if not user_claims:
         await ctx.send("You haven't claimed anything in this drop yet.")
         return
@@ -1283,7 +1276,6 @@ async def cmd_history(ctx):
         return
     await silent(ctx)
 
-    import json
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT closed_at, total_revenue, total_items, unique_buyers, summary
@@ -1294,7 +1286,7 @@ async def cmd_history(ctx):
         """, guild_id)
 
     if not rows:
-        await ctx.author.send("No drop history yet. History is saved automatically when you run `!enddrop`.")
+        await ctx.author.send("No drop history yet. History is saved automatically when a drop ends.")
         return
 
     embed = discord.Embed(
@@ -1309,19 +1301,29 @@ async def cmd_history(ctx):
         summary = json.loads(row["summary"])
         date_str = row["closed_at"].strftime("%b %d, %Y")
         item_lines = "\n".join(
-            f"• {item}: ×{data['qty']} — ${data['revenue']:.2f}"
+            f"- {item}: x{data['qty']} - ${float(data['revenue']):.2f}"
             for item, data in summary.items()
         )
+        footer_line = f"{row['total_items']} items  -  {row['unique_buyers']} buyer(s)"
+        field_value = f"{item_lines}\n{footer_line}" if item_lines else footer_line
+        if len(field_value) > 1024:
+            field_value = field_value[:1020] + "..."
         embed.add_field(
-            name=f"Drop #{len(rows) - i}  •  {date_str}  •  ${row['total_revenue']:.2f}",
-            value=f"{item_lines}\n{row['total_items']} items  •  {row['unique_buyers']} buyer(s)",
+            name=f"Drop #{len(rows) - i}  -  {date_str}  -  ${float(row['total_revenue']):.2f}",
+            value=field_value,
             inline=False
         )
         all_revenue += float(row["total_revenue"])
         all_items += row["total_items"]
 
-    embed.set_footer(text=f"All-time total: ${all_revenue:.2f} across {all_items} items")
-    await ctx.author.send(embed=embed)
+    embed.set_footer(text=f"All-time: ${all_revenue:.2f} revenue  -  {all_items} items sold")
+
+    try:
+        await ctx.author.send(embed=embed)
+    except discord.Forbidden:
+        await ctx.send("Could not DM you the history - please open your DMs and try again.")
+    except discord.HTTPException:
+        await ctx.send("History embed was too large to send.")
 
 
 @bot.command(name="bump")
@@ -1338,14 +1340,8 @@ async def cmd_bump(ctx):
         return
 
     user = ctx.message.mentions[0]
+    total_owed = get_user_total_owed(guild_id, user.id)
 
-    # Calculate what they owe
-    total_owed = sum(
-        c["qty"] * stock[guild_id][key]["price"]
-        for key, claim_list in claims[guild_id].items()
-        for c in claim_list
-        if c["user"].id == user.id
-    )
     if total_owed == 0:
         await dm(ctx, f"⚠️  **{user.display_name}** doesn't have any claims.")
         return
@@ -1358,7 +1354,6 @@ async def cmd_bump(ctx):
         return
 
     payment_info = build_payment_info(guild_id)
-
     try:
         await user.send(
             f"👋  Hey! Just a friendly reminder that you have an outstanding balance of **${remaining:.2f}** from the recent drop.\n\n"
@@ -1381,22 +1376,26 @@ async def cmd_remind(ctx):
     await silent(ctx)
     drop_channel = get_drop_channel(ctx.guild) or ctx.channel
 
-    # Build list of unpaid claimers
+    claims_ref = claims[guild_id] if claims[guild_id] else last_drop_snapshot.get(guild_id, {}).get("claims", {})
+    stock_ref = stock[guild_id] if stock[guild_id] else last_drop_snapshot.get(guild_id, {}).get("stock", {})
+
     unpaid_mentions = []
-    for key, claim_list in claims[guild_id].items():
+    seen_users = set()
+    for key, claim_list in claims_ref.items():
         for c in claim_list:
             uid = c["user"].id
+            if uid in seen_users or key not in stock_ref:
+                continue
+            seen_users.add(uid)
             total_owed = sum(
-                cc["qty"] * stock[guild_id][k]["price"]
-                for k, cl in claims[guild_id].items()
+                cc["qty"] * stock_ref[k]["price"]
+                for k, cl in claims_ref.items()
                 for cc in cl
-                if cc["user"].id == uid
+                if cc["user"].id == uid and k in stock_ref
             )
             confirmed = sum(p["amount"] for p in payments[guild_id][uid] if p["confirmed"])
             if total_owed - confirmed > 0.01:
-                mention = f"<@{uid}>"
-                if mention not in unpaid_mentions:
-                    unpaid_mentions.append(mention)
+                unpaid_mentions.append(f"<@{uid}>")
 
     if not unpaid_mentions:
         await dm(ctx, "✅  Everyone has been confirmed — no outstanding payments!")
@@ -1404,10 +1403,9 @@ async def cmd_remind(ctx):
 
     payment_info = build_payment_info(guild_id)
     mentions_str = " ".join(unpaid_mentions)
-
     await drop_channel.send(
         f"⏰  **Payment Reminder** — {mentions_str}\n\n"
-        f"You have an outstanding balance from the recent drop. Please send payment using one of these methods:\n"
+        f"You have an outstanding balance from the recent drop. Please send payment:\n"
         f"{payment_info}\n\n"
         f"Once sent, type `!paid <method> <amount>` to confirm. Thanks!"
     )
