@@ -39,13 +39,77 @@ from collections import defaultdict
 import datetime
 import asyncio
 import os
+import asyncpg
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 PREFIX = "!"
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+
+# ── DATABASE ──────────────────────────────────────────────────────────────────
+
+db_pool = None
+
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS server_admins (
+                guild_id BIGINT PRIMARY KEY,
+                user_id BIGINT NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS server_managers (
+                guild_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                PRIMARY KEY (guild_id, user_id)
+            )
+        """)
+    print("✅  Database ready.")
+
+
+async def db_load_all():
+    """Load all admins and managers from DB into memory on startup."""
+    async with db_pool.acquire() as conn:
+        admins = await conn.fetch("SELECT guild_id, user_id FROM server_admins")
+        for row in admins:
+            server_admins[row["guild_id"]] = row["user_id"]
+
+        managers = await conn.fetch("SELECT guild_id, user_id FROM server_managers")
+        for row in managers:
+            server_managers[row["guild_id"]].add(row["user_id"])
+
+    print(f"✅  Loaded {len(server_admins)} server(s) from database.")
+
+
+async def db_set_admin(guild_id, user_id):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO server_admins (guild_id, user_id)
+            VALUES ($1, $2)
+            ON CONFLICT (guild_id) DO UPDATE SET user_id = $2
+        """, guild_id, user_id)
+
+
+async def db_add_manager(guild_id, user_id):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO server_managers (guild_id, user_id)
+            VALUES ($1, $2)
+            ON CONFLICT DO NOTHING
+        """, guild_id, user_id)
+
+
+async def db_remove_manager(guild_id, user_id):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            DELETE FROM server_managers WHERE guild_id = $1 AND user_id = $2
+        """, guild_id, user_id)
 
 # ── PER-SERVER STATE ──────────────────────────────────────────────────────────
 
@@ -59,7 +123,7 @@ stock = defaultdict(dict)
 # claims[guild_id][item_key] = [{"user": member, "qty": int, "time": datetime}, ...]
 claims = defaultdict(lambda: defaultdict(list))
 
-# waitlist[guild_id][item_key] = [user, user, ...]
+# waitlist[guild_id][item_key] = [user, ...]
 waitlist = defaultdict(lambda: defaultdict(list))
 
 stock_message = {}
@@ -177,19 +241,15 @@ async def update_stock_embed(guild_id):
 
 
 async def notify_waitlist(guild_id, key, qty_freed):
-    """Notify waitlist users when stock becomes available after an unclaim."""
     wl = waitlist[guild_id][key]
     if not wl or qty_freed <= 0:
         return
     item_display = stock[guild_id][key]["display"] if key in stock[guild_id] else key
-    notified = 0
     for user in wl[:qty_freed]:
         try:
             await user.send(f"🔔  **{item_display}** is available again! Head back to the server and use `!claim {item_display} 1` before it's gone!")
-            notified += 1
         except discord.Forbidden:
             pass
-    # Remove notified users from waitlist
     waitlist[guild_id][key] = wl[qty_freed:]
 
 
@@ -231,8 +291,12 @@ async def dm(ctx, message):
         pass
 
 
+# ── EVENTS ────────────────────────────────────────────────────────────────────
+
 @bot.event
 async def on_ready():
+    await init_db()
+    await db_load_all()
     print(f"✅  Logged in as {bot.user} ({bot.user.id})")
 
 
@@ -249,6 +313,8 @@ async def cmd_setup(ctx):
         return
     server_admins[guild_id] = ctx.author.id
     server_managers[guild_id].add(ctx.author.id)
+    await db_set_admin(guild_id, ctx.author.id)
+    await db_add_manager(guild_id, ctx.author.id)
     await ctx.send(f"✅  **{ctx.author.display_name}** is now the drop admin for this server!\nUse `!addmanager @user` to add additional managers.")
 
 
@@ -265,6 +331,7 @@ async def cmd_addmanager(ctx):
         return
     user = ctx.message.mentions[0]
     server_managers[guild_id].add(user.id)
+    await db_add_manager(guild_id, user.id)
     await ctx.send(f"✅  **{user.display_name}** has been added as a drop manager.")
 
 
@@ -284,6 +351,7 @@ async def cmd_removemanager(ctx):
         await ctx.send("⚠️  You can't remove the admin.")
         return
     server_managers[guild_id].discard(user.id)
+    await db_remove_manager(guild_id, user.id)
     await ctx.send(f"✅  **{user.display_name}** has been removed as a drop manager.")
 
 
@@ -402,7 +470,6 @@ async def cmd_editstock(ctx, *, args=""):
             return
     stock[guild_id][key]["qty"] = qty
     stock[guild_id][key]["price"] = price
-    # Update live embed if drop is already released
     if session_state[guild_id] == "live":
         await update_stock_embed(guild_id)
     await dm(ctx, f"✅  **{stock[guild_id][key]['display']}** updated — {qty} @ ${price:.2f} each.")
@@ -464,9 +531,8 @@ async def cmd_countdown(ctx, minutes: str = ""):
     except ValueError:
         await dm(ctx, "⚠️  Please provide a number of minutes between 1 and 60. Example: `!countdown 5`")
         return
-
     await drop_channel.send(f"⏳  **Drop incoming in {mins} minute{'s' if mins != 1 else ''}!** Get ready to claim — first come, first served! 🔥")
-    await dm(ctx, f"✅  Countdown posted — drop announced in {mins} minute{'s' if mins != 1 else ''}.")
+    await dm(ctx, f"✅  Countdown posted — {mins} minute{'s' if mins != 1 else ''} until drop.")
 
     async def auto_remind():
         if mins >= 2:
