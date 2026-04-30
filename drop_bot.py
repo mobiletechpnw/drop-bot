@@ -11,6 +11,13 @@ Admin only:
   !setpayment                      — Update payment info
   !setdropchannel #channel         — Update drop channel
 
+Creator only (DM the bot):
+  !creator servers                 — List all servers the bot is in
+  !creator info <guild_id>         — See a server's settings, admin, and managers
+  !creator setpayment <guild_id>   — Update payment info for a server
+  !creator setdropchannel <guild_id> <#channel_id> — Update drop channel for a server
+  !creator resetadmin <guild_id> @user — Reassign the admin for a server
+
 Manager/Admin commands (server or DM after !drop):
   !drop                            — Start a new drop session (must run in server)
   !addstock <item> <qty> <price> [limit <n>]
@@ -48,12 +55,13 @@ import asyncpg
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+CREATOR_ID = int(os.environ.get("CREATOR_ID", "0"))  # Bot creator — cross-server super admin
 PREFIX = "!"
 
 intents = discord.Intents.default()
 intents.message_content = True
-intents.guild_reactions = True
-intents.dm_reactions = True
+intents.members = True  # Required for guild.get_member() — enable in discord.dev portal
+intents.reactions = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
 # ── DATABASE ──────────────────────────────────────────────────────────────────
@@ -212,6 +220,10 @@ def is_manager(guild_id, user_id):
 
 def is_admin(guild_id, user_id):
     return server_admins.get(guild_id) == user_id
+
+
+def is_creator(user_id):
+    return user_id == CREATOR_ID
 
 
 def all_sold_out(guild_id):
@@ -709,6 +721,7 @@ async def cmd_drop(ctx):
     stock_message.pop(guild_id, None)
     pinned_message.pop(guild_id, None)
     payment_board_message.pop(guild_id, None)
+    pending_payment_messages.clear()  # clear any stale reaction listeners
     autoclose[guild_id] = True
     manager_session[ctx.author.id] = {"guild_id": guild_id, "channel": drop_ch}
     await silent(ctx)
@@ -1426,5 +1439,162 @@ async def cmd_remind(ctx):
     )
     await dm(ctx, f"✅  Reminder posted for {len(unpaid_mentions)} unpaid buyer(s).")
 
+
+
+# ── CREATOR COMMANDS (DM only, cross-server) ──────────────────────────────────
+
+@bot.command(name="creator")
+async def cmd_creator(ctx, subcommand: str = "", *args):
+    """Super admin commands — DM only, creator only."""
+    # Must be DM and must be the creator
+    if ctx.guild:
+        await ctx.message.delete()
+        return
+    if not is_creator(ctx.author.id):
+        return
+
+    if not subcommand:
+        await ctx.author.send(
+            "**Creator Commands (DM only):**\n"
+            "`!creator servers` — List all servers the bot is in\n"
+            "`!creator info <guild_id>` — See a server's settings, admin, and managers\n"
+            "`!creator setpayment <guild_id>` — Update payment info for a server\n"
+            "`!creator setdropchannel <guild_id> <channel_id>` — Update drop channel for a server\n"
+            "`!creator resetadmin <guild_id> <user_id>` — Reassign the admin for a server"
+        )
+        return
+
+    sub = subcommand.lower()
+
+    # ── !creator servers ──────────────────────────────────────────────────────
+    if sub == "servers":
+        guilds = bot.guilds
+        if not guilds:
+            await ctx.author.send("The bot is not in any servers.")
+            return
+        lines = []
+        for g in guilds:
+            admin_id = server_admins.get(g.id)
+            admin_str = f"<@{admin_id}>" if admin_id else "No admin set"
+            settings = server_settings.get(g.id, {})
+            ch_id = settings.get("drop_channel_id")
+            ch_str = f"<#{ch_id}>" if ch_id else "No channel set"
+            payment_set = any([settings.get("venmo"), settings.get("zelle"), settings.get("cashapp"), settings.get("applepay")])
+            lines.append(f"**{g.name}** (`{g.id}`)")
+            lines.append(f"  Admin: {admin_str}  |  Drop channel: {ch_str}  |  Payment info: {'✅' if payment_set else '❌'}")
+        # Split into chunks to avoid 2000 char limit
+        msg = "\n".join(lines)
+        for i in range(0, len(msg), 1900):
+            await ctx.author.send(msg[i:i+1900])
+        return
+
+    # ── !creator info <guild_id> ──────────────────────────────────────────────
+    if sub == "info":
+        if not args:
+            await ctx.author.send("Usage: `!creator info <guild_id>`")
+            return
+        try:
+            guild_id = int(args[0])
+        except ValueError:
+            await ctx.author.send("⚠️  Invalid guild ID.")
+            return
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            await ctx.author.send(f"⚠️  Bot is not in a server with ID `{guild_id}`.")
+            return
+        admin_id = server_admins.get(guild_id)
+        managers = [uid for uid in server_managers[guild_id] if uid != admin_id]
+        settings = server_settings.get(guild_id, {})
+        ch_id = settings.get("drop_channel_id")
+        lines = [
+            f"**Server:** {guild.name} (`{guild_id}`)",
+            f"**Members:** {guild.member_count}",
+            f"**Admin:** {'<@' + str(admin_id) + '>' if admin_id else 'Not set'}",
+            f"**Managers:** {', '.join('<@' + str(uid) + '>' for uid in managers) if managers else 'None'}",
+            f"**Drop channel:** {'<#' + str(ch_id) + '>' if ch_id else 'Not set'}",
+            f"**Venmo:** {settings.get('venmo') or 'Not set'}",
+            f"**Zelle:** {settings.get('zelle') or 'Not set'}",
+            f"**Cash App:** {settings.get('cashapp') or 'Not set'}",
+            f"**Apple Pay:** {settings.get('applepay') or 'Not set'}",
+        ]
+        await ctx.author.send("\n".join(lines))
+        return
+
+    # ── !creator setpayment <guild_id> ────────────────────────────────────────
+    if sub == "setpayment":
+        if not args:
+            await ctx.author.send("Usage: `!creator setpayment <guild_id>`")
+            return
+        try:
+            guild_id = int(args[0])
+        except ValueError:
+            await ctx.author.send("⚠️  Invalid guild ID.")
+            return
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            await ctx.author.send(f"⚠️  Bot is not in a server with ID `{guild_id}`.")
+            return
+        await ctx.author.send(f"Setting payment info for **{guild.name}**:")
+        await collect_payment_info(ctx.author, guild_id)
+        return
+
+    # ── !creator setdropchannel <guild_id> <channel_id> ──────────────────────
+    if sub == "setdropchannel":
+        if len(args) < 2:
+            await ctx.author.send("Usage: `!creator setdropchannel <guild_id> <channel_id>`")
+            return
+        try:
+            guild_id = int(args[0])
+            channel_id = int(args[1])
+        except ValueError:
+            await ctx.author.send("⚠️  Invalid guild ID or channel ID.")
+            return
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            await ctx.author.send(f"⚠️  Bot is not in a server with ID `{guild_id}`.")
+            return
+        channel = guild.get_channel(channel_id)
+        if not channel:
+            await ctx.author.send(f"⚠️  Channel `{channel_id}` not found in **{guild.name}**. Use `!creator info {guild_id}` to check available channels.")
+            return
+        if guild_id not in server_settings:
+            server_settings[guild_id] = {}
+        server_settings[guild_id]["drop_channel_id"] = channel_id
+        await db_save_settings(guild_id)
+        await ctx.author.send(f"✅  Drop channel for **{guild.name}** updated to **#{channel.name}**.")
+        return
+
+    # ── !creator resetadmin <guild_id> <user_id> ─────────────────────────────
+    if sub == "resetadmin":
+        if len(args) < 2:
+            await ctx.author.send("Usage: `!creator resetadmin <guild_id> <user_id>`")
+            return
+        try:
+            guild_id = int(args[0])
+            new_admin_id = int(args[1])
+        except ValueError:
+            await ctx.author.send("⚠️  Invalid guild ID or user ID.")
+            return
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            await ctx.author.send(f"⚠️  Bot is not in a server with ID `{guild_id}`.")
+            return
+        member = guild.get_member(new_admin_id)
+        if not member:
+            await ctx.author.send(f"⚠️  User `{new_admin_id}` not found in **{guild.name}**.")
+            return
+        old_admin_id = server_admins.get(guild_id)
+        server_admins[guild_id] = new_admin_id
+        server_managers[guild_id].add(new_admin_id)
+        await db_set_admin(guild_id, new_admin_id)
+        await db_add_manager(guild_id, new_admin_id)
+        await ctx.author.send(
+            f"✅  Admin for **{guild.name}** updated.\n"
+            f"Old admin: {'<@' + str(old_admin_id) + '>' if old_admin_id else 'None'}\n"
+            f"New admin: **{member.display_name}** (`{new_admin_id}`)"
+        )
+        return
+
+    await ctx.author.send(f"⚠️  Unknown subcommand `{subcommand}`. Type `!creator` for a list of commands.")
 
 bot.run(BOT_TOKEN)
