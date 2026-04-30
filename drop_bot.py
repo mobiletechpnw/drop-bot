@@ -1623,6 +1623,47 @@ async def cmd_creator(ctx, subcommand: str = "", *args):
         )
         return
 
+    # ── !creator announce <guild_id> <message> ────────────────────────────────
+    if sub == "announce":
+        if len(args) < 2:
+            await ctx.author.send(
+                "Usage: `!creator announce <guild_id> <message>`\n"
+                "Example: `!creator announce 123456789012345678 Drop going live soon!`"
+            )
+            return
+        try:
+            guild_id = int(args[0])
+        except ValueError:
+            await ctx.author.send("⚠️  Invalid guild ID — must be a number.")
+            return
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            await ctx.author.send(f"⚠️  Bot is not in a server with ID `{guild_id}`.")
+            return
+        message = " ".join(args[1:])
+        if not message.strip():
+            await ctx.author.send("⚠️  Message cannot be empty.")
+            return
+        drop_channel = get_drop_channel(guild)
+        if not drop_channel:
+            drop_channel = next(
+                (c for c in guild.text_channels if c.permissions_for(guild.me).send_messages),
+                None
+            )
+            if not drop_channel:
+                await ctx.author.send(f"⚠️  No drop channel set for **{guild.name}** and no accessible channel found.")
+                return
+            await ctx.author.send(f"⚠️  No drop channel configured — posting to **#{drop_channel.name}** instead.")
+        embed = discord.Embed(
+            description=message,
+            color=discord.Color.gold(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        embed.set_footer(text="VaultDrop")
+        await drop_channel.send(embed=embed)
+        await ctx.author.send(f"✅  Announcement posted in **#{drop_channel.name}** on **{guild.name}**.")
+        return
+
     await ctx.author.send(f"⚠️  Unknown subcommand `{subcommand}`. Type `!creator` for a list of commands.")
 
 bot.run(BOT_TOKEN)
