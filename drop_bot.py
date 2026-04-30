@@ -17,6 +17,7 @@ Creator only (DM the bot):
   !creator setpayment <guild_id>   — Update payment info for a server
   !creator setdropchannel <guild_id> <#channel_id> — Update drop channel for a server
   !creator resetadmin <guild_id> @user — Reassign the admin for a server
+  !creator announce <guild_id> <message> — Post an announcement in a server's drop channel
 
 Manager/Admin commands (server or DM after !drop):
   !drop                            — Start a new drop session (must run in server)
@@ -32,6 +33,7 @@ Manager/Admin commands (server or DM after !drop):
   !confirm @user                   — Mark a buyer as fully paid
   !bump @user                      — DM a buyer a payment reminder
   !remind                          — Tag all unpaid buyers in the drop channel
+  !announce <message>              — Post a formatted announcement in the drop channel
   !history                         — View last 10 drop summaries
   !enddrop
 
@@ -1441,6 +1443,31 @@ async def cmd_remind(ctx):
 
 
 
+
+@bot.command(name="announce")
+async def cmd_announce(ctx, *, message: str = ""):
+    if not ctx.guild:
+        await ctx.author.send("\u26a0\ufe0f  Please run `!announce` in your server channel.")
+        return
+    guild_id = ctx.guild.id
+    if not is_manager(guild_id, ctx.author.id):
+        return
+    await silent(ctx)
+    if not message:
+        await dm(ctx, "Usage: `!announce <message>`\nExample: `!announce Drop going live in 10 minutes!`")
+        return
+    drop_channel = get_drop_channel(ctx.guild) or ctx.channel
+    embed = discord.Embed(
+        description=message,
+        color=discord.Color.gold(),
+        timestamp=datetime.datetime.utcnow()
+    )
+    embed.set_footer(text="VaultDrop")
+    await drop_channel.send(embed=embed)
+    if drop_channel != ctx.channel:
+        await dm(ctx, f"\u2705  Announcement posted in **#{drop_channel.name}**.")
+
+
 # ── CREATOR COMMANDS (DM only, cross-server) ──────────────────────────────────
 
 @bot.command(name="creator")
@@ -1460,7 +1487,8 @@ async def cmd_creator(ctx, subcommand: str = "", *args):
             "`!creator info <guild_id>` — See a server's settings, admin, and managers\n"
             "`!creator setpayment <guild_id>` — Update payment info for a server\n"
             "`!creator setdropchannel <guild_id> <channel_id>` — Update drop channel for a server\n"
-            "`!creator resetadmin <guild_id> <user_id>` — Reassign the admin for a server"
+            "`!creator resetadmin <guild_id> <user_id>` — Reassign the admin for a server\n"
+            "`!creator announce <guild_id> <message>` — Post announcement in a server's drop channel"
         )
         return
 
