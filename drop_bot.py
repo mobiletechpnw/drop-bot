@@ -391,10 +391,23 @@ async def update_payment_board(guild_id):
 
 async def update_stock_embed(guild_id):
     msg = stock_message.get(guild_id)
-    if msg:
-        try:
-            await msg.edit(embed=build_stock_embed(guild_id))
-        except (discord.NotFound, discord.Forbidden):
+    if not msg:
+        return
+    try:
+        await msg.edit(embed=build_stock_embed(guild_id))
+    except discord.NotFound:
+        stock_message.pop(guild_id, None)
+    except discord.Forbidden:
+        stock_message.pop(guild_id, None)
+    except discord.HTTPException as e:
+        if e.status == 429:
+            # Rate limited — wait and retry once
+            await asyncio.sleep(2)
+            try:
+                await msg.edit(embed=build_stock_embed(guild_id))
+            except Exception:
+                pass
+        else:
             stock_message.pop(guild_id, None)
 
 
@@ -869,12 +882,41 @@ async def cmd_countdown(ctx, minutes: str = ""):
     await drop_channel.send(f"⏳  **Drop incoming in {mins} minute{'s' if mins != 1 else ''}!** Get ready to claim — first come, first served! 🔥")
     await dm(ctx, f"✅  Countdown posted — {mins} minute{'s' if mins != 1 else ''} until drop.")
 
-    async def auto_remind():
+    async def auto_release():
+        # Post 1-minute warning if countdown is long enough
         if mins >= 2:
             await asyncio.sleep((mins - 1) * 60)
             if session_state[guild_id] != "live":
                 await drop_channel.send("⏰  **1 minute until the drop!** Stay ready!")
-    asyncio.create_task(auto_remind())
+            else:
+                return  # Already released manually
+        else:
+            await asyncio.sleep(mins * 60)
+
+        # Auto-release if not already live
+        if session_state[guild_id] == "live":
+            return  # Manager released it manually already
+
+        if session_state[guild_id] != "staging":
+            return  # Session was cancelled or never started
+
+        if not stock[guild_id]:
+            await drop_channel.send("⚠️  Countdown ended but no stock was loaded — drop not released.")
+            return
+
+        # Fire the release
+        session_state[guild_id] = "live"
+        msg = await drop_channel.send(embed=build_stock_embed(guild_id))
+        stock_message[guild_id] = msg
+        await drop_channel.send("🟢  **Drop is LIVE!**  First come, first served!")
+        await drop_channel.send(embed=build_howto_embed())
+        try:
+            await msg.pin()
+            pinned_message[guild_id] = msg
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    asyncio.create_task(auto_release())
 
 
 @bot.command(name="autoclose")
