@@ -53,6 +53,7 @@ import datetime
 import asyncio
 import json
 import os
+import random
 import asyncpg
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
@@ -560,6 +561,19 @@ async def collect_drop_channel(user, guild):
 
 # ── EVENTS ────────────────────────────────────────────────────────────────────
 
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandOnCooldown):
+        await ctx.send(
+            f"⏳  Slow down! Try again in **{error.retry_after:.0f}s**.",
+            delete_after=5
+        )
+    elif isinstance(error, commands.CommandNotFound):
+        pass  # Ignore unknown commands silently
+    else:
+        raise error
+
 @bot.event
 async def on_ready():
     await init_db()
@@ -979,6 +993,8 @@ async def cmd_enddrop(ctx):
     if session_state[guild_id] != "live":
         await dm(ctx, "⚠️  No active drop to end.")
         return
+    # Clear manager session so DM commands don't linger
+    manager_session.pop(ctx.author.id, None)
     await close_drop(drop_channel, guild_id)
 
 
@@ -1036,13 +1052,13 @@ async def cmd_unpaid(ctx):
 
 @bot.command(name="confirm")
 async def cmd_confirm(ctx):
-    guild_id, drop_channel = get_manager_context(ctx)
-    if guild_id is None:
-        if not ctx.guild:
-            await ctx.author.send("⚠️  No active drop session found.")
+    if not ctx.guild:
+        await ctx.author.send("⚠️  Please run `!confirm` in your server channel.")
         return
-    if ctx.guild:
-        await silent(ctx)
+    guild_id = ctx.guild.id
+    if not is_manager(guild_id, ctx.author.id):
+        return
+    await silent(ctx)
     if not ctx.message.mentions:
         await dm(ctx, "Usage: `!confirm @user`")
         return
@@ -1078,6 +1094,7 @@ async def cmd_stock(ctx):
 
 
 @bot.command(name="paid")
+@commands.cooldown(3, 60, commands.BucketType.user)
 async def cmd_paid(ctx, *, args=""):
     if not ctx.guild:
         await ctx.author.send("⚠️  Please use `!paid` in your server channel.")
@@ -1149,6 +1166,7 @@ async def cmd_paid(ctx, *, args=""):
 
 
 @bot.command(name="claim")
+@commands.cooldown(5, 10, commands.BucketType.user)
 async def cmd_claim(ctx, *, args=""):
     if not ctx.guild:
         await ctx.author.send("⚠️  Please use `!claim` in your server channel.")
@@ -1161,6 +1179,31 @@ async def cmd_claim(ctx, *, args=""):
     if not parts:
         await ctx.send("Usage: `!claim <item> <qty>`  e.g. `!claim PRE ETB 1`")
         return
+
+    # ── EASTER EGGS ────────────────────────────────────────────────
+    if args.strip().lower() == "all":
+        oak_response = (
+            "🔴  *Oak's words echoed: "
+            "'There's a time and place for everything, but not now.' "
+            "* Use `!claim <item> <qty>`."
+        )
+        responses = [
+            oak_response,
+            "💫  You used Splash. Nothing happened. Use `!claim <item> <qty>`.",
+            "😴  Your claim used Rest. It fell asleep and did nothing. Try `!claim <item> <qty>`.",
+            "💀  Giovanni himself reviewed your claim and rejected it. Try `!claim <item> <qty>`.",
+        ]
+        await ctx.send(random.choice(responses))
+        return
+
+    if "luck" in args.lower():
+        await ctx.send(
+            "🎰  Even Arceus couldn't find *luck* in this drop. "
+            "It's not in stock. Check `!stock` for what's real."
+        )
+        return
+    # ─────────────────────────────────────────────────────────────────────
+
     try:
         qty = int(parts[-1])
         item_name = " ".join(parts[:-1])
@@ -1498,6 +1541,9 @@ async def cmd_announce(ctx, *, message: str = ""):
     if not message:
         await dm(ctx, "Usage: `!announce <message>`\nExample: `!announce Drop going live in 10 minutes!`")
         return
+    if len(message) > 4000:
+        await dm(ctx, "⚠️  Message too long — keep it under 4000 characters.")
+        return
     drop_channel = get_drop_channel(ctx.guild) or ctx.channel
     embed = discord.Embed(
         description=message,
@@ -1707,5 +1753,38 @@ async def cmd_creator(ctx, subcommand: str = "", *args):
         return
 
     await ctx.author.send(f"⚠️  Unknown subcommand `{subcommand}`. Type `!creator` for a list of commands.")
+
+
+@bot.command(name="help")
+async def cmd_help(ctx):
+    if not ctx.guild:
+        return
+    embed = discord.Embed(
+        title="📖  VaultDrop Commands",
+        color=discord.Color.gold(),
+        timestamp=datetime.datetime.utcnow()
+    )
+    embed.add_field(
+        name="During a Drop",
+        value=(
+            "`!claim <item> <qty>` — Claim an item\n"
+            "`!unclaim <item> <qty>` — Remove a claim\n"
+            "`!stock` — See what's available\n"
+            "`!myclaims` — See your claims and total\n"
+            "`!waitlist <item>` — Join waitlist for sold out items"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="Payments",
+        value=(
+            "`!paid <method> <amount>` — Report your payment\n"
+            "e.g. `!paid venmo $125`\n"
+            "Methods: venmo, zelle, cashapp, applepay"
+        ),
+        inline=False
+    )
+    embed.set_footer(text="VaultDrop — First come, first served!")
+    await ctx.send(embed=embed)
 
 bot.run(BOT_TOKEN)
