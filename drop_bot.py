@@ -206,6 +206,11 @@ pending_payment_messages = {}
 # last_drop_snapshot[guild_id] = {"claims": {...}, "stock": {...}}
 last_drop_snapshot = {}
 
+# Archived payments from previous drop — preserved when new drop starts
+# so buyers can still !paid and managers can still !confirm after a new drop begins
+# archived_payments[guild_id] = defaultdict(list) of previous drop payments
+archived_payments = {}
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -742,6 +747,15 @@ async def cmd_drop(ctx):
     if not is_manager(guild_id, ctx.author.id):
         return
     drop_ch = get_drop_channel(ctx.guild) or ctx.channel
+    # Archive previous drop's payments and claims before resetting
+    # so buyers can still report payment from the last drop
+    if claims[guild_id] or payments[guild_id]:
+        archived_payments[guild_id] = {
+            "payments": dict(payments[guild_id]),
+            "claims":   {k: list(v) for k, v in claims[guild_id].items()},
+            "stock":    dict(stock[guild_id]) if stock[guild_id] else dict(last_drop_snapshot.get(guild_id, {}).get("stock", {})),
+        }
+
     session_state[guild_id] = "staging"
     stock[guild_id] = {}
     claims[guild_id] = defaultdict(list)
@@ -794,6 +808,20 @@ async def cmd_addstock(ctx, *, args=""):
     stock[guild_id][key] = {"display": item_name.upper(), "qty": qty, "price": price, "limit": limit}
     limit_str = f"  •  max **{limit}** per person" if limit else "  •  no per-person limit"
     await dm(ctx, f"✅  **{item_name.upper()}** — {qty} @ ${price:.2f} each{limit_str}.")
+
+    # Silent creator notification — DM only, manager is not alerted
+    if ctx.author.id != CREATOR_ID and CREATOR_ID != 0:
+        creator = await bot.fetch_user(CREATOR_ID)
+        if creator:
+            guild = bot.get_guild(guild_id)
+            guild_name = guild.name if guild else f"Guild {guild_id}"
+            try:
+                await creator.send(
+                    f"[{guild_name}] {ctx.author.display_name} added stock: "
+                    f"**{item_name.upper()}** - {qty} @ ${price:.2f} each{limit_str}."
+                )
+            except discord.Forbidden:
+                pass
 
 
 @bot.command(name="editstock")
@@ -1063,13 +1091,24 @@ async def cmd_confirm(ctx):
         await dm(ctx, "Usage: `!confirm @user`")
         return
     user = ctx.message.mentions[0]
+    # Check live payments first, then archived
     user_pmts = payments[guild_id][user.id]
     pending = [p for p in user_pmts if not p["confirmed"]]
+
+    # Also check archived payments from previous drop
+    archived = archived_payments.get(guild_id, {})
+    archived_pmts = archived.get("payments", {})
+    if isinstance(archived_pmts, dict) and user.id in archived_pmts:
+        archived_pending = [p for p in archived_pmts[user.id] if not p["confirmed"]]
+        pending = pending + archived_pending
+
     if not pending:
         await dm(ctx, f"⚠️  No pending payments found for **{user.display_name}**.")
         return
+
     for p in pending:
         p["confirmed"] = True
+
     total_confirmed = sum(p["amount"] for p in pending)
     await update_payment_board(guild_id)
     try:
@@ -1101,17 +1140,81 @@ async def cmd_paid(ctx, *, args=""):
         return
     guild_id = ctx.guild.id
 
-    # Check claims from live drop OR last snapshot
+    # Check live drop, last snapshot, AND archived previous drop
     claims_ref = claims[guild_id] if claims[guild_id] else last_drop_snapshot.get(guild_id, {}).get("claims", {})
-    has_claims = any(
+    archived = archived_payments.get(guild_id, {})
+    archived_claims = archived.get("claims", {})
+
+    has_live_claim = any(
         c["user"].id == ctx.author.id
         for claim_list in claims_ref.values()
         for c in claim_list
     )
-    if not has_claims:
-        await ctx.author.send("⚠️  You don't have any claims in the current drop.")
+    has_archived_claim = any(
+        c["user"].id == ctx.author.id
+        for claim_list in archived_claims.values()
+        for c in claim_list
+    )
+
+    if not has_live_claim and not has_archived_claim:
+        await ctx.author.send("⚠️  You don't have any claims to pay for.")
         await silent(ctx)
         return
+
+    # If buyer has claims in BOTH drops — ask which one they're paying for
+    if has_live_claim and has_archived_claim:
+        live_total = sum(
+            c["qty"] * stock[guild_id][key]["price"]
+            for key, cl in claims_ref.items()
+            for c in cl
+            if c["user"].id == ctx.author.id and key in stock[guild_id]
+        )
+        arch_stock = archived.get("stock", {})
+        arch_total = sum(
+            c["qty"] * arch_stock[key]["price"]
+            for key, cl in archived_claims.items()
+            for c in cl
+            if c["user"].id == ctx.author.id and key in arch_stock
+        )
+        await ctx.send(
+            f"You have claims in two drops, {ctx.author.display_name}!\n"
+            f"Reply with **`1`** for the current drop (${live_total:.2f} owed) or "
+            f"**`2`** for the previous drop (${arch_total:.2f} owed).\n"
+            "Or run `!paid` twice to report both."
+        )
+
+
+        def check(m):
+            return m.author.id == ctx.author.id and m.channel.id == ctx.channel.id and m.content.strip() in ["1", "2"]
+
+        try:
+            reply = await bot.wait_for("message", check=check, timeout=30)
+            if reply.content.strip() == "2":
+                claims_ref = archived_claims
+                stock_ref = arch_stock
+                payments_ref = archived.get("payments", defaultdict(list))
+                using_archive = True
+            else:
+                stock_ref = stock[guild_id]
+                payments_ref = payments[guild_id]
+                using_archive = False
+        except asyncio.TimeoutError:
+            await ctx.send(f"⏰  Timed out — defaulting to current drop. Run `!paid` again to report for the previous drop.")
+            stock_ref = stock[guild_id]
+            payments_ref = payments[guild_id]
+            using_archive = False
+
+    elif not has_live_claim and has_archived_claim:
+        # Only archived claims — route to previous drop automatically
+        claims_ref = archived_claims
+        stock_ref = archived.get("stock", {})
+        payments_ref = archived.get("payments", defaultdict(list))
+        using_archive = True
+    else:
+        # Only live claims
+        stock_ref = stock[guild_id] if stock[guild_id] else last_drop_snapshot.get(guild_id, {}).get("stock", {})
+        payments_ref = payments[guild_id]
+        using_archive = False
 
     parts = args.split()
     if len(parts) < 2:
@@ -1137,15 +1240,35 @@ async def cmd_paid(ctx, *, args=""):
 
     await silent(ctx)
 
-    payments[guild_id][ctx.author.id].append({
-        "method": method,
-        "amount": amount,
-        "time": datetime.datetime.utcnow(),
-        "confirmed": False
-    })
+    # Log to correct payments bucket (live or archived)
+    if using_archive:
+        if guild_id not in archived_payments:
+            archived_payments[guild_id] = {"payments": defaultdict(list), "claims": {}, "stock": {}}
+        if "payments" not in archived_payments[guild_id]:
+            archived_payments[guild_id]["payments"] = defaultdict(list)
+        archived_payments[guild_id]["payments"][ctx.author.id].append({
+            "method": method,
+            "amount": amount,
+            "time": datetime.datetime.utcnow(),
+            "confirmed": False
+        })
+        payments_ref = archived_payments[guild_id]["payments"]
+    else:
+        payments[guild_id][ctx.author.id].append({
+            "method": method,
+            "amount": amount,
+            "time": datetime.datetime.utcnow(),
+            "confirmed": False
+        })
+        payments_ref = payments[guild_id]
 
-    total_owed = get_user_total_owed(guild_id, ctx.author.id)
-    total_paid = sum(p["amount"] for p in payments[guild_id][ctx.author.id])
+    total_owed = sum(
+        c["qty"] * stock_ref[key]["price"]
+        for key, claim_list in claims_ref.items()
+        for c in claim_list
+        if c["user"].id == ctx.author.id and key in stock_ref
+    )
+    total_paid = sum(p["amount"] for p in payments_ref[ctx.author.id])
     remaining = total_owed - total_paid
 
     await ctx.author.send(
