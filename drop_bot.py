@@ -1,6 +1,62 @@
 """
-Vault & Pine — Drop Bot + Raffle Module
-Drop commands unchanged. New raffle commands below.
+Vault & Pine Drop Bot
+=====================
+Setup (first time in a new server):
+  !setup                           — Register yourself as admin, set drop channel + payment info
+
+Admin only:
+  !addmanager @user                — Grant manager role
+  !removemanager @user             — Revoke manager role
+  !managers                        — List admin and managers
+  !setpayment                      — Update payment info
+  !setdropchannel #channel         — Update drop channel
+
+Creator only (DM the bot):
+  !creator servers                 — List all servers the bot is in
+  !creator info <guild_id>         — See a server's settings, admin, and managers
+  !creator setpayment <guild_id>   — Update payment info for a server
+  !creator setdropchannel <guild_id> <#channel_id> — Update drop channel for a server
+  !creator resetadmin <guild_id> @user — Reassign the admin for a server
+  !creator announce <guild_id> <message> — Post an announcement in a server's drop channel
+
+Manager/Admin commands (server or DM after !drop):
+  !drop                            — Start a new drop session (must run in server)
+  !addstock <item> <qty> <price> [limit <n>]
+  !editstock <item> <qty> <price>
+  !removestockitem <item>
+  !preview
+  !countdown <minutes>
+  !release
+  !autoclose on/off
+  !claimlist
+  !unpaid                          — List buyers who haven't been confirmed yet
+  !confirm @user                   — Mark a buyer as fully paid
+  !bump @user                      — DM a buyer a payment reminder
+  !remind                          — Tag all unpaid buyers in the drop channel
+  !announce <message>              — Post a formatted announcement in the drop channel
+  !history                         — View last 10 drop summaries
+  !enddrop
+
+Public commands (anyone, in server only):
+  !claim <item> <qty>
+  !unclaim <item> <qty>
+  !waitlist <item>
+  !paid <method> <amount>          — works during and after drop
+  !stock
+  !myclaims
+
+Raffle commands — owner only:
+  !raffle create <name> <spots> <price>  — Create a raffle
+  !raffle confirm <name> @user           — Confirm a user's payment
+  !raffle wheel <name>                   — Generate Wheel of Names link for live spin
+  !raffle winner <name> @user            — Record the winner
+  !raffle cancel <name>                  — Cancel and remove a raffle
+  !raffle setchannel #channel            — Change the raffle channel
+
+Raffle commands — anyone:
+  !raffle claim <name> <spot#>           — Claim a numbered spot
+  !raffle status <name>                  — Show current raffle state
+  !raffles                               — List all active raffles
 """
 
 import discord
