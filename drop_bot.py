@@ -686,29 +686,66 @@ async def on_reaction_add(reaction, user):
     msg_id = reaction.message.id
     if msg_id not in pending_payment_messages:
         return
-    data     = pending_payment_messages[msg_id]
-    guild_id = data["guild_id"]
-    buyer_id = data["buyer_id"]
+
+    data         = pending_payment_messages[msg_id]
+    guild_id     = data["guild_id"]
+    buyer_id     = data["buyer_id"]
+    raffle_spots = data.get("raffle_spots", [])   # list of (raffle_name, spot_num)
+
     if not is_manager(guild_id, user.id):
         return
+
+    # ── Confirm drop payments ──────────────────────────────────────────────────
     user_pmts = payments[guild_id][buyer_id]
     pending   = [p for p in user_pmts if not p["confirmed"]]
-    if not pending:
-        return
     for p in pending:
         p["confirmed"] = True
     total_confirmed = sum(p["amount"] for p in pending)
+
+    # ── Confirm raffle slot payments and update raffle embeds ──────────────────
+    confirmed_raffle_spots = []
+    for r_name, spot_num in raffle_spots:
+        if r_name in server_raffles.get(guild_id, {}):
+            slot = server_raffles[guild_id][r_name]["slots"].get(spot_num)
+            if slot and slot["user_id"] == buyer_id and not slot["paid"]:
+                slot["paid"] = True
+                await _db_save_slot(guild_id, r_name, spot_num)
+                confirmed_raffle_spots.append((r_name, spot_num))
+
+    # Rebuild embed for each affected raffle
+    for r_name in {r for r, _ in confirmed_raffle_spots}:
+        raffle  = server_raffles[guild_id][r_name]
+        channel = bot.get_channel(raffle["channel_id"])
+        if channel and raffle["message_id"]:
+            try:
+                msg  = await channel.fetch_message(raffle["message_id"])
+                view = _build_raffle_view(guild_id, r_name, raffle)
+                await msg.edit(embed=_raffle_embed(r_name, raffle), view=view)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
+    if not pending and not confirmed_raffle_spots:
+        return
+
     del pending_payment_messages[msg_id]
-    await update_payment_board(guild_id)
+
+    if pending:
+        await update_payment_board(guild_id)
+
     guild = reaction.message.guild
     buyer = guild.get_member(buyer_id)
     if buyer:
         try:
-            await buyer.send(f"✅  Your payment of **${total_confirmed:.2f}** has been confirmed! Thanks so much — enjoy your order! 🎉")
+            await buyer.send(
+                f"✅  Your payment of **${total_confirmed:.2f}** has been confirmed! "
+                f"Thanks so much — enjoy! 🎉"
+            )
         except discord.Forbidden:
             pass
     try:
-        await reaction.message.edit(content=reaction.message.content + f"\n✅  Confirmed by **{user.display_name}**")
+        await reaction.message.edit(
+            content=reaction.message.content + f"\n✅  Confirmed by **{user.display_name}**"
+        )
     except (discord.Forbidden, discord.NotFound):
         pass
 
@@ -1320,21 +1357,35 @@ async def cmd_paid(ctx, *, args=""):
     drop_ch          = get_drop_channel(ctx.guild) or ctx.channel
     manager_mentions = " ".join(f"<@{uid}>" for uid in server_managers[guild_id])
     # Check if this payment is for raffle spots — collect ALL unpaid spots for this user
+    # Collect unpaid raffle slots for this user — store with the ping for react handler
     raffle_spots = []
     for r_name, raffle in server_raffles.get(guild_id, {}).items():
         for spot_num, s in raffle["slots"].items():
             if s["user_id"] == ctx.author.id and not s["paid"]:
-                raffle_spots.append(f"**{r_name}** Spot #{spot_num}")
-    raffle_context = f" *(Raffle: {', '.join(raffle_spots)})*" if raffle_spots else ""
+                raffle_spots.append((r_name, spot_num))
 
-    ping_msg         = await drop_ch.send(
-        f"💰  {manager_mentions} — **{ctx.author.display_name}** reported payment of **${amount:.2f}** via **{method.title()}**{raffle_context}.\n"
-        f"React ✅ to confirm or use `!confirm @{ctx.author.display_name}`"
-        + (" / `/raffle confirm <name> @user`" if raffle_context else "") + ".",
+    raffle_context = ""
+    if raffle_spots:
+        spots_label = ", ".join(f"**{r}** Spot #{n}" for r, n in raffle_spots)
+        raffle_context = f" *(Raffle: {spots_label})*"
+
+    # Build confirm hint — raffle payments use /raffle confirm, drop payments use !confirm
+    if raffle_context:
+        confirm_hint = f"React ✅ or use `/raffle confirm` to mark as paid."
+    else:
+        confirm_hint = f"React ✅ to confirm or use `!confirm @{ctx.author.display_name}`."
+
+    ping_msg = await drop_ch.send(
+        f"💰  {manager_mentions} — **{ctx.author.display_name}** reported payment of "
+        f"**${amount:.2f}** via **{method.title()}**{raffle_context}.\n{confirm_hint}",
         allowed_mentions=discord.AllowedMentions(users=True)
     )
     await ping_msg.add_reaction("✅")
-    pending_payment_messages[ping_msg.id] = {"guild_id": guild_id, "buyer_id": ctx.author.id}
+    pending_payment_messages[ping_msg.id] = {
+        "guild_id":    guild_id,
+        "buyer_id":    ctx.author.id,
+        "raffle_spots": raffle_spots,   # list of (raffle_name, spot_num) tuples
+    }
 
 
 @bot.command(name="claim")
@@ -2330,8 +2381,8 @@ async def slash_raffle_wheel(interaction: discord.Interaction, name: str, force:
         )
         return
 
-    entries   = [f"{s['username']} - Spot {num}" for num, s in paid_slots]
-    wheel_url = f"https://wheelofnames.com/?v=1&names={url_quote(','.join(entries))}"
+    entries      = [f"{s['username']} - Spot {num}" for num, s in paid_slots]
+    entries_text = "\n".join(entries)
 
     channel = bot.get_channel(raffle["channel_id"])
     if channel is None:
@@ -2341,20 +2392,23 @@ async def slash_raffle_wheel(interaction: discord.Interaction, name: str, force:
     embed = discord.Embed(
         title=f"🎡  SPIN TIME — {name} Raffle!",
         description=(
-            f"**{len(paid_slots)} entries** loaded into the wheel!\n\n"
-            f"🔗 **[Click here to open the wheel]({wheel_url})**\n\n"
-            f"🎙️  Get into voice chat — the creator is spinning **LIVE** right now!"
+            f"**{len(paid_slots)} entries** are ready!\n\n"
+            f"**How to spin:**\n"
+            f"1️⃣  Go to **[wheelofnames.com](https://wheelofnames.com)**\n"
+            f"2️⃣  Copy the names below and paste them into the text box\n"
+            f"3️⃣  Share your screen in voice chat and spin!\n\n"
+            f"🎙️  Get into voice chat — creator is spinning **LIVE**!"
         ),
         color=discord.Color.gold(),
     )
     embed.add_field(
-        name="Entries on the Wheel",
-        value="\n".join(f"• {e}" for e in entries),
+        name="📋  Copy these names into Wheel of Names",
+        value=f"```\n{entries_text}\n```",
         inline=False,
     )
     embed.set_footer(text=f"After the spin → /raffle winner {name} @winner")
     await channel.send(embed=embed)
-    await interaction.followup.send("✅  Wheel posted! Go spin it live.", ephemeral=True)
+    await interaction.followup.send("✅  Wheel embed posted! Copy the names into wheelofnames.com and spin live.", ephemeral=True)
 
 
 @discord.app_commands.autocomplete(name=_raffle_name_autocomplete)
