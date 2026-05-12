@@ -1319,18 +1319,18 @@ async def cmd_paid(ctx, *, args=""):
     )
     drop_ch          = get_drop_channel(ctx.guild) or ctx.channel
     manager_mentions = " ".join(f"<@{uid}>" for uid in server_managers[guild_id])
-    # Check if this payment is for a raffle spot — add context to the ping
-    raffle_context = ""
+    # Check if this payment is for raffle spots — collect ALL unpaid spots for this user
+    raffle_spots = []
     for r_name, raffle in server_raffles.get(guild_id, {}).items():
         for spot_num, s in raffle["slots"].items():
             if s["user_id"] == ctx.author.id and not s["paid"]:
-                raffle_context = f" *(Raffle: **{r_name}** Spot #{spot_num})*"
-                break
+                raffle_spots.append(f"**{r_name}** Spot #{spot_num}")
+    raffle_context = f" *(Raffle: {', '.join(raffle_spots)})*" if raffle_spots else ""
 
     ping_msg         = await drop_ch.send(
         f"💰  {manager_mentions} — **{ctx.author.display_name}** reported payment of **${amount:.2f}** via **{method.title()}**{raffle_context}.\n"
         f"React ✅ to confirm or use `!confirm @{ctx.author.display_name}`"
-        + (f" / `/raffle confirm {list(server_raffles.get(guild_id, {}).keys())[0] if server_raffles.get(guild_id) else 'name'} @{ctx.author.display_name}`" if raffle_context else "") + ".",
+        + (" / `/raffle confirm <name> @user`" if raffle_context else "") + ".",
         allowed_mentions=discord.AllowedMentions(users=True)
     )
     await ping_msg.add_reaction("✅")
@@ -2061,14 +2061,6 @@ async def on_interaction(interaction: discord.Interaction):
             ephemeral=True,
         )
         return
-
-    for n, s in raffle["slots"].items():
-        if s["user_id"] == interaction.user.id:
-            await interaction.followup.send(
-                f"⚠️  You already hold **Spot #{n}** in this raffle.",
-                ephemeral=True,
-            )
-            return
 
     username = str(interaction.user)
     raffle["slots"][spot_num] = {"user_id": interaction.user.id, "username": username, "paid": False}
