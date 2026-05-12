@@ -1212,7 +1212,14 @@ async def cmd_paid(ctx, *, args=""):
         for claim_list in archived_claims.values()
         for c in claim_list
     )
-    if not has_live_claim and not has_archived_claim:
+    # Check if user has a raffle spot in any active raffle for this server
+    has_raffle_claim = any(
+        s["user_id"] == ctx.author.id
+        for raffle in server_raffles.get(guild_id, {}).values()
+        if raffle["status"] in ("open", "closed")
+        for s in raffle["slots"].values()
+    )
+    if not has_live_claim and not has_archived_claim and not has_raffle_claim:
         await ctx.author.send("⚠️  You don't have any claims to pay for.")
         await silent(ctx)
         return
@@ -1312,9 +1319,18 @@ async def cmd_paid(ctx, *, args=""):
     )
     drop_ch          = get_drop_channel(ctx.guild) or ctx.channel
     manager_mentions = " ".join(f"<@{uid}>" for uid in server_managers[guild_id])
+    # Check if this payment is for a raffle spot — add context to the ping
+    raffle_context = ""
+    for r_name, raffle in server_raffles.get(guild_id, {}).items():
+        for spot_num, s in raffle["slots"].items():
+            if s["user_id"] == ctx.author.id and not s["paid"]:
+                raffle_context = f" *(Raffle: **{r_name}** Spot #{spot_num})*"
+                break
+
     ping_msg         = await drop_ch.send(
-        f"💰  {manager_mentions} — **{ctx.author.display_name}** reported payment of **${amount:.2f}** via **{method.title()}**.\n"
-        f"React ✅ to confirm or use `!confirm @{ctx.author.display_name}`.",
+        f"💰  {manager_mentions} — **{ctx.author.display_name}** reported payment of **${amount:.2f}** via **{method.title()}**{raffle_context}.\n"
+        f"React ✅ to confirm or use `!confirm @{ctx.author.display_name}`"
+        + (f" / `/raffle confirm {list(server_raffles.get(guild_id, {}).keys())[0] if server_raffles.get(guild_id) else 'name'} @{ctx.author.display_name}`" if raffle_context else "") + ".",
         allowed_mentions=discord.AllowedMentions(users=True)
     )
     await ping_msg.add_reaction("✅")
@@ -2089,8 +2105,8 @@ async def on_interaction(interaction: discord.Interaction):
             f"🎉  You claimed **Spot #{spot_num}** in the **{name}** raffle!\n\n"
             f"**Price:** {raffle['price']}\n\n"
             f"**Send payment using one of these methods:**\n{payment_info}\n\n"
-            f"Once you've sent payment, reply here with your method and amount "
-            f"so the organizer can confirm — e.g. `Venmo $25`.\n\nGood luck! 🤞"
+            f"Once you've sent payment, go back to the server and type:\n"
+            f"`!paid venmo $25` (or whichever method you used)\n\nGood luck! 🤞"
         )
     except discord.Forbidden:
         if channel:
