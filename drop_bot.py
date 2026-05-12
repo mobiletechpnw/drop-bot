@@ -673,7 +673,6 @@ async def on_command_error(ctx, error):
 async def on_ready():
     await init_db()
     await db_load_all()
-    await _register_persistent_views()
     await bot.tree.sync()
     print(f"✅  Logged in as {bot.user} ({bot.user.id})")
 
@@ -1875,20 +1874,15 @@ async def cmd_help(ctx):
 
 
 
+
 # ══════════════════════════════════════════════════════════════════════════════
 # RAFFLE MODULE — Button UI + Slash Commands
 # ══════════════════════════════════════════════════════════════════════════════
 #
-# USER FLOW:
-#   Owner runs /raffle create → embed posts with numbered buttons (max 10)
-#   User taps a button        → spot claimed instantly, bot DMs payment info
-#   Owner runs /raffle confirm @user → marks paid, embed updates
-#   Owner runs /raffle wheel  → Wheel of Names link posted for live spin
-#   Owner runs /raffle winner @user  → winner announced
-#
-# PERSISTENCE:
-#   RaffleView is re-registered from DB on startup so buttons survive restarts
-#
+# Buttons handled via on_interaction with custom_id parsing.
+# custom_id format: raffle:{guild_id}:{name}:{spot_num}
+
+
 # ── DB HELPERS ────────────────────────────────────────────────────────────────
 
 async def _db_save_raffle(guild_id: int, name: str):
@@ -1943,7 +1937,6 @@ def _raffle_embed(name: str, raffle: dict) -> discord.Embed:
     slots     = raffle["slots"]
     total     = raffle["spots"]
     claimed   = sum(1 for s in slots.values() if s["user_id"] is not None)
-    paid      = sum(1 for s in slots.values() if s["paid"])
     remaining = total - claimed
 
     if raffle["status"] == "complete":
@@ -1958,7 +1951,6 @@ def _raffle_embed(name: str, raffle: dict) -> discord.Embed:
     embed.add_field(name="Total Spots",    value=str(total),      inline=True)
     embed.add_field(name="Remaining",      value=str(remaining),  inline=True)
 
-    # Slot list
     lines = []
     for num in sorted(slots.keys()):
         s = slots[num]
@@ -1972,9 +1964,9 @@ def _raffle_embed(name: str, raffle: dict) -> discord.Embed:
     if total <= 5:
         embed.add_field(name="Spots", value="\n".join(lines) or "—", inline=False)
     else:
-        mid   = (len(lines) + 1) // 2
-        embed.add_field(name="Spots",  value="\n".join(lines[:mid]) or "—", inline=True)
-        embed.add_field(name="\u200b", value="\n".join(lines[mid:]) or "—", inline=True)
+        mid = (len(lines) + 1) // 2
+        embed.add_field(name="Spots",   value="\n".join(lines[:mid]) or "—", inline=True)
+        embed.add_field(name="\u200b",  value="\n".join(lines[mid:]) or "—", inline=True)
 
     status_map = {
         "open":     "🟢 Open — tap a spot button to claim!",
@@ -1995,54 +1987,45 @@ def _build_raffle_payment_dm(guild_id: int) -> str:
     return "\n".join(lines) if lines else "*(payment info not set — contact the server owner)*"
 
 
-# ── BUTTON VIEW ───────────────────────────────────────────────────────────────
-
-class RaffleView(discord.ui.View):
-    """
-    Persistent button view for a single raffle.
-    custom_id format: raffle:{guild_id}:{name}:{spot_num}
-    This format lets us reconstruct views from DB on restart.
-    """
-
-    def __init__(self, guild_id: int, name: str, raffle: dict):
-        super().__init__(timeout=None)  # Never times out — persistent
-        self.guild_id = guild_id
-        self.name     = name
-        self._build_buttons(raffle)
-
-    def _build_buttons(self, raffle: dict):
-        self.clear_items()
-        for num in sorted(raffle["slots"].keys()):
-            s       = raffle["slots"][num]
-            taken   = s["user_id"] is not None
-            label   = f"Spot {num}" if not taken else f"#{num} — {s['username'][:12]}"
-            btn     = discord.ui.Button(
-                label     = label,
-                style     = discord.ButtonStyle.danger if taken else discord.ButtonStyle.success,
-                disabled  = taken,
-                custom_id = f"raffle:{self.guild_id}:{self.name}:{num}",
-                row       = (num - 1) // 5,   # 5 buttons per row, max 2 rows = 10 spots
-            )
-            btn.callback = self._make_callback(num)
-            self.add_item(btn)
-
-    def _make_callback(self, spot_num: int):
-        async def callback(interaction: discord.Interaction):
-            await _handle_spot_claim(interaction, self.guild_id, self.name, spot_num)
-        return callback
-
-    def refresh(self, raffle: dict):
-        """Rebuild buttons to reflect current slot state."""
-        self._build_buttons(raffle)
+def _build_raffle_view(guild_id: int, name: str, raffle: dict) -> discord.ui.View:
+    """Build a View with numbered spot buttons. Interaction handled by on_interaction."""
+    view = discord.ui.View(timeout=None)
+    for num in sorted(raffle["slots"].keys()):
+        s     = raffle["slots"][num]
+        taken = s["user_id"] is not None
+        label = f"Spot {num}" if not taken else f"#{num} \u2014 {s['username'][:12]}"
+        btn   = discord.ui.Button(
+            label     = label,
+            style     = discord.ButtonStyle.danger if taken else discord.ButtonStyle.success,
+            disabled  = taken or raffle["status"] != "open",
+            custom_id = f"raffle:{guild_id}:{name}:{num}",
+            row       = (num - 1) // 5,
+        )
+        view.add_item(btn)
+    return view
 
 
-async def _handle_spot_claim(
-    interaction: discord.Interaction,
-    guild_id: int,
-    name: str,
-    spot_num: int,
-):
-    """Shared handler called by button callbacks."""
+# ── BUTTON INTERACTION HANDLER ────────────────────────────────────────────────
+
+@bot.event
+async def on_interaction(interaction: discord.Interaction):
+    """Route raffle button clicks by parsing custom_id."""
+    if interaction.type != discord.InteractionType.component:
+        return
+    custom_id = interaction.data.get("custom_id", "")
+    if not custom_id.startswith("raffle:"):
+        return
+
+    parts = custom_id.split(":", 3)
+    if len(parts) != 4:
+        return
+    try:
+        guild_id = int(parts[1])
+        name     = parts[2]
+        spot_num = int(parts[3])
+    except (ValueError, IndexError):
+        return
+
     await interaction.response.defer(ephemeral=True)
 
     if guild_id not in server_raffles or name not in server_raffles[guild_id]:
@@ -2056,18 +2039,13 @@ async def _handle_spot_claim(
         return
 
     slot = raffle["slots"].get(spot_num)
-    if slot is None:
-        await interaction.followup.send("⚠️  That spot doesn't exist.", ephemeral=True)
-        return
-
-    if slot["user_id"] is not None:
+    if slot is None or slot["user_id"] is not None:
         await interaction.followup.send(
             f"⚠️  Spot **#{spot_num}** was just taken! Pick another open spot.",
             ephemeral=True,
         )
         return
 
-    # Check user doesn't already hold a spot in this raffle
     for n, s in raffle["slots"].items():
         if s["user_id"] == interaction.user.id:
             await interaction.followup.send(
@@ -2076,41 +2054,35 @@ async def _handle_spot_claim(
             )
             return
 
-    # Claim the spot
     username = str(interaction.user)
     raffle["slots"][spot_num] = {"user_id": interaction.user.id, "username": username, "paid": False}
     await _db_save_slot(guild_id, name, spot_num)
 
-    # Auto-close if all spots taken
     all_claimed = all(s["user_id"] is not None for s in raffle["slots"].values())
     if all_claimed:
         raffle["status"] = "closed"
         await _db_save_raffle(guild_id, name)
 
-    # Rebuild and update the embed + buttons
-    view = RaffleView(guild_id, name, raffle)
-    try:
-        channel = bot.get_channel(raffle["channel_id"])
-        msg     = await channel.fetch_message(raffle["message_id"])
-        await msg.edit(embed=_raffle_embed(name, raffle), view=view)
-    except (discord.NotFound, discord.HTTPException):
-        pass
+    channel = bot.get_channel(raffle["channel_id"])
+    if channel and raffle["message_id"]:
+        try:
+            msg  = await channel.fetch_message(raffle["message_id"])
+            view = _build_raffle_view(guild_id, name, raffle)
+            await msg.edit(embed=_raffle_embed(name, raffle), view=view)
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
-    if all_claimed:
-        channel = bot.get_channel(raffle["channel_id"])
-        if channel:
-            await channel.send(
-                f"🔒  **{name}** is fully claimed! "
-                f"Waiting on payment confirmations before the spin. 🎡"
-            )
+    if all_claimed and channel:
+        await channel.send(
+            f"🔒  **{name}** is fully claimed! "
+            f"Waiting on payment confirmations before the spin. 🎡"
+        )
 
-    # Confirm to the user ephemerally
     await interaction.followup.send(
         f"🎟️  You claimed **Spot #{spot_num}**! Check your DMs for payment details.",
         ephemeral=True,
     )
 
-    # DM payment instructions
     payment_info = _build_raffle_payment_dm(guild_id)
     try:
         await interaction.user.send(
@@ -2121,7 +2093,6 @@ async def _handle_spot_claim(
             f"so the organizer can confirm — e.g. `Venmo $25`.\n\nGood luck! 🤞"
         )
     except discord.Forbidden:
-        channel = bot.get_channel(raffle["channel_id"])
         if channel:
             await channel.send(
                 f"⚠️  {interaction.user.mention} — I couldn't DM you! "
@@ -2130,19 +2101,7 @@ async def _handle_spot_claim(
             )
 
 
-async def _register_persistent_views():
-    """
-    Called on startup — re-adds RaffleView for every open/closed raffle
-    so buttons still work after a Railway restart.
-    """
-    for guild_id, raffles in server_raffles.items():
-        for name, raffle in raffles.items():
-            if raffle["status"] in ("open", "closed"):
-                view = RaffleView(guild_id, name, raffle)
-                bot.add_view(view)
-
-
-# ── SLASH COMMAND TREE ────────────────────────────────────────────────────────
+# ── SLASH COMMAND GROUP ───────────────────────────────────────────────────────
 
 raffle_group = discord.app_commands.Group(
     name="raffle",
@@ -2153,7 +2112,7 @@ raffle_group = discord.app_commands.Group(
 @raffle_group.command(name="create", description="Create a new raffle with button-based spot claiming")
 @discord.app_commands.describe(
     name="Raffle name (e.g. ScarletVault)",
-    spots="Number of spots (max 10)",
+    spots="Number of spots (2-10)",
     price="Price per spot (e.g. $25)",
 )
 async def slash_raffle_create(interaction: discord.Interaction, name: str, spots: int, price: str):
@@ -2178,11 +2137,10 @@ async def slash_raffle_create(interaction: discord.Interaction, name: str, spots
         )
         return
 
-    # One-time channel setup
     if guild_id not in server_raffle_channel:
         await interaction.followup.send(
-            "📋  **One-time setup:** Which channel should raffles be posted in?\n"
-            "Use `/raffle setchannel` first, then create your raffle.",
+            "📋  **One-time setup required.**\n"
+            "Run `/raffle setchannel #channel` first, then create your raffle.",
             ephemeral=True,
         )
         return
@@ -2201,7 +2159,7 @@ async def slash_raffle_create(interaction: discord.Interaction, name: str, spots
     channel = bot.get_channel(server_raffle_channel[guild_id])
     if channel is None:
         await interaction.followup.send(
-            "⚠️  Raffle channel not found. Use `/raffle setchannel` to set one.",
+            "⚠️  Raffle channel not found. Use `/raffle setchannel` to set a new one.",
             ephemeral=True,
         )
         del server_raffles[guild_id][name]
@@ -2210,12 +2168,12 @@ async def slash_raffle_create(interaction: discord.Interaction, name: str, spots
     payment_hint = _build_raffle_payment_dm(guild_id)
     embed        = _raffle_embed(name, raffle)
     embed.description = (
-        f"Tap a button below to claim your spot!\n"
-        f"The bot will DM you payment details instantly.\n\n"
+        "Tap a button below to claim your spot!\n"
+        "The bot will DM you payment details instantly.\n\n"
         f"💳 **Payment accepted via:**\n{payment_hint}"
     )
 
-    view = RaffleView(guild_id, name, raffle)
+    view = _build_raffle_view(guild_id, name, raffle)
     msg  = await channel.send(embed=embed, view=view)
 
     raffle["message_id"] = msg.id
@@ -2223,11 +2181,8 @@ async def slash_raffle_create(interaction: discord.Interaction, name: str, spots
     for spot_num in raffle["slots"]:
         await _db_save_slot(guild_id, name, spot_num)
 
-    # Register the view for persistence
-    bot.add_view(view)
-
     await interaction.followup.send(
-        f"✅  Raffle **{name}** is live with **{spots} spots** at **{price}** each!",
+        f"✅  Raffle **{name}** is live — **{spots} spots** at **{price}** each!",
         ephemeral=True,
     )
 
@@ -2271,12 +2226,11 @@ async def slash_raffle_confirm(interaction: discord.Interaction, name: str, user
     raffle["slots"][spot_found]["paid"] = True
     await _db_save_slot(guild_id, name, spot_found)
 
-    # Update embed
     channel = bot.get_channel(raffle["channel_id"])
     if channel and raffle["message_id"]:
         try:
             msg  = await channel.fetch_message(raffle["message_id"])
-            view = RaffleView(guild_id, name, raffle)
+            view = _build_raffle_view(guild_id, name, raffle)
             await msg.edit(embed=_raffle_embed(name, raffle), view=view)
         except (discord.NotFound, discord.HTTPException):
             pass
@@ -2301,20 +2255,16 @@ async def slash_raffle_confirm(interaction: discord.Interaction, name: str, user
 @raffle_group.command(name="wheel", description="Generate Wheel of Names link for the live spin")
 @discord.app_commands.describe(
     name="Raffle name",
-    force="Spin even if some payments aren't confirmed yet",
+    force="Spin even if some payments are not confirmed yet",
 )
-async def slash_raffle_wheel(
-    interaction: discord.Interaction,
-    name: str,
-    force: bool = False,
-):
+async def slash_raffle_wheel(interaction: discord.Interaction, name: str, force: bool = False):
     await interaction.response.defer(ephemeral=True)
 
     if interaction.guild.owner_id != interaction.user.id:
         await interaction.followup.send("⚠️  Only the server owner can start the wheel.", ephemeral=True)
         return
 
-    guild_id = interaction.guild_id
+    guild_id   = interaction.guild_id
 
     if name not in server_raffles[guild_id]:
         await interaction.followup.send(f"⚠️  No raffle named **{name}**.", ephemeral=True)
@@ -2325,7 +2275,7 @@ async def slash_raffle_wheel(
 
     if not paid_slots:
         await interaction.followup.send(
-            "⚠️  No confirmed payments yet. Confirm payments with `/raffle confirm` first.",
+            "⚠️  No confirmed payments yet. Use `/raffle confirm` first.",
             ephemeral=True,
         )
         return
@@ -2367,7 +2317,6 @@ async def slash_raffle_wheel(
     )
     embed.set_footer(text=f"After the spin → /raffle winner {name} @winner")
     await channel.send(embed=embed)
-
     await interaction.followup.send("✅  Wheel posted! Go spin it live.", ephemeral=True)
 
 
@@ -2403,16 +2352,14 @@ async def slash_raffle_winner(interaction: discord.Interaction, name: str, user:
     raffle["status"] = "complete"
     await _db_save_raffle(guild_id, name)
 
-    # Update embed — disable all buttons
     channel = bot.get_channel(raffle["channel_id"])
     if channel and raffle["message_id"]:
         try:
             msg  = await channel.fetch_message(raffle["message_id"])
-            view = RaffleView(guild_id, name, raffle)
+            view = _build_raffle_view(guild_id, name, raffle)
             await msg.edit(embed=_raffle_embed(name, raffle), view=view)
         except (discord.NotFound, discord.HTTPException):
             pass
-
         winner_embed = discord.Embed(
             title=f"🏆  Winner — {name} Raffle!",
             description=(
@@ -2454,7 +2401,6 @@ async def slash_raffle_cancel(interaction: discord.Interaction, name: str):
         await interaction.followup.send(f"⚠️  No raffle named **{name}**.", ephemeral=True)
         return
 
-    # Disable buttons on the original message
     raffle  = server_raffles[guild_id][name]
     channel = bot.get_channel(raffle["channel_id"])
     if channel and raffle["message_id"]:
@@ -2472,7 +2418,6 @@ async def slash_raffle_cancel(interaction: discord.Interaction, name: str):
 
     await _db_delete_raffle(guild_id, name)
     del server_raffles[guild_id][name]
-
     await interaction.followup.send(f"🗑️  Raffle **{name}** cancelled and removed.", ephemeral=True)
 
 
@@ -2534,7 +2479,7 @@ async def slash_raffles(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-# Register the raffle slash command group
+# Register slash command group
 bot.tree.add_command(raffle_group)
 
 
