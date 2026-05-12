@@ -2111,6 +2111,21 @@ async def on_interaction(interaction: discord.Interaction):
 
 # ── SLASH COMMAND GROUP ───────────────────────────────────────────────────────
 
+
+async def _raffle_name_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[discord.app_commands.Choice[str]]:
+    """Autocomplete active raffle names for slash commands."""
+    guild_id = interaction.guild_id
+    raffles  = server_raffles.get(guild_id, {})
+    return [
+        discord.app_commands.Choice(name=name, value=name)
+        for name in raffles
+        if current.lower() in name.lower()
+    ][:25]
+
+
 raffle_group = discord.app_commands.Group(
     name="raffle",
     description="Raffle commands for Vault & Pine drops"
@@ -2195,6 +2210,7 @@ async def slash_raffle_create(interaction: discord.Interaction, name: str, spots
     )
 
 
+@discord.app_commands.autocomplete(name=_raffle_name_autocomplete)
 @raffle_group.command(name="confirm", description="Confirm a user's payment for a raffle spot")
 @discord.app_commands.describe(name="Raffle name", user="The user to confirm")
 async def slash_raffle_confirm(interaction: discord.Interaction, name: str, user: discord.Member):
@@ -2210,29 +2226,39 @@ async def slash_raffle_confirm(interaction: discord.Interaction, name: str, user
         await interaction.followup.send(f"⚠️  No raffle named **{name}**.", ephemeral=True)
         return
 
-    raffle     = server_raffles[guild_id][name]
-    spot_found = None
-    for num, s in raffle["slots"].items():
-        if s["user_id"] == user.id:
-            spot_found = num
-            break
+    raffle      = server_raffles[guild_id][name]
 
-    if spot_found is None:
+    # Find ALL unpaid slots for this user (they may hold multiple)
+    unpaid_spots = [
+        num for num, s in raffle["slots"].items()
+        if s["user_id"] == user.id and not s["paid"]
+    ]
+    already_paid = [
+        num for num, s in raffle["slots"].items()
+        if s["user_id"] == user.id and s["paid"]
+    ]
+
+    if not unpaid_spots and not already_paid:
         await interaction.followup.send(
-            f"⚠️  **{user.display_name}** doesn't have a spot in **{name}**.",
+            f"⚠️  **{user.display_name}** doesn't have any spots in **{name}**.",
             ephemeral=True,
         )
         return
 
-    if raffle["slots"][spot_found]["paid"]:
+    if not unpaid_spots:
         await interaction.followup.send(
-            f"⚠️  **{user.display_name}**'s payment is already confirmed.",
+            f"⚠️  All of **{user.display_name}**'s spots are already confirmed "
+            f"(Spot{'s' if len(already_paid) > 1 else ''} {', '.join(f'#{n}' for n in already_paid)}).",
             ephemeral=True,
         )
         return
 
-    raffle["slots"][spot_found]["paid"] = True
-    await _db_save_slot(guild_id, name, spot_found)
+    # Mark all unpaid spots as paid
+    for num in unpaid_spots:
+        raffle["slots"][num]["paid"] = True
+        await _db_save_slot(guild_id, name, num)
+
+    spots_str = ", ".join(f"#{n}" for n in sorted(unpaid_spots))
 
     channel = bot.get_channel(raffle["channel_id"])
     if channel and raffle["message_id"]:
@@ -2243,23 +2269,26 @@ async def slash_raffle_confirm(interaction: discord.Interaction, name: str, user
         except (discord.NotFound, discord.HTTPException):
             pass
         await channel.send(
-            f"✅  Payment confirmed — **{user.display_name}** holds Spot **#{spot_found}** in **{name}**!"
+            f"✅  Payment confirmed — **{user.display_name}** "
+            f"(Spot{'s' if len(unpaid_spots) > 1 else ''} {spots_str}) in **{name}**!"
         )
 
     try:
         await user.send(
-            f"✅  Your payment for **Spot #{spot_found}** in the **{name}** raffle is confirmed!\n"
+            f"✅  Your payment for Spot{'s' if len(unpaid_spots) > 1 else ''} {spots_str} "
+            f"in the **{name}** raffle is confirmed!\n"
             f"Watch for the live spin announcement. 🎡"
         )
     except discord.Forbidden:
         pass
 
     await interaction.followup.send(
-        f"✅  Confirmed payment for **{user.display_name}** — Spot #{spot_found}.",
+        f"✅  Confirmed payment for **{user.display_name}** — Spot{'s' if len(unpaid_spots) > 1 else ''} {spots_str}.",
         ephemeral=True,
     )
 
 
+@discord.app_commands.autocomplete(name=_raffle_name_autocomplete)
 @raffle_group.command(name="wheel", description="Generate Wheel of Names link for the live spin")
 @discord.app_commands.describe(
     name="Raffle name",
@@ -2328,6 +2357,7 @@ async def slash_raffle_wheel(interaction: discord.Interaction, name: str, force:
     await interaction.followup.send("✅  Wheel posted! Go spin it live.", ephemeral=True)
 
 
+@discord.app_commands.autocomplete(name=_raffle_name_autocomplete)
 @raffle_group.command(name="winner", description="Record the winner and post the announcement")
 @discord.app_commands.describe(name="Raffle name", user="The winning user")
 async def slash_raffle_winner(interaction: discord.Interaction, name: str, user: discord.Member):
@@ -2394,6 +2424,7 @@ async def slash_raffle_winner(interaction: discord.Interaction, name: str, user:
     )
 
 
+@discord.app_commands.autocomplete(name=_raffle_name_autocomplete)
 @raffle_group.command(name="cancel", description="Cancel and remove a raffle")
 @discord.app_commands.describe(name="Raffle name")
 async def slash_raffle_cancel(interaction: discord.Interaction, name: str):
@@ -2429,6 +2460,7 @@ async def slash_raffle_cancel(interaction: discord.Interaction, name: str):
     await interaction.followup.send(f"🗑️  Raffle **{name}** cancelled and removed.", ephemeral=True)
 
 
+@discord.app_commands.autocomplete(name=_raffle_name_autocomplete)
 @raffle_group.command(name="status", description="Show the current state of a raffle")
 @discord.app_commands.describe(name="Raffle name")
 async def slash_raffle_status(interaction: discord.Interaction, name: str):
