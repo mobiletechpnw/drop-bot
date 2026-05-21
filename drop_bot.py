@@ -2407,14 +2407,19 @@ async def slash_raffle_wheel(interaction: discord.Interaction, name: str, force:
         inline=False,
     )
     embed.set_footer(text=f"After the spin → /raffle winner {name} @winner")
-    await channel.send(embed=embed)
-    await interaction.followup.send("✅  Wheel embed posted! Copy the names into wheelofnames.com and spin live.", ephemeral=True)
+    # Send the names list only to the owner (ephemeral via followup)
+    # Channel stays clean until the winner is announced
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @discord.app_commands.autocomplete(name=_raffle_name_autocomplete)
-@raffle_group.command(name="winner", description="Record the winner and post the announcement")
-@discord.app_commands.describe(name="Raffle name", user="The winning user")
-async def slash_raffle_winner(interaction: discord.Interaction, name: str, user: discord.Member):
+@discord.app_commands.autocomplete(name=_raffle_name_autocomplete)
+@raffle_group.command(name="winner", description="Announce the raffle winner by winning spot number")
+@discord.app_commands.describe(
+    name="Raffle name",
+    spot="The winning spot number from the wheel spin",
+)
+async def slash_raffle_winner(interaction: discord.Interaction, name: str, spot: int):
     await interaction.response.defer(ephemeral=True)
 
     if interaction.guild.owner_id != interaction.user.id:
@@ -2427,19 +2432,26 @@ async def slash_raffle_winner(interaction: discord.Interaction, name: str, user:
         await interaction.followup.send(f"⚠️  No raffle named **{name}**.", ephemeral=True)
         return
 
-    raffle     = server_raffles[guild_id][name]
-    spot_found = None
-    for num, s in raffle["slots"].items():
-        if s["user_id"] == user.id:
-            spot_found = num
-            break
+    raffle = server_raffles[guild_id][name]
 
-    if spot_found is None:
+    if spot not in raffle["slots"]:
         await interaction.followup.send(
-            f"⚠️  **{user.display_name}** doesn't have a spot in **{name}**.",
+            f"⚠️  Spot **#{spot}** doesn't exist in **{name}**. Valid spots: 1–{raffle['spots']}.",
             ephemeral=True,
         )
         return
+
+    winning_slot = raffle["slots"][spot]
+    if winning_slot["user_id"] is None:
+        await interaction.followup.send(
+            f"⚠️  Spot **#{spot}** was never claimed. Double-check the winning spot number.",
+            ephemeral=True,
+        )
+        return
+
+    winner = interaction.guild.get_member(winning_slot["user_id"])
+    winner_mention = winner.mention if winner else winning_slot["username"]
+    winner_name    = winning_slot["username"]
 
     raffle["status"] = "complete"
     await _db_save_raffle(guild_id, name)
@@ -2452,28 +2464,30 @@ async def slash_raffle_winner(interaction: discord.Interaction, name: str, user:
             await msg.edit(embed=_raffle_embed(name, raffle), view=view)
         except (discord.NotFound, discord.HTTPException):
             pass
+
         winner_embed = discord.Embed(
-            title=f"🏆  Winner — {name} Raffle!",
+            title=f"🏆  We Have a Winner — {name} Raffle!",
             description=(
-                f"🎉 Congratulations to {user.mention}!\n\n"
-                f"**Winner:** {raffle['slots'][spot_found]['username']}\n"
-                f"**Winning Spot:** #{spot_found}\n\n"
+                f"🎉 Congratulations to {winner_mention}!\n\n"
+                f"**Winner:** {winner_name}\n"
+                f"**Winning Spot:** #{spot}\n\n"
                 f"Thanks to everyone who participated! 🙌"
             ),
             color=discord.Color.gold(),
         )
         await channel.send(embed=winner_embed)
 
-    try:
-        await user.send(
-            f"🏆  **You won the {name} raffle!** Congratulations!\n"
-            f"The server owner will reach out shortly with your prize details."
-        )
-    except discord.Forbidden:
-        pass
+    if winner:
+        try:
+            await winner.send(
+                f"🏆  **You won the {name} raffle with Spot #{spot}!** Congratulations!\n"
+                f"The server owner will reach out shortly with your prize details."
+            )
+        except discord.Forbidden:
+            pass
 
     await interaction.followup.send(
-        f"🏆  Winner recorded — **{user.display_name}**, Spot #{spot_found}.",
+        f"🏆  Winner recorded — **{winner_name}**, Spot #{spot}.",
         ephemeral=True,
     )
 
