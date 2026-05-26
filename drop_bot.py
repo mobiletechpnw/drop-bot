@@ -44,6 +44,7 @@ Public commands (anyone, in server only):
   !paid <method> <amount>          — works during and after drop
   !stock
   !myclaims
+  !myhistory                       — View your personal claim history across all drops (going forward from deployment)
 """
 
 import discord
@@ -314,8 +315,10 @@ pinned_message = {}
 autoclose = defaultdict(lambda: True)
 manager_session = {}
 payments = defaultdict(lambda: defaultdict(list))
-payment_board_message = {}
+payment_board_message    = {}
+live_claimlist_message   = {}   # guild_id -> Message (live claim list embed)
 pending_payment_messages = {}
+_pending_board_update    = {}   # guild_id -> bool (debounce flag)
 
 # Snapshot of stock prices at drop close for bump/remind to reference after stock resets
 # last_drop_snapshot[guild_id] = {"claims": {...}, "stock": {...}}
@@ -514,6 +517,86 @@ async def update_payment_board(guild_id):
             payment_board_message.pop(guild_id, None)
 
 
+def build_live_claimlist_embed(guild_id):
+    """Live claim list with payment status inline."""
+    stock_ref  = stock[guild_id] if stock[guild_id] else last_drop_snapshot.get(guild_id, {}).get("stock", {})
+    claims_ref = claims[guild_id] if claims[guild_id] else last_drop_snapshot.get(guild_id, {}).get("claims", {})
+    embed = discord.Embed(
+        title="📋  Live Claim List",
+        color=discord.Color.blurple(),
+        timestamp=datetime.datetime.utcnow()
+    )
+    user_orders = {}
+    for key, claim_list in claims_ref.items():
+        if not claim_list or key not in stock_ref:
+            continue
+        for c in claim_list:
+            uid = c["user"].id
+            if uid not in user_orders:
+                user_orders[uid] = {"user": c["user"], "items": [], "total": 0.0}
+            subtotal = c["qty"] * stock_ref[key]["price"]
+            user_orders[uid]["items"].append(
+                f"• {stock_ref[key]['display']}  x{c['qty']}  — ${subtotal:.2f}"
+            )
+            user_orders[uid]["total"] += subtotal
+    if not user_orders:
+        embed.description = "No claims yet."
+        return embed
+    for uid, order in user_orders.items():
+        confirmed_total = sum(p["amount"] for p in payments[guild_id][uid] if p["confirmed"])
+        paid_status = "✅  Paid" if confirmed_total >= order["total"] - 0.01 else f"⏳  ${confirmed_total:.2f} of ${order['total']:.2f} paid"
+        lines_str = "\n".join(order["items"])
+        field_value = lines_str + f"\n**Total: ${order['total']:.2f}** -- {paid_status}"
+        if len(field_value) > 1024:
+            field_value = field_value[:1020] + "..."
+        embed.add_field(
+            name=order["user"].display_name,
+            value=field_value,
+            inline=False
+        )
+    embed.set_footer(text="Updates live as claims and payments come in")
+    return embed
+
+
+async def update_all_live_boards(guild_id):
+    """Debounced update of stock, claimlist, and payment board."""
+    if _pending_board_update.get(guild_id):
+        return
+    _pending_board_update[guild_id] = True
+    await asyncio.sleep(2)  # debounce — wait 2s then flush
+    _pending_board_update[guild_id] = False
+
+    # Update stock embed
+    msg = stock_message.get(guild_id)
+    if msg:
+        try:
+            await msg.edit(embed=build_stock_embed(guild_id))
+        except discord.NotFound:
+            stock_message.pop(guild_id, None)
+        except discord.HTTPException:
+            pass
+
+    # Update live claim list
+    cl_msg = live_claimlist_message.get(guild_id)
+    if cl_msg:
+        try:
+            await cl_msg.edit(embed=build_live_claimlist_embed(guild_id))
+        except discord.NotFound:
+            live_claimlist_message.pop(guild_id, None)
+        except discord.HTTPException:
+            pass
+
+    # Update payment board
+    pb_msg = payment_board_message.get(guild_id)
+    if pb_msg:
+        try:
+            await pb_msg.edit(embed=build_payment_board_embed(guild_id))
+        except discord.NotFound:
+            payment_board_message.pop(guild_id, None)
+        except discord.HTTPException:
+            pass
+
+
 async def update_stock_embed(guild_id):
     msg = stock_message.get(guild_id)
     if not msg:
@@ -601,11 +684,28 @@ async def close_drop(channel, guild_id):
         claims[guild_id], stock[guild_id], confirmed_users
     )
 
+    # Final live update of claim list and payment board
+    cl_msg = live_claimlist_message.get(guild_id)
+    if cl_msg:
+        try:
+            await cl_msg.edit(embed=build_live_claimlist_embed(guild_id))
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
+    pb_existing = payment_board_message.get(guild_id)
+    if pb_existing:
+        try:
+            await pb_existing.edit(embed=build_payment_board_embed(guild_id))
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
+    # Post final summary
     embed = build_claimlist_embed(guild_id, title="🔴  Drop CLOSED — Final Claim List")
     await channel.send(embed=embed)
 
-    board_msg = await channel.send(embed=build_payment_board_embed(guild_id))
-    payment_board_message[guild_id] = board_msg
+    if not pb_existing:
+        board_msg = await channel.send(embed=build_payment_board_embed(guild_id))
+        payment_board_message[guild_id] = board_msg
 
     payment_info = build_payment_info(guild_id)
 
@@ -752,7 +852,7 @@ async def on_reaction_add(reaction, user):
     total_confirmed = sum(p["amount"] for p in pending)
     del pending_payment_messages[msg_id]
 
-    await update_payment_board(guild_id)
+    asyncio.create_task(update_all_live_boards(guild_id))
 
     guild = reaction.message.guild
     buyer = guild.get_member(buyer_id)
@@ -902,6 +1002,8 @@ async def cmd_drop(ctx):
     stock_message.pop(guild_id, None)
     pinned_message.pop(guild_id, None)
     payment_board_message.pop(guild_id, None)
+    live_claimlist_message.pop(guild_id, None)
+    _pending_board_update.pop(guild_id, None)
     pending_payment_messages.clear()  # clear any stale reaction listeners
     autoclose[guild_id] = True
     manager_session[ctx.author.id] = {"guild_id": guild_id, "channel": drop_ch}
@@ -999,7 +1101,7 @@ async def cmd_editstock(ctx, *, args=""):
     stock[guild_id][key]["qty"] = qty
     stock[guild_id][key]["price"] = price
     if session_state[guild_id] == "live":
-        await update_stock_embed(guild_id)
+        asyncio.create_task(update_all_live_boards(guild_id))
     await dm(ctx, f"✅  **{stock[guild_id][key]['display']}** updated — {qty} @ ${price:.2f} each.")
 
 
@@ -1135,13 +1237,18 @@ async def cmd_release(ctx):
         await dm(ctx, "⚠️  No stock loaded.")
         return
     session_state[guild_id] = "live"
-    msg = await drop_channel.send(embed=build_stock_embed(guild_id))
-    stock_message[guild_id] = msg
+    # Post all three live boards together
+    stock_msg = await drop_channel.send(embed=build_stock_embed(guild_id))
+    stock_message[guild_id] = stock_msg
+    cl_msg = await drop_channel.send(embed=build_live_claimlist_embed(guild_id))
+    live_claimlist_message[guild_id] = cl_msg
+    pb_msg = await drop_channel.send(embed=build_payment_board_embed(guild_id))
+    payment_board_message[guild_id] = pb_msg
     await drop_channel.send("🟢  **Drop is LIVE!**  First come, first served!")
     await drop_channel.send(embed=build_howto_embed())
     try:
-        await msg.pin()
-        pinned_message[guild_id] = msg
+        await stock_msg.pin()
+        pinned_message[guild_id] = stock_msg
     except (discord.Forbidden, discord.HTTPException):
         pass
     await dm(ctx, "🟢  Drop is live!")
@@ -1248,7 +1355,7 @@ async def cmd_confirm(ctx):
         p["confirmed"] = True
 
     total_confirmed = sum(p["amount"] for p in pending)
-    await update_payment_board(guild_id)
+    asyncio.create_task(update_all_live_boards(guild_id))
 
     # Update confirmed status in DB
     await db_update_user_claim_confirmed(guild_id, user.id)
@@ -1525,7 +1632,7 @@ async def cmd_claim(ctx, *, args=""):
     new_remaining = remaining - qty
     total_cost = qty * info["price"]
     await ctx.send(f"✅  **{ctx.author.display_name}** claimed **{qty}x {info['display']}** — ${total_cost:.2f}  •  {new_remaining} left")
-    await update_stock_embed(guild_id)
+    asyncio.create_task(update_all_live_boards(guild_id))
     if autoclose[guild_id] and all_sold_out(guild_id):
         await ctx.send("🎉  **Everything is claimed!** Closing the drop...")
         await close_drop(ctx.channel, guild_id)
@@ -1576,7 +1683,7 @@ async def cmd_unclaim(ctx, *, args=""):
         freed = qty
         existing["qty"] -= qty
         await ctx.send(f"↩️  **{ctx.author.display_name}** removed **{qty}x {stock[guild_id][key]['display']}** from their claim. ({existing['qty']} still claimed)")
-    await update_stock_embed(guild_id)
+    asyncio.create_task(update_all_live_boards(guild_id))
     await notify_waitlist(guild_id, key, freed)
 
 
