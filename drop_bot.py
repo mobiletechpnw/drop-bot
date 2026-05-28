@@ -3250,22 +3250,13 @@ async def slash_raffle_close(interaction: discord.Interaction, name: str):
         )
         return
 
-    # Delete the embed from the channel
-    channel = bot.get_channel(raffle["channel_id"])
-    if channel and raffle["message_id"]:
-        try:
-            msg = await channel.fetch_message(raffle["message_id"])
-            await msg.delete()
-        except (discord.NotFound, discord.HTTPException):
-            pass  # Already gone — that's fine
-
-    # Remove from DB and memory
+    # Remove from DB and memory — embed stays in channel for reference
     await _db_delete_raffle(guild_id, name)
     del server_raffles[guild_id][name]
 
     await interaction.followup.send(
-        f"✅  Raffle **{name}** has been closed and removed. "
-        f"The channel embed has been deleted.",
+        f"✅  Raffle **{name}** has been archived and removed from the active list. "
+        f"The embed remains in the channel for reference.",
         ephemeral=True
     )
 
