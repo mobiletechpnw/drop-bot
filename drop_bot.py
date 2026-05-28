@@ -30,6 +30,8 @@ Manager/Admin commands (server or DM after !drop):
   !autoclose on/off
   !claimlist
   !unpaid                          — List buyers who haven't been confirmed yet
+  !paymentboard                    — Post or refresh the live payment board
+  !payments                        — Full payment summary across all drops and raffles (DM)
   !confirm @user                   — Mark a buyer as fully paid
   !bump @user                      — DM a buyer a payment reminder
   !remind                          — Tag all unpaid buyers in the drop channel
@@ -821,6 +823,12 @@ async def on_ready():
     await init_db()
     await db_load_all()
     await bot.tree.sync()
+    # Re-register persistent raffle Views so buttons work after restart
+    for guild_id, raffles in server_raffles.items():
+        for name, raffle in raffles.items():
+            if raffle["status"] in ("open", "closed") and raffle.get("message_id"):
+                view = _build_raffle_view(guild_id, name, raffle)
+                bot.add_view(view)
     print(f"✅  Logged in as {bot.user} ({bot.user.id})")
 
 
@@ -842,14 +850,37 @@ async def on_reaction_add(reaction, user):
         return
 
     user_pmts = payments[guild_id][buyer_id]
-    pending = [p for p in user_pmts if not p["confirmed"]]
-    if not pending:
-        return
-
+    pending   = [p for p in user_pmts if not p["confirmed"]]
     for p in pending:
         p["confirmed"] = True
-
     total_confirmed = sum(p["amount"] for p in pending)
+
+    # Also confirm raffle spots stored in this ping message
+    raffle_spots = data.get("raffle_spots", [])
+    confirmed_raffle_spots = []
+    for r_name, spot_num in raffle_spots:
+        if r_name in server_raffles.get(guild_id, {}):
+            slot = server_raffles[guild_id][r_name]["slots"].get(spot_num)
+            if slot and slot["user_id"] == buyer_id and not slot["paid"]:
+                slot["paid"] = True
+                await _db_save_slot(guild_id, r_name, spot_num)
+                confirmed_raffle_spots.append((r_name, spot_num))
+
+    # Rebuild raffle embed for each affected raffle
+    for r_name in {r for r, _ in confirmed_raffle_spots}:
+        raffle  = server_raffles[guild_id][r_name]
+        channel = bot.get_channel(raffle["channel_id"])
+        if channel and raffle["message_id"]:
+            try:
+                msg  = await channel.fetch_message(raffle["message_id"])
+                view = _build_raffle_view(guild_id, r_name, raffle)
+                await msg.edit(embed=_raffle_embed(r_name, raffle), view=view)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
+    if not pending and not confirmed_raffle_spots:
+        return
+
     del pending_payment_messages[msg_id]
 
     asyncio.create_task(update_all_live_boards(guild_id))
@@ -857,8 +888,12 @@ async def on_reaction_add(reaction, user):
     guild = reaction.message.guild
     buyer = guild.get_member(buyer_id)
     if buyer:
+        confirm_msg = f"✅  Your payment of **${total_confirmed:.2f}** has been confirmed! Thanks so much — enjoy! 🎉"
+        if confirmed_raffle_spots:
+            spots_str = ", ".join(f"**{r}** Spot #{n}" for r, n in confirmed_raffle_spots)
+            confirm_msg += f"\n🎟️  Raffle spot(s) confirmed: {spots_str}"
         try:
-            await buyer.send(f"✅  Your payment of **${total_confirmed:.2f}** has been confirmed! Thanks so much — enjoy your order! 🎉")
+            await buyer.send(confirm_msg)
         except discord.Forbidden:
             pass
 
@@ -1186,15 +1221,19 @@ async def cmd_countdown(ctx, minutes: str = ""):
             await drop_channel.send("⚠️  Countdown ended but no stock was loaded — drop not released.")
             return
 
-        # Fire the release
+        # Fire the release — post all three live boards
         session_state[guild_id] = "live"
-        msg = await drop_channel.send(embed=build_stock_embed(guild_id))
-        stock_message[guild_id] = msg
+        stock_msg = await drop_channel.send(embed=build_stock_embed(guild_id))
+        stock_message[guild_id] = stock_msg
+        cl_msg = await drop_channel.send(embed=build_live_claimlist_embed(guild_id))
+        live_claimlist_message[guild_id] = cl_msg
+        pb_msg = await drop_channel.send(embed=build_payment_board_embed(guild_id))
+        payment_board_message[guild_id] = pb_msg
         await drop_channel.send("🟢  **Drop is LIVE!**  First come, first served!")
         await drop_channel.send(embed=build_howto_embed())
         try:
-            await msg.pin()
-            pinned_message[guild_id] = msg
+            await stock_msg.pin()
+            pinned_message[guild_id] = stock_msg
         except (discord.Forbidden, discord.HTTPException):
             pass
 
@@ -1405,10 +1444,20 @@ async def cmd_paid(ctx, *, args=""):
         for c in claim_list
     )
 
-    if not has_live_claim and not has_archived_claim:
+    # Check if user has an unpaid raffle spot
+    has_raffle_claim = any(
+        s["user_id"] == ctx.author.id and not s["paid"]
+        for raffle in server_raffles.get(guild_id, {}).values()
+        if raffle["status"] in ("open", "closed")
+        for s in raffle["slots"].values()
+    )
+    if not has_live_claim and not has_archived_claim and not has_raffle_claim:
         await ctx.author.send("⚠️  You don't have any claims to pay for.")
         await silent(ctx)
         return
+
+    # Default using_archive to False — set correctly in the drop routing below
+    using_archive = False
 
     # If buyer has claims in BOTH drops — ask which one they're paying for
     if has_live_claim and has_archived_claim:
@@ -1528,13 +1577,34 @@ async def cmd_paid(ctx, *, args=""):
 
     drop_ch = get_drop_channel(ctx.guild) or ctx.channel
     manager_mentions = " ".join(f"<@{uid}>" for uid in server_managers[guild_id])
+
+    # Build raffle context if user has unpaid raffle spots
+    raffle_spots = []
+    for r_name, raffle in server_raffles.get(guild_id, {}).items():
+        for spot_num, s in raffle["slots"].items():
+            if s["user_id"] == ctx.author.id and not s["paid"]:
+                raffle_spots.append((r_name, spot_num))
+
+    if raffle_spots:
+        spots_label = ", ".join(f"**{r}** Spot #{n}" for r, n in raffle_spots)
+        confirm_hint = (
+            f"React \u2705 to confirm payment & raffle spot(s): {spots_label}\n"
+            f"Or use `/raffle confirm` to confirm raffle spot only."
+        )
+    else:
+        confirm_hint = f"React \u2705 to confirm or use `!confirm @{ctx.author.display_name}`."
+
     ping_msg = await drop_ch.send(
-        f"💰  {manager_mentions} — **{ctx.author.display_name}** reported payment of **${amount:.2f}** via **{method.title()}**.\n"
-        f"React ✅ to confirm or use `!confirm @{ctx.author.display_name}`.",
+        f"\U0001f4b0  {manager_mentions} \u2014 **{ctx.author.display_name}** reported payment of "
+        f"**${amount:.2f}** via **{method.title()}**.\n{confirm_hint}",
         allowed_mentions=discord.AllowedMentions(users=True)
     )
-    await ping_msg.add_reaction("✅")
-    pending_payment_messages[ping_msg.id] = {"guild_id": guild_id, "buyer_id": ctx.author.id}
+    await ping_msg.add_reaction("\u2705")
+    pending_payment_messages[ping_msg.id] = {
+        "guild_id":     guild_id,
+        "buyer_id":     ctx.author.id,
+        "raffle_spots": raffle_spots,
+    }
 
 
 @bot.command(name="claim")
@@ -1634,8 +1704,9 @@ async def cmd_claim(ctx, *, args=""):
     await ctx.send(f"✅  **{ctx.author.display_name}** claimed **{qty}x {info['display']}** — ${total_cost:.2f}  •  {new_remaining} left")
     asyncio.create_task(update_all_live_boards(guild_id))
     if autoclose[guild_id] and all_sold_out(guild_id):
-        await ctx.send("🎉  **Everything is claimed!** Closing the drop...")
-        await close_drop(ctx.channel, guild_id)
+        drop_ch = get_drop_channel(ctx.guild) or ctx.channel
+        await drop_ch.send("🎉  **Everything is claimed!** Closing the drop...")
+        await close_drop(drop_ch, guild_id)
 
 
 @bot.command(name="unclaim")
@@ -2153,6 +2224,19 @@ async def cmd_help(ctx):
             "`!paid <method> <amount>` — Report your payment\n"
             "e.g. `!paid venmo $125`\n"
             "Methods: venmo, zelle, cashapp, applepay"
+        ),
+        inline=False
+    )
+    embed.add_field(
+        name="History",
+        value="`!myhistory` — View your personal claim history across past drops",
+        inline=False
+    )
+    embed.add_field(
+        name="Raffles",
+        value=(
+            "`/raffles` — See all active raffles\n"
+            "Tap a button on the raffle post to claim a spot — no command needed!"
         ),
         inline=False
     )
@@ -2817,8 +2901,457 @@ async def slash_raffles(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
+
+@raffle_group.command(name="release", description="Release your claimed raffle spot back to open")
+@discord.app_commands.autocomplete(name=_raffle_name_autocomplete)
+@discord.app_commands.describe(name="Raffle name")
+async def slash_raffle_release(interaction: discord.Interaction, name: str):
+    await interaction.response.defer(ephemeral=True)
+    guild_id = interaction.guild_id
+
+    if name not in server_raffles.get(guild_id, {}):
+        await interaction.followup.send(f"No raffle named **{name}**.", ephemeral=True)
+        return
+
+    raffle = server_raffles[guild_id][name]
+
+    if raffle["status"] not in ("open", "closed"):
+        await interaction.followup.send(
+            "This raffle is no longer accepting changes.", ephemeral=True
+        )
+        return
+
+    # Find spots held by this user
+    user_spots = [
+        num for num, s in raffle["slots"].items()
+        if s["user_id"] == interaction.user.id
+    ]
+
+    if not user_spots:
+        await interaction.followup.send(
+            f"You don't have a spot in **{name}**.", ephemeral=True
+        )
+        return
+
+    # Block release if payment already confirmed
+    paid_spots = [num for num in user_spots if raffle["slots"][num]["paid"]]
+    if paid_spots:
+        spots_str = ", ".join(f"#{n}" for n in paid_spots)
+        await interaction.followup.send(
+            f"Spot{'s' if len(paid_spots) > 1 else ''} {spots_str} "
+            f"{'have' if len(paid_spots) > 1 else 'has'} already been paid and confirmed — "
+            f"contact the server owner to make changes.",
+            ephemeral=True
+        )
+        return
+
+    # Release all unpaid spots for this user
+    released = []
+    for num in user_spots:
+        if not raffle["slots"][num]["paid"]:
+            raffle["slots"][num] = {"user_id": None, "username": None, "paid": False}
+            await _db_save_slot(guild_id, name, num)
+            released.append(num)
+
+    # If raffle was closed (all spots taken), reopen it
+    if raffle["status"] == "closed":
+        raffle["status"] = "open"
+        await _db_save_raffle(guild_id, name)
+
+    # Update the raffle embed
+    channel = bot.get_channel(raffle["channel_id"])
+    if channel and raffle["message_id"]:
+        try:
+            msg  = await channel.fetch_message(raffle["message_id"])
+            view = _build_raffle_view(guild_id, name, raffle)
+            await msg.edit(embed=_raffle_embed(name, raffle), view=view)
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
+    spots_str = ", ".join(f"#{n}" for n in sorted(released))
+    await interaction.followup.send(
+        f"Spot{'s' if len(released) > 1 else ''} {spots_str} in **{name}** "
+        f"{'have' if len(released) > 1 else 'has'} been released back to open. "
+        f"Tap a button to reclaim a different spot!",
+        ephemeral=True
+    )
+
+    # Notify owner
+    guild = interaction.guild
+    if guild:
+        owner = guild.get_member(guild.owner_id)
+        if owner:
+            try:
+                await owner.send(
+                    f"ℹ️  **{interaction.user.display_name}** released "
+                    f"Spot{'s' if len(released) > 1 else ''} {spots_str} "
+                    f"in raffle **{name}** on **{guild.name}**."
+                )
+            except discord.Forbidden:
+                pass
+
+
+@raffle_group.command(name="swap", description="Swap or clear a raffle spot (owner only)")
+@discord.app_commands.autocomplete(name=_raffle_name_autocomplete)
+@discord.app_commands.describe(
+    name="Raffle name",
+    spot="The spot number to reassign",
+    user="New user to assign this spot to (leave empty to clear the spot)",
+)
+async def slash_raffle_swap(
+    interaction: discord.Interaction,
+    name: str,
+    spot: int,
+    user: discord.Member = None,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if interaction.guild.owner_id != interaction.user.id:
+        await interaction.followup.send(
+            "Only the server owner can swap raffle spots.", ephemeral=True
+        )
+        return
+
+    guild_id = interaction.guild_id
+
+    if name not in server_raffles.get(guild_id, {}):
+        await interaction.followup.send(f"No raffle named **{name}**.", ephemeral=True)
+        return
+
+    raffle = server_raffles[guild_id][name]
+
+    if spot not in raffle["slots"]:
+        await interaction.followup.send(
+            f"Spot #{spot} doesn't exist. Valid spots: 1-{raffle['spots']}.",
+            ephemeral=True
+        )
+        return
+
+    current_slot = raffle["slots"][spot]
+    current_holder = current_slot.get("username") or "empty"
+    was_paid = current_slot.get("paid", False)
+
+    if was_paid and user is None:
+        # Clearing a paid spot — warn owner
+        await interaction.followup.send(
+            f"⚠️  Spot #{spot} is already confirmed as paid by **{current_holder}**. "
+            f"Are you sure? Run the command again to confirm, or use `/raffle confirm` to fix payment.",
+            ephemeral=True
+        )
+        return
+
+    if user is None:
+        # Clear the spot
+        old_user_id = current_slot.get("user_id")
+        raffle["slots"][spot] = {"user_id": None, "username": None, "paid": False}
+        await _db_save_slot(guild_id, name, spot)
+
+        # Reopen raffle if it was closed
+        if raffle["status"] == "closed":
+            raffle["status"] = "open"
+            await _db_save_raffle(guild_id, name)
+
+        # Notify previous holder if they exist
+        if old_user_id:
+            prev_member = interaction.guild.get_member(old_user_id)
+            if prev_member:
+                try:
+                    await prev_member.send(
+                        f"ℹ️  Your Spot #{spot} in the **{name}** raffle on **{interaction.guild.name}** "
+                        f"has been cleared by the server owner. "
+                        f"Please contact them if you have questions."
+                    )
+                except discord.Forbidden:
+                    pass
+
+        result_msg = f"✅  Spot #{spot} cleared (was held by **{current_holder}**). It's now open."
+
+    else:
+        # Assign spot to new user
+        # Check if new user already has a spot in this raffle
+        existing_spots = [
+            num for num, s in raffle["slots"].items()
+            if s["user_id"] == user.id
+        ]
+        if existing_spots:
+            existing_str = ", ".join(f"#{n}" for n in existing_spots)
+            await interaction.followup.send(
+                f"⚠️  **{user.display_name}** already holds Spot{'s' if len(existing_spots) > 1 else ''} "
+                f"{existing_str} in **{name}**. Swap anyway by reassigning.",
+                ephemeral=True
+            )
+            return
+
+        old_user_id = current_slot.get("user_id")
+        old_was_paid = current_slot.get("paid", False)
+        raffle["slots"][spot] = {
+            "user_id":  user.id,
+            "username": str(user),
+            "paid":     False,  # reset paid status on swap
+        }
+        await _db_save_slot(guild_id, name, spot)
+
+        # DM new holder with payment info
+        payment_info = _build_raffle_payment_dm(guild_id)
+        try:
+            await user.send(
+                f"You have been assigned Spot #{spot} in the {name} raffle"
+                f" on {interaction.guild.name}.\n\n"
+                f"Price: {raffle['price']}\n\n"
+                f"Send payment using:\n{payment_info}\n\n"
+                "Once sent, run `!paid <method> <amount>` in the server."
+            )
+        except discord.Forbidden:
+            pass
+
+        # Notify previous holder they were moved
+        if old_user_id and old_user_id != user.id:
+            prev_member = interaction.guild.get_member(old_user_id)
+            if prev_member:
+                try:
+                    await prev_member.send(
+                        f"ℹ️  Your Spot #{spot} in the **{name}** raffle on **{interaction.guild.name}** "
+                        f"has been reassigned by the server owner. "
+                        f"Please contact them if you have questions."
+                    )
+                except discord.Forbidden:
+                    pass
+
+        result_msg = (
+            f"✅  Spot #{spot} reassigned from **{current_holder}** to **{user.display_name}**."
+            + (" *(was paid — payment status reset)*" if old_was_paid else "")
+        )
+
+    # Update raffle embed
+    channel = bot.get_channel(raffle["channel_id"])
+    if channel and raffle["message_id"]:
+        try:
+            msg  = await channel.fetch_message(raffle["message_id"])
+            view = _build_raffle_view(guild_id, name, raffle)
+            await msg.edit(embed=_raffle_embed(name, raffle), view=view)
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
+    await interaction.followup.send(result_msg, ephemeral=True)
+
+
+
+@raffle_group.command(name="close", description="Clean up a completed raffle — removes it from the list and deletes the embed")
+@discord.app_commands.autocomplete(name=_raffle_name_autocomplete)
+@discord.app_commands.describe(name="Raffle name")
+async def slash_raffle_close(interaction: discord.Interaction, name: str):
+    await interaction.response.defer(ephemeral=True)
+
+    if interaction.guild.owner_id != interaction.user.id:
+        await interaction.followup.send(
+            "Only the server owner can close raffles.", ephemeral=True
+        )
+        return
+
+    guild_id = interaction.guild_id
+
+    if name not in server_raffles.get(guild_id, {}):
+        await interaction.followup.send(f"No raffle named **{name}**.", ephemeral=True)
+        return
+
+    raffle = server_raffles[guild_id][name]
+
+    # Warn if trying to close an incomplete raffle
+    if raffle["status"] not in ("complete",):
+        claimed = sum(1 for s in raffle["slots"].values() if s["user_id"] is not None)
+        paid    = sum(1 for s in raffle["slots"].values() if s["paid"])
+        await interaction.followup.send(
+            f"⚠️  **{name}** is not marked complete yet "
+            f"(status: {raffle['status']}, {claimed}/{raffle['spots']} claimed, {paid} paid).\n"
+            f"Use `/raffle winner` to record the winner first, or `/raffle cancel` to remove it entirely.",
+            ephemeral=True
+        )
+        return
+
+    # Delete the embed from the channel
+    channel = bot.get_channel(raffle["channel_id"])
+    if channel and raffle["message_id"]:
+        try:
+            msg = await channel.fetch_message(raffle["message_id"])
+            await msg.delete()
+        except (discord.NotFound, discord.HTTPException):
+            pass  # Already gone — that's fine
+
+    # Remove from DB and memory
+    await _db_delete_raffle(guild_id, name)
+    del server_raffles[guild_id][name]
+
+    await interaction.followup.send(
+        f"✅  Raffle **{name}** has been closed and removed. "
+        f"The channel embed has been deleted.",
+        ephemeral=True
+    )
+
+
 # Register slash command group
 bot.tree.add_command(raffle_group)
 
+
+
+@bot.command(name="paymentboard")
+async def cmd_paymentboard(ctx):
+    """Post or refresh the payment board in the drop channel."""
+    if not ctx.guild:
+        await ctx.author.send("⚠️  Please run `!paymentboard` in your server channel.")
+        return
+    guild_id = ctx.guild.id
+    if not is_manager(guild_id, ctx.author.id):
+        return
+    await silent(ctx)
+    drop_channel = get_drop_channel(ctx.guild) or ctx.channel
+    embed = build_payment_board_embed(guild_id)
+    # If a live board already exists update it, otherwise post a new one
+    pb_msg = payment_board_message.get(guild_id)
+    if pb_msg:
+        try:
+            await pb_msg.edit(embed=embed)
+            await dm(ctx, "✅  Payment board updated.")
+            return
+        except (discord.NotFound, discord.HTTPException):
+            payment_board_message.pop(guild_id, None)
+    # Post a fresh one
+    msg = await drop_channel.send(embed=embed)
+    payment_board_message[guild_id] = msg
+    await dm(ctx, "✅  Payment board posted.")
+
+
+@bot.command(name="payments")
+async def cmd_payments(ctx):
+    """DM the manager a full payment summary across all active drops and raffles."""
+    if not ctx.guild:
+        await ctx.author.send("⚠️  Please run `!payments` in your server channel.")
+        return
+    guild_id = ctx.guild.id
+    if not is_manager(guild_id, ctx.author.id):
+        return
+    await silent(ctx)
+
+    stock_ref    = stock[guild_id]   if stock[guild_id]   else last_drop_snapshot.get(guild_id, {}).get("stock",  {})
+    claims_ref   = claims[guild_id]  if claims[guild_id]  else last_drop_snapshot.get(guild_id, {}).get("claims", {})
+    archived     = archived_payments.get(guild_id, {})
+    arch_claims  = archived.get("claims", {})
+    arch_stock   = archived.get("stock",  {})
+    arch_pmts    = archived.get("payments", {})
+
+    # ── Build per-user totals across live + archived drops ────────────────────
+    def build_user_totals(claims_data, stock_data, payments_data, label):
+        rows = []
+        seen = set()
+        for key, claim_list in claims_data.items():
+            for c in claim_list:
+                uid = c["user"].id
+                if uid in seen or key not in stock_data:
+                    continue
+                seen.add(uid)
+                owed = sum(
+                    cc["qty"] * stock_data[k]["price"]
+                    for k, cl in claims_data.items()
+                    for cc in cl
+                    if cc["user"].id == uid and k in stock_data
+                )
+                confirmed = sum(
+                    p["amount"] for p in payments_data.get(uid, [])
+                    if p["confirmed"]
+                )
+                pending = sum(
+                    p["amount"] for p in payments_data.get(uid, [])
+                    if not p["confirmed"]
+                )
+                outstanding = owed - confirmed
+                rows.append({
+                    "name":        c["user"].display_name,
+                    "owed":        owed,
+                    "confirmed":   confirmed,
+                    "pending":     pending,
+                    "outstanding": outstanding,
+                    "label":       label,
+                })
+        return rows
+
+    live_rows     = build_user_totals(claims_ref,  stock_ref,  payments[guild_id], "Current Drop")
+    archived_rows = build_user_totals(arch_claims, arch_stock, arch_pmts,          "Previous Drop")
+
+    # ── Raffle rows ───────────────────────────────────────────────────────────
+    raffle_rows = []
+    for r_name, raffle in server_raffles.get(guild_id, {}).items():
+        if raffle["status"] == "complete":
+            continue
+        for spot_num, s in raffle["slots"].items():
+            if s["user_id"] is None:
+                continue
+            raffle_rows.append({
+                "name":    s["username"],
+                "raffle":  r_name,
+                "spot":    spot_num,
+                "price":   raffle["price"],
+                "paid":    s["paid"],
+            })
+
+    # ── Build embed ───────────────────────────────────────────────────────────
+    embed = discord.Embed(
+        title="💳  Payment Summary — All Drops",
+        color=discord.Color.gold(),
+        timestamp=datetime.datetime.utcnow()
+    )
+
+    total_confirmed_all   = 0.0
+    total_outstanding_all = 0.0
+
+    def format_rows(rows, title):
+        nonlocal total_confirmed_all, total_outstanding_all
+        if not rows:
+            return
+        lines = []
+        for r in rows:
+            if r["outstanding"] <= 0.01 and r["confirmed"] > 0:
+                status = "✅"
+            elif r["pending"] > 0:
+                status = f"⏳ ${r['pending']:.2f} pending"
+            else:
+                status = f"owes ${r['outstanding']:.2f}"
+            lines.append(
+                f"**{r['name']}** — owed ${r['owed']:.2f} | "
+                f"confirmed ${r['confirmed']:.2f} | {status}"
+            )
+            total_confirmed_all   += r["confirmed"]
+            total_outstanding_all += max(r["outstanding"], 0)
+        field_value = "\n".join(lines)
+        if len(field_value) > 1024:
+            field_value = field_value[:1020] + "..."
+        embed.add_field(name=title, value=field_value, inline=False)
+
+    format_rows(live_rows,     "🟢  Current Drop")
+    format_rows(archived_rows, "🕐  Previous Drop")
+
+    if raffle_rows:
+        r_lines = []
+        for r in raffle_rows:
+            status = "✅  Paid" if r["paid"] else "⏳  Awaiting payment"
+            r_lines.append(
+                f"**{r['name']}** — {r['raffle']} Spot #{r['spot']} "
+                f"({r['price']}) — {status}"
+            )
+        r_value = "\n".join(r_lines)
+        if len(r_value) > 1024:
+            r_value = r_value[:1020] + "..."
+        embed.add_field(name="🎟️  Active Raffles", value=r_value, inline=False)
+
+    if not live_rows and not archived_rows and not raffle_rows:
+        embed.description = "No active drops or raffles with claims right now."
+    else:
+        embed.set_footer(
+            text=f"Total confirmed: ${total_confirmed_all:.2f}  |  "
+                 f"Total outstanding: ${total_outstanding_all:.2f}"
+        )
+
+    try:
+        await ctx.author.send(embed=embed)
+    except discord.Forbidden:
+        await ctx.send("⚠️  I couldn't DM you — please open your DMs and try again.")
 
 bot.run(BOT_TOKEN)
