@@ -152,6 +152,22 @@ async def init_db():
             )
         """)
         await conn.execute("""
+            CREATE TABLE IF NOT EXISTS raffle_hosts (
+                guild_id  BIGINT NOT NULL,
+                host_num  INTEGER NOT NULL,
+                name      TEXT,
+                venmo     TEXT,
+                zelle     TEXT,
+                cashapp   TEXT,
+                applepay  TEXT,
+                PRIMARY KEY (guild_id, host_num)
+            )
+        """)
+        await conn.execute("""
+            ALTER TABLE raffles
+            ADD COLUMN IF NOT EXISTS host_num INTEGER DEFAULT 0
+        """)
+        await conn.execute("""
             ALTER TABLE server_settings
             ADD COLUMN IF NOT EXISTS raffle_channel_id BIGINT
         """)
@@ -194,6 +210,7 @@ async def db_load_all():
                 "channel_id": row["channel_id"],
                 "message_id": row["message_id"],
                 "status":     row["status"],
+                "host_num":   row["host_num"] if row["host_num"] else 0,
                 "slots":      {},
             }
             server_raffle_channel[gid] = row["channel_id"]
@@ -208,6 +225,17 @@ async def db_load_all():
                     "username": row["username"],
                     "paid":     row["paid"],
                 }
+
+        # Load raffle hosts
+        host_rows = await conn.fetch("SELECT * FROM raffle_hosts")
+        for row in host_rows:
+            raffle_hosts[row["guild_id"]][row["host_num"]] = {
+                "name":     row["name"],
+                "venmo":    row["venmo"],
+                "zelle":    row["zelle"],
+                "cashapp":  row["cashapp"],
+                "applepay": row["applepay"],
+            }
 
     print(f"✅  Loaded {len(server_admins)} server(s) from database.")
 
@@ -281,6 +309,27 @@ async def db_update_user_claim_confirmed(guild_id, user_id):
         """, guild_id, user_id)
 
 
+async def db_save_raffle_host(guild_id: int, host_num: int):
+    h = raffle_hosts[guild_id].get(host_num, {})
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO raffle_hosts (guild_id, host_num, name, venmo, zelle, cashapp, applepay)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (guild_id, host_num) DO UPDATE SET
+                name     = $3,
+                venmo    = $4,
+                zelle    = $5,
+                cashapp  = $6,
+                applepay = $7
+        """, guild_id, host_num,
+            h.get("name"),
+            h.get("venmo"),
+            h.get("zelle"),
+            h.get("cashapp"),
+            h.get("applepay"),
+        )
+
+
 async def db_save_settings(guild_id):
     s = server_settings.get(guild_id, {})
     async with db_pool.acquire() as conn:
@@ -329,6 +378,7 @@ last_drop_snapshot = {}
 # Raffle state
 server_raffles        = defaultdict(dict)   # guild_id -> {name -> raffle_dict}
 server_raffle_channel = {}                  # guild_id -> channel_id
+raffle_hosts          = defaultdict(dict)   # guild_id -> {1: {...}, 2: {...}}
 
 # Archived payments from previous drop — preserved when new drop starts
 # so buyers can still !paid and managers can still !confirm after a new drop begins
@@ -2330,16 +2380,18 @@ async def _db_save_raffle(guild_id: int, name: str):
     r = server_raffles[guild_id][name]
     async with db_pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO raffles (guild_id, name, spots, price, channel_id, message_id, status)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            INSERT INTO raffles (guild_id, name, spots, price, channel_id, message_id, status, host_num)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT (guild_id, name) DO UPDATE SET
                 spots      = EXCLUDED.spots,
                 price      = EXCLUDED.price,
                 channel_id = EXCLUDED.channel_id,
                 message_id = EXCLUDED.message_id,
-                status     = EXCLUDED.status
+                status     = EXCLUDED.status,
+                host_num   = EXCLUDED.host_num
         """, guild_id, name,
-            r["spots"], r["price"], r["channel_id"], r["message_id"], r["status"])
+            r["spots"], r["price"], r["channel_id"], r["message_id"], r["status"],
+            r.get("host_num", 0))
 
 
 async def _db_save_slot(guild_id: int, name: str, spot_num: int):
@@ -2415,7 +2467,20 @@ def _raffle_embed(name: str, raffle: dict) -> discord.Embed:
     return embed
 
 
-def _build_raffle_payment_dm(guild_id: int) -> str:
+def _build_raffle_payment_dm(guild_id: int, host_num: int = 0) -> str:
+    """Build payment info string. Uses host-specific info if host_num is 1 or 2."""
+    if host_num in (1, 2):
+        h = raffle_hosts.get(guild_id, {}).get(host_num, {})
+        if h:
+            lines = []
+            if h.get("venmo"):    lines.append(f"Venmo: {h['venmo']}")
+            if h.get("zelle"):    lines.append(f"Zelle: {h['zelle']}")
+            if h.get("cashapp"):  lines.append(f"Cash App: {h['cashapp']}")
+            if h.get("applepay"): lines.append(f"Apple Pay: {h['applepay']}")
+            host_label = h.get("name") or f"Host {host_num}"
+            prefix = f"Send payment to **{host_label}**:"
+            return prefix + "\n" + ("\n".join(lines) if lines else "(no payment methods set for this host)")
+    # Fall back to server default
     s = server_settings.get(guild_id, {})
     lines = []
     if s.get("venmo"):    lines.append(f"Venmo: {s['venmo']}")
@@ -2525,7 +2590,7 @@ async def on_interaction(interaction: discord.Interaction):
         ephemeral=True,
     )
 
-    payment_info = _build_raffle_payment_dm(guild_id)
+    payment_info = _build_raffle_payment_dm(guild_id, raffle.get("host_num", 0))
     try:
         await interaction.user.send(
             f"You claimed Spot #{spot_num} in the **{name}** raffle!\n\n"
@@ -2569,8 +2634,9 @@ async def slash_raffle_setchannel(interaction: discord.Interaction, channel: dis
     name="Raffle name (e.g. ScarletVault)",
     spots="Number of spots (2-10)",
     price="Price per spot (e.g. $25)",
+    host="Which host is collecting payment (1 or 2) — leave blank to use server default",
 )
-async def slash_raffle_create(interaction: discord.Interaction, name: str, spots: int, price: str):
+async def slash_raffle_create(interaction: discord.Interaction, name: str, spots: int, price: str, host: int = 0):
     await interaction.response.defer(ephemeral=True)
     if interaction.guild.owner_id != interaction.user.id:
         await interaction.followup.send("Only the server owner can create raffles.", ephemeral=True)
@@ -2593,12 +2659,24 @@ async def slash_raffle_create(interaction: discord.Interaction, name: str, spots
         )
         return
 
+    if host not in (0, 1, 2):
+        await interaction.followup.send("Host must be 1 or 2 (or leave blank for server default).", ephemeral=True)
+        return
+
+    if host in (1, 2) and host not in raffle_hosts.get(guild_id, {}):
+        await interaction.followup.send(
+            f"⚠️  Host {host} has no payment info set. Run `/raffle sethost host:{host}` first.",
+            ephemeral=True
+        )
+        return
+
     raffle = {
         "spots":      spots,
         "price":      price,
         "channel_id": server_raffle_channel[guild_id],
         "message_id": None,
         "status":     "open",
+        "host_num":   host,
         "slots":      {n: {"user_id": None, "username": None, "paid": False}
                        for n in range(1, spots + 1)},
     }
@@ -2613,7 +2691,7 @@ async def slash_raffle_create(interaction: discord.Interaction, name: str, spots
         del server_raffles[guild_id][name]
         return
 
-    payment_hint = _build_raffle_payment_dm(guild_id)
+    payment_hint = _build_raffle_payment_dm(guild_id, raffle.get("host_num", 0))
     embed        = _raffle_embed(name, raffle)
     embed.description = (
         f"Tap a button below to claim your spot!\n"
@@ -2628,8 +2706,12 @@ async def slash_raffle_create(interaction: discord.Interaction, name: str, spots
     for spot_num in raffle["slots"]:
         await _db_save_slot(guild_id, name, spot_num)
 
+    host_label = ""
+    if host in (1, 2):
+        h = raffle_hosts.get(guild_id, {}).get(host, {})
+        host_label = f" — payments to **{h.get('name', f'Host {host}')}**"
     await interaction.followup.send(
-        f"Raffle **{name}** is live -- **{spots} spots** at **{price}** each!",
+        f"Raffle **{name}** is live -- **{spots} spots** at **{price}** each{host_label}!",
         ephemeral=True,
     )
 
@@ -3092,7 +3174,7 @@ async def slash_raffle_swap(
         await _db_save_slot(guild_id, name, spot)
 
         # DM new holder with payment info
-        payment_info = _build_raffle_payment_dm(guild_id)
+        payment_info = _build_raffle_payment_dm(guild_id, raffle.get("host_num", 0))
         try:
             await user.send(
                 f"You have been assigned Spot #{spot} in the {name} raffle"
@@ -3187,6 +3269,62 @@ async def slash_raffle_close(interaction: discord.Interaction, name: str):
         ephemeral=True
     )
 
+
+
+@raffle_group.command(name="sethost", description="Set payment info for a raffle host (owner only)")
+@discord.app_commands.describe(
+    host="Which host to configure (1 or 2)",
+    name="Display name for this host (shown in payment DMs)",
+    venmo="Venmo handle",
+    zelle="Zelle phone or email",
+    cashapp="Cash App handle",
+    applepay="Apple Pay phone number",
+)
+async def slash_raffle_sethost(
+    interaction: discord.Interaction,
+    host: int,
+    name: str,
+    venmo: str = "",
+    zelle: str = "",
+    cashapp: str = "",
+    applepay: str = "",
+):
+    await interaction.response.defer(ephemeral=True)
+
+    if interaction.guild.owner_id != interaction.user.id:
+        await interaction.followup.send(
+            "Only the server owner can configure raffle hosts.", ephemeral=True
+        )
+        return
+
+    if host not in (1, 2):
+        await interaction.followup.send(
+            "Host must be 1 or 2.", ephemeral=True
+        )
+        return
+
+    guild_id = interaction.guild_id
+    raffle_hosts[guild_id][host] = {
+        "name":     name,
+        "venmo":    venmo    or None,
+        "zelle":    zelle    or None,
+        "cashapp":  cashapp  or None,
+        "applepay": applepay or None,
+    }
+    await db_save_raffle_host(guild_id, host)
+
+    lines = [f"**Host {host} — {name}**"]
+    if venmo:    lines.append(f"Venmo: {venmo}")
+    if zelle:    lines.append(f"Zelle: {zelle}")
+    if cashapp:  lines.append(f"Cash App: {cashapp}")
+    if applepay: lines.append(f"Apple Pay: {applepay}")
+    if not any([venmo, zelle, cashapp, applepay]):
+        lines.append("⚠️  No payment methods set — add at least one.")
+
+    await interaction.followup.send(
+        "✅  Host saved:\n" + "\n".join(lines),
+        ephemeral=True
+    )
 
 # Register slash command group
 bot.tree.add_command(raffle_group)
