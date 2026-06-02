@@ -1639,7 +1639,7 @@ async def cmd_paid(ctx, *, args=""):
         spots_label = ", ".join(f"**{r}** Spot #{n}" for r, n in raffle_spots)
         confirm_hint = (
             f"React \u2705 to confirm payment & raffle spot(s): {spots_label}\n"
-            f"Or use `/raffle confirm` to confirm raffle spot only."
+            f"Or use `/raffle confirm {name}` to confirm raffle only."
         )
     else:
         confirm_hint = f"React \u2705 to confirm or use `!confirm @{ctx.author.display_name}`."
@@ -2721,10 +2721,15 @@ async def slash_raffle_create(interaction: discord.Interaction, name: str, spots
 @discord.app_commands.describe(name="Raffle name", user="The user to confirm")
 async def slash_raffle_confirm(interaction: discord.Interaction, name: str, user: discord.Member):
     await interaction.response.defer(ephemeral=True)
-    if interaction.guild.owner_id != interaction.user.id:
-        await interaction.followup.send("Only the server owner can confirm payments.", ephemeral=True)
-        return
     guild_id = interaction.guild_id
+    # Allow server owner OR any drop manager to confirm raffle payments
+    if (interaction.guild.owner_id != interaction.user.id
+            and not is_manager(guild_id, interaction.user.id)):
+        await interaction.followup.send(
+            "Only the server owner or a drop manager can confirm raffle payments.",
+            ephemeral=True
+        )
+        return
     if name not in server_raffles[guild_id]:
         await interaction.followup.send(f"No raffle named **{name}**.", ephemeral=True)
         return
