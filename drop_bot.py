@@ -171,6 +171,10 @@ async def init_db():
             ALTER TABLE server_settings
             ADD COLUMN IF NOT EXISTS raffle_channel_id BIGINT
         """)
+        await conn.execute("""
+            ALTER TABLE raffle_slots
+            ADD COLUMN IF NOT EXISTS locked BOOLEAN NOT NULL DEFAULT FALSE
+        """)
     print("✅  Database ready.")
 
 
@@ -224,6 +228,7 @@ async def db_load_all():
                     "user_id":  row["user_id"],
                     "username": row["username"],
                     "paid":     row["paid"],
+                    "locked":   bool(row["locked"]) if row["locked"] is not None else False,
                 }
 
         # Load raffle hosts
@@ -2419,13 +2424,14 @@ async def _db_save_slot(guild_id: int, name: str, spot_num: int):
     s = server_raffles[guild_id][name]["slots"][spot_num]
     async with db_pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO raffle_slots (guild_id, raffle_name, spot_num, user_id, username, paid)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO raffle_slots (guild_id, raffle_name, spot_num, user_id, username, paid, locked)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (guild_id, raffle_name, spot_num) DO UPDATE SET
                 user_id  = EXCLUDED.user_id,
                 username = EXCLUDED.username,
-                paid     = EXCLUDED.paid
-        """, guild_id, name, spot_num, s["user_id"], s["username"], s["paid"])
+                paid     = EXCLUDED.paid,
+                locked   = EXCLUDED.locked
+        """, guild_id, name, spot_num, s["user_id"], s["username"], s["paid"], s.get("locked", False))
 
 
 async def _db_delete_raffle(guild_id: int, name: str):
@@ -2448,10 +2454,11 @@ async def _db_save_raffle_channel(guild_id: int, channel_id: int):
 # ── RAFFLE EMBED BUILDER ──────────────────────────────────────────────────────
 
 def _raffle_embed(name: str, raffle: dict) -> discord.Embed:
-    slots     = raffle["slots"]
-    total     = raffle["spots"]
-    claimed   = sum(1 for s in slots.values() if s["user_id"] is not None)
-    remaining = total - claimed
+    slots        = raffle["slots"]
+    total        = raffle["spots"]
+    claimed      = sum(1 for s in slots.values() if s["user_id"] is not None)
+    locked_empty = sum(1 for s in slots.values() if s.get("locked") and s["user_id"] is None)
+    remaining    = total - claimed - locked_empty
 
     if raffle["status"] == "complete":
         color = discord.Color.gold()
@@ -2469,7 +2476,10 @@ def _raffle_embed(name: str, raffle: dict) -> discord.Embed:
     for num in sorted(slots.keys()):
         s = slots[num]
         if s["user_id"] is None:
-            lines.append(f"`{num:>2}` Open")
+            if s.get("locked"):
+                lines.append(f"`{num:>2}` \ud83d\udd12 Mini Round")
+            else:
+                lines.append(f"`{num:>2}` Open")
         elif s["paid"]:
             lines.append(f"`{num:>2}` Paid: {s['username']}")
         else:
@@ -2479,8 +2489,9 @@ def _raffle_embed(name: str, raffle: dict) -> discord.Embed:
     embed.add_field(name="Spots",  value="\n".join(lines[:mid]) or "--", inline=True)
     embed.add_field(name="\u200b", value="\n".join(lines[mid:]) or "--", inline=True)
 
+    mini_note = f" \u00b7 {locked_empty} spot(s) reserved for mini round" if locked_empty else ""
     status_map = {
-        "open":     "Open -- tap a button to claim a spot!",
+        "open":     f"Open -- tap a button to claim a spot!{mini_note}",
         "closed":   "All spots claimed -- awaiting payment confirmations",
         "complete": "Raffle complete",
     }
@@ -2514,13 +2525,22 @@ def _build_raffle_payment_dm(guild_id: int, host_num: int = 0) -> str:
 def _build_raffle_view(guild_id: int, name: str, raffle: dict) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     for num in sorted(raffle["slots"].keys()):
-        s     = raffle["slots"][num]
-        taken = s["user_id"] is not None
-        label = f"Spot {num}" if not taken else f"#{num} -- {s['username'][:12]}"
-        btn   = discord.ui.Button(
+        s      = raffle["slots"][num]
+        taken  = s["user_id"] is not None
+        locked = s.get("locked", False) and not taken
+        if locked:
+            label = f"🔒 #{num}"
+            style = discord.ButtonStyle.secondary
+        elif taken:
+            label = f"#{num} -- {s['username'][:12]}"
+            style = discord.ButtonStyle.danger
+        else:
+            label = f"Spot {num}"
+            style = discord.ButtonStyle.success
+        btn = discord.ui.Button(
             label     = label,
-            style     = discord.ButtonStyle.danger if taken else discord.ButtonStyle.success,
-            disabled  = taken or raffle["status"] != "open",
+            style     = style,
+            disabled  = taken or locked or raffle["status"] != "open",
             custom_id = f"raffle:{guild_id}:{name}:{num}",
             row       = (num - 1) // 5,
         )
@@ -2582,11 +2602,19 @@ async def on_interaction(interaction: discord.Interaction):
         )
         return
 
+    if slot.get("locked"):
+        await interaction.followup.send(
+            f"Spot #{spot_num} is reserved for a mini round and can't be claimed here.",
+            ephemeral=True,
+        )
+        return
+
     username = str(interaction.user)
-    raffle["slots"][spot_num] = {"user_id": interaction.user.id, "username": username, "paid": False}
+    raffle["slots"][spot_num] = {"user_id": interaction.user.id, "username": username, "paid": False, "locked": False}
     await _db_save_slot(guild_id, name, spot_num)
 
-    all_claimed = all(s["user_id"] is not None for s in raffle["slots"].values())
+    open_slots = [s for s in raffle["slots"].values() if not s.get("locked")]
+    all_claimed = bool(open_slots) and all(s["user_id"] is not None for s in open_slots)
     if all_claimed:
         raffle["status"] = "closed"
         await _db_save_raffle(guild_id, name)
@@ -2601,9 +2629,11 @@ async def on_interaction(interaction: discord.Interaction):
             pass
 
     if all_claimed and channel:
+        locked_nums = sorted(n for n, s in raffle["slots"].items() if s.get("locked") and s["user_id"] is None)
+        mini_note = f" Spots {', '.join(f'#{n}' for n in locked_nums)} are reserved for mini rounds." if locked_nums else ""
         await channel.send(
-            f"All spots in **{name}** are claimed! "
-            f"Waiting on payment confirmations before the spin."
+            f"All open spots in **{name}** are claimed!"
+            f" Waiting on payment confirmations before the spin.{mini_note}"
         )
 
     await interaction.followup.send(
@@ -2698,7 +2728,7 @@ async def slash_raffle_create(interaction: discord.Interaction, name: str, spots
         "message_id": None,
         "status":     "open",
         "host_num":   host,
-        "slots":      {n: {"user_id": None, "username": None, "paid": False}
+        "slots":      {n: {"user_id": None, "username": None, "paid": False, "locked": False}
                        for n in range(1, spots + 1)},
     }
     server_raffles[guild_id][name] = raffle
@@ -3151,7 +3181,7 @@ async def slash_raffle_swap(
     if user is None:
         # Clear the spot
         old_user_id = current_slot.get("user_id")
-        raffle["slots"][spot] = {"user_id": None, "username": None, "paid": False}
+        raffle["slots"][spot] = {"user_id": None, "username": None, "paid": False, "locked": False}
         await _db_save_slot(guild_id, name, spot)
 
         # Reopen raffle if it was closed
@@ -3195,7 +3225,8 @@ async def slash_raffle_swap(
         raffle["slots"][spot] = {
             "user_id":  user.id,
             "username": str(user),
-            "paid":     False,  # reset paid status on swap
+            "paid":     False,
+            "locked":   False,
         }
         await _db_save_slot(guild_id, name, spot)
 
@@ -3342,6 +3373,132 @@ async def slash_raffle_sethost(
         "✅  Host saved:\n" + "\n".join(lines),
         ephemeral=True
     )
+
+@raffle_group.command(
+    name="lock",
+    description="Lock spots for a mini round — prevents regular button claims on those spots",
+)
+@discord.app_commands.describe(
+    name  = "Name of the raffle",
+    spots = "Spot numbers to lock, e.g. '3 5 7' or '3,5,7'",
+)
+@discord.app_commands.autocomplete(name=_raffle_name_autocomplete)
+async def slash_raffle_lock(interaction: discord.Interaction, name: str, spots: str):
+    await interaction.response.defer(ephemeral=True)
+    if interaction.guild.owner_id != interaction.user.id:
+        await interaction.followup.send("Only the server owner can lock raffle spots.", ephemeral=True)
+        return
+    guild_id = interaction.guild_id
+    if name not in server_raffles.get(guild_id, {}):
+        await interaction.followup.send(f"No raffle named **{name}**.", ephemeral=True)
+        return
+    raffle = server_raffles[guild_id][name]
+
+    spot_nums = []
+    for token in spots.replace(",", " ").split():
+        try:
+            spot_nums.append(int(token))
+        except ValueError:
+            pass
+    if not spot_nums:
+        await interaction.followup.send(
+            "Couldn't parse spot numbers. Use e.g. `3 5 7` or `3,5,7`.", ephemeral=True
+        )
+        return
+
+    locked, skipped = [], []
+    for n in spot_nums:
+        if n not in raffle["slots"]:
+            skipped.append(f"#{n} (doesn't exist)")
+            continue
+        slot = raffle["slots"][n]
+        if slot["user_id"] is not None:
+            skipped.append(f"#{n} (already claimed by {slot['username'][:12]})")
+            continue
+        if slot.get("locked"):
+            skipped.append(f"#{n} (already locked)")
+            continue
+        raffle["slots"][n]["locked"] = True
+        await _db_save_slot(guild_id, name, n)
+        locked.append(n)
+
+    if locked:
+        channel = bot.get_channel(raffle["channel_id"])
+        if channel and raffle["message_id"]:
+            try:
+                msg  = await channel.fetch_message(raffle["message_id"])
+                await msg.edit(embed=_raffle_embed(name, raffle), view=_build_raffle_view(guild_id, name, raffle))
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
+    parts = []
+    if locked:
+        parts.append(f"🔒 Locked: {', '.join(f'#{n}' for n in sorted(locked))}")
+    if skipped:
+        parts.append(f"⚠️ Skipped: {', '.join(skipped)}")
+    await interaction.followup.send("\n".join(parts) or "Nothing was locked.", ephemeral=True)
+
+
+@raffle_group.command(
+    name="unlock",
+    description="Unlock spots previously reserved for a mini round, returning them to the open pool",
+)
+@discord.app_commands.describe(
+    name  = "Name of the raffle",
+    spots = "Spot numbers to unlock, e.g. '3 5 7' or '3,5,7'",
+)
+@discord.app_commands.autocomplete(name=_raffle_name_autocomplete)
+async def slash_raffle_unlock(interaction: discord.Interaction, name: str, spots: str):
+    await interaction.response.defer(ephemeral=True)
+    if interaction.guild.owner_id != interaction.user.id:
+        await interaction.followup.send("Only the server owner can unlock raffle spots.", ephemeral=True)
+        return
+    guild_id = interaction.guild_id
+    if name not in server_raffles.get(guild_id, {}):
+        await interaction.followup.send(f"No raffle named **{name}**.", ephemeral=True)
+        return
+    raffle = server_raffles[guild_id][name]
+
+    spot_nums = []
+    for token in spots.replace(",", " ").split():
+        try:
+            spot_nums.append(int(token))
+        except ValueError:
+            pass
+    if not spot_nums:
+        await interaction.followup.send(
+            "Couldn't parse spot numbers. Use e.g. `3 5 7` or `3,5,7`.", ephemeral=True
+        )
+        return
+
+    unlocked, skipped = [], []
+    for n in spot_nums:
+        if n not in raffle["slots"]:
+            skipped.append(f"#{n} (doesn't exist)")
+            continue
+        if not raffle["slots"][n].get("locked"):
+            skipped.append(f"#{n} (not locked)")
+            continue
+        raffle["slots"][n]["locked"] = False
+        await _db_save_slot(guild_id, name, n)
+        unlocked.append(n)
+
+    if unlocked:
+        channel = bot.get_channel(raffle["channel_id"])
+        if channel and raffle["message_id"]:
+            try:
+                msg  = await channel.fetch_message(raffle["message_id"])
+                await msg.edit(embed=_raffle_embed(name, raffle), view=_build_raffle_view(guild_id, name, raffle))
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
+    parts = []
+    if unlocked:
+        parts.append(f"🔓 Unlocked: {', '.join(f'#{n}' for n in sorted(unlocked))}")
+    if skipped:
+        parts.append(f"ℹ️ Skipped: {', '.join(skipped)}")
+    await interaction.followup.send("\n".join(parts) or "Nothing was unlocked.", ephemeral=True)
+
 
 # Register slash command group
 bot.tree.add_command(raffle_group)
