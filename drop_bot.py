@@ -1506,11 +1506,28 @@ async def cmd_paid(ctx, *, args=""):
         await silent(ctx)
         return
 
+    # Allow "prev"/"previous" prefix to directly target the previous drop, bypassing the interactive prompt
+    target_prev = False
+    args_parts = args.split()
+    if args_parts and args_parts[0].lower() in ("prev", "previous"):
+        target_prev = True
+        args = " ".join(args_parts[1:])
+
     # Default using_archive to False — set correctly in the drop routing below
     using_archive = False
 
-    # If buyer has claims in BOTH drops — ask which one they're paying for
-    if has_live_claim and has_archived_claim:
+    if target_prev:
+        if not has_archived_claim:
+            await ctx.author.send("⚠️  You don't have any claims in the previous drop.")
+            await silent(ctx)
+            return
+        claims_ref = archived_claims
+        stock_ref = archived.get("stock", {})
+        payments_ref = archived.get("payments", defaultdict(list))
+        using_archive = True
+
+    elif has_live_claim and has_archived_claim:
+        # Buyer has claims in BOTH drops — ask which one they're paying for
         live_total = sum(
             c["qty"] * stock[guild_id][key]["price"]
             for key, cl in claims_ref.items()
@@ -1527,10 +1544,8 @@ async def cmd_paid(ctx, *, args=""):
         await ctx.send(
             f"You have claims in two drops, {ctx.author.display_name}!\n"
             f"Reply with **`1`** for the current drop (${live_total:.2f} owed) or "
-            f"**`2`** for the previous drop (${arch_total:.2f} owed).\n"
-            "Or run `!paid` twice to report both."
+            f"**`2`** for the previous drop (${arch_total:.2f} owed)."
         )
-
 
         def check(m):
             return m.author.id == ctx.author.id and m.channel.id == ctx.channel.id and m.content.strip() in ["1", "2"]
@@ -1547,7 +1562,10 @@ async def cmd_paid(ctx, *, args=""):
                 payments_ref = payments[guild_id]
                 using_archive = False
         except asyncio.TimeoutError:
-            await ctx.send(f"⏰  Timed out — defaulting to current drop. Run `!paid` again to report for the previous drop.")
+            await ctx.send(
+                f"⏰  Timed out — defaulting to **current drop**.\n"
+                f"To pay for the previous drop instead, use `!paid prev <method> <amount>`."
+            )
             stock_ref = stock[guild_id]
             payments_ref = payments[guild_id]
             using_archive = False
@@ -1566,7 +1584,10 @@ async def cmd_paid(ctx, *, args=""):
 
     parts = args.split()
     if len(parts) < 2:
-        await ctx.author.send("Usage: `!paid <method> <amount>`  e.g. `!paid venmo $125`")
+        await ctx.author.send(
+            "Usage: `!paid <method> <amount>`  e.g. `!paid venmo $125`\n"
+            "For the previous drop: `!paid prev <method> <amount>`  e.g. `!paid prev venmo $125`"
+        )
         await silent(ctx)
         return
 
