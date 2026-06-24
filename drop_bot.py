@@ -37,6 +37,8 @@ Manager/Admin commands (server or DM after !drop):
   !remind                          — Tag all unpaid buyers in the drop channel
   !announce <message>              — Post a formatted announcement in the drop channel
   !history                         — View last 10 drop summaries
+  !export                          — Generate Excel spreadsheet of current drop (orders, payments, raffles)
+  !addtracking @user <tracking#>  — Attach a tracking number to a buyer's order
   !enddrop
 
 Public commands (anyone, in server only):
@@ -54,10 +56,14 @@ from discord.ext import commands
 from collections import defaultdict
 import datetime
 import asyncio
+import io
 import json
 import os
 import random
 import asyncpg
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -171,10 +177,6 @@ async def init_db():
             ALTER TABLE server_settings
             ADD COLUMN IF NOT EXISTS raffle_channel_id BIGINT
         """)
-        await conn.execute("""
-            ALTER TABLE raffle_slots
-            ADD COLUMN IF NOT EXISTS locked BOOLEAN NOT NULL DEFAULT FALSE
-        """)
     print("✅  Database ready.")
 
 
@@ -228,7 +230,6 @@ async def db_load_all():
                     "user_id":  row["user_id"],
                     "username": row["username"],
                     "paid":     row["paid"],
-                    "locked":   bool(row["locked"]) if row["locked"] is not None else False,
                 }
 
         # Load raffle hosts
@@ -369,15 +370,12 @@ waitlist = defaultdict(lambda: defaultdict(list))
 stock_message = {}
 pinned_message = {}
 autoclose = defaultdict(lambda: True)
-manager_session: dict = {}   # user_id -> list of {"guild_id": int, "channel": channel}
+manager_session = {}
 payments = defaultdict(lambda: defaultdict(list))
 payment_board_message    = {}
 live_claimlist_message   = {}   # guild_id -> Message (live claim list embed)
 pending_payment_messages = {}
 _pending_board_update    = {}   # guild_id -> bool (debounce flag)
-_closing_guilds: set = set()    # guards close_drop against double-close races
-# guild_id -> item_key -> {user_ids already notified that a spot opened up}
-waitlist_notified = defaultdict(lambda: defaultdict(set))
 
 # Snapshot of stock prices at drop close for bump/remind to reference after stock resets
 # last_drop_snapshot[guild_id] = {"claims": {...}, "stock": {...}}
@@ -387,6 +385,9 @@ last_drop_snapshot = {}
 server_raffles        = defaultdict(dict)   # guild_id -> {name -> raffle_dict}
 server_raffle_channel = {}                  # guild_id -> channel_id
 raffle_hosts          = defaultdict(dict)   # guild_id -> {1: {...}, 2: {...}}
+
+# Tracking numbers — guild_id -> user_id -> tracking number string
+tracking_numbers = defaultdict(dict)
 
 # Archived payments from previous drop — preserved when new drop starts
 # so buyers can still !paid and managers can still !confirm after a new drop begins
@@ -401,10 +402,7 @@ def normalize(name):
 
 
 def parse_price(price_str):
-    val = float(price_str.lstrip("$").replace(",", ""))
-    if val <= 0:
-        raise ValueError(f"Price must be positive, got {val}")
-    return val
+    return float(price_str.lstrip("$"))
 
 
 def is_manager(guild_id, user_id):
@@ -440,12 +438,9 @@ def get_manager_context(ctx):
             return None, None
         return guild_id, ctx.channel
     else:
-        sessions = manager_session.get(ctx.author.id)
-        if not sessions:
+        session = manager_session.get(ctx.author.id)
+        if not session:
             return None, None
-        # Multiple sessions possible (manager running drops in several servers);
-        # use the most recently started one as the default DM target.
-        session = sessions[-1]
         guild_id = session["guild_id"]
         if not is_manager(guild_id, ctx.author.id):
             return None, None
@@ -486,28 +481,8 @@ def get_user_total_owed(guild_id, user_id):
     )
 
 
-MAX_EMBED_FIELDS = 24  # leave 1 slot for overflow indicator
-
-
-def _safe_add_fields(embed, fields):
-    """Add fields to embed, respecting the 25-field Discord limit."""
-    for i, (name, value, inline) in enumerate(fields):
-        if i >= MAX_EMBED_FIELDS:
-            embed.add_field(
-                name=f"… and {len(fields) - MAX_EMBED_FIELDS} more",
-                value="Use `!payments` for the full list.",
-                inline=False
-            )
-            break
-        # Truncate value if it exceeds the 1024-char field limit
-        if len(value) > 1024:
-            value = value[:1020] + "…"
-        embed.add_field(name=name, value=value, inline=inline)
-
-
 def build_stock_embed(guild_id):
     embed = discord.Embed(title="🛒  Drop Stock", color=discord.Color.gold(), timestamp=datetime.datetime.utcnow())
-    fields = []
     for key, info in stock[guild_id].items():
         claimed = sum(c["qty"] for c in claims[guild_id][key])
         qty_left = info["qty"] - claimed
@@ -515,8 +490,7 @@ def build_stock_embed(guild_id):
         status = f"**${info['price']:.2f}** each  •  **{qty_left}** of {info['qty']} remaining{limit_str}"
         if qty_left <= 0:
             status += "  🚫 **SOLD OUT**"
-        fields.append((info["display"], status, False))
-    _safe_add_fields(embed, fields)
+        embed.add_field(name=info["display"], value=status, inline=False)
     return embed
 
 
@@ -544,12 +518,16 @@ def build_claimlist_embed(guild_id, title="📋  Claim List"):
         embed.description = "No claims yet."
         return embed
 
-    fields = []
     for uid, order in user_orders.items():
         lines = "\n".join(order["items"])
         field_value = f"{lines}\n**Total: ${order['total']:.2f}**"
-        fields.append((order['user'].display_name, field_value, False))
-    _safe_add_fields(embed, fields)
+        if len(field_value) > 1024:
+            field_value = field_value[:1020] + "..."
+        embed.add_field(
+            name=f"{order['user'].display_name}",
+            value=field_value,
+            inline=False
+        )
 
     return embed
 
@@ -584,15 +562,7 @@ def build_payment_board_embed(guild_id):
             methods = ", ".join(f"{p['method'].title()} ${p['amount']:.2f}" for p in confirmed)
             confirmed_lines.append(f"✅  <@{user_id}> — {methods}  •  **${total:.2f} total**")
     if confirmed_lines:
-        # Description has a 4096-char cap; keep it short and overflow into fields if needed.
-        MAX_DESC_LINES = 24
-        embed.description = "\n".join(confirmed_lines[:MAX_DESC_LINES])
-        if len(confirmed_lines) > MAX_DESC_LINES:
-            extra = confirmed_lines[MAX_DESC_LINES:]
-            _safe_add_fields(
-                embed,
-                [(f"+ {len(extra)} more confirmed", "\n".join(extra), False)],
-            )
+        embed.description = "\n".join(confirmed_lines)
     else:
         embed.description = "No payments confirmed yet."
     embed.set_footer(text="Updated automatically as payments are confirmed")
@@ -633,14 +603,18 @@ def build_live_claimlist_embed(guild_id):
     if not user_orders:
         embed.description = "No claims yet."
         return embed
-    fields = []
     for uid, order in user_orders.items():
         confirmed_total = sum(p["amount"] for p in payments[guild_id][uid] if p["confirmed"])
         paid_status = "✅  Paid" if confirmed_total >= order["total"] - 0.01 else f"⏳  ${confirmed_total:.2f} of ${order['total']:.2f} paid"
         lines_str = "\n".join(order["items"])
         field_value = lines_str + f"\n**Total: ${order['total']:.2f}** -- {paid_status}"
-        fields.append((order["user"].display_name, field_value, False))
-    _safe_add_fields(embed, fields)
+        if len(field_value) > 1024:
+            field_value = field_value[:1020] + "..."
+        embed.add_field(
+            name=order["user"].display_name,
+            value=field_value,
+            inline=False
+        )
     embed.set_footer(text="Updates live as claims and payments come in")
     return embed
 
@@ -650,40 +624,38 @@ async def update_all_live_boards(guild_id):
     if _pending_board_update.get(guild_id):
         return
     _pending_board_update[guild_id] = True
-    try:
-        await asyncio.sleep(2)  # debounce — wait 2s then flush
+    await asyncio.sleep(2)  # debounce — wait 2s then flush
+    _pending_board_update[guild_id] = False
 
-        # Update stock embed
-        msg = stock_message.get(guild_id)
-        if msg:
-            try:
-                await msg.edit(embed=build_stock_embed(guild_id))
-            except discord.NotFound:
-                stock_message.pop(guild_id, None)
-            except discord.HTTPException:
-                pass
+    # Update stock embed
+    msg = stock_message.get(guild_id)
+    if msg:
+        try:
+            await msg.edit(embed=build_stock_embed(guild_id))
+        except discord.NotFound:
+            stock_message.pop(guild_id, None)
+        except discord.HTTPException:
+            pass
 
-        # Update live claim list
-        cl_msg = live_claimlist_message.get(guild_id)
-        if cl_msg:
-            try:
-                await cl_msg.edit(embed=build_live_claimlist_embed(guild_id))
-            except discord.NotFound:
-                live_claimlist_message.pop(guild_id, None)
-            except discord.HTTPException:
-                pass
+    # Update live claim list
+    cl_msg = live_claimlist_message.get(guild_id)
+    if cl_msg:
+        try:
+            await cl_msg.edit(embed=build_live_claimlist_embed(guild_id))
+        except discord.NotFound:
+            live_claimlist_message.pop(guild_id, None)
+        except discord.HTTPException:
+            pass
 
-        # Update payment board
-        pb_msg = payment_board_message.get(guild_id)
-        if pb_msg:
-            try:
-                await pb_msg.edit(embed=build_payment_board_embed(guild_id))
-            except discord.NotFound:
-                payment_board_message.pop(guild_id, None)
-            except discord.HTTPException:
-                pass
-    finally:
-        _pending_board_update.pop(guild_id, None)
+    # Update payment board
+    pb_msg = payment_board_message.get(guild_id)
+    if pb_msg:
+        try:
+            await pb_msg.edit(embed=build_payment_board_embed(guild_id))
+        except discord.NotFound:
+            payment_board_message.pop(guild_id, None)
+        except discord.HTTPException:
+            pass
 
 
 async def update_stock_embed(guild_id):
@@ -713,43 +685,16 @@ async def notify_waitlist(guild_id, key, qty_freed):
     if not wl or qty_freed <= 0:
         return
     item_display = stock[guild_id][key]["display"] if key in stock[guild_id] else key
-    notified = waitlist_notified[guild_id][key]
-    # Notify the next users who haven't already been pinged, but keep them on the
-    # waitlist until they actually reclaim — so a no-show doesn't lose their spot
-    # to nobody.
-    sent = 0
-    for user in wl:
-        if sent >= qty_freed:
-            break
-        if user.id in notified:
-            continue
+    for user in wl[:qty_freed]:
         try:
-            await user.send(
-                f"🔔  **{item_display}** is available again! Head back to the server and use "
-                f"`!claim {item_display} 1` before it's gone — if you don't reclaim, you'll lose "
-                f"your spot to the next person."
-            )
+            await user.send(f"🔔  **{item_display}** is available again! Head back to the server and use `!claim {item_display} 1` before it's gone!")
         except discord.Forbidden:
             pass
-        notified.add(user.id)
-        sent += 1
+    waitlist[guild_id][key] = wl[qty_freed:]
 
 
 async def close_drop(channel, guild_id):
-    if guild_id in _closing_guilds:
-        return
-    _closing_guilds.add(guild_id)
-    try:
-        await _close_drop_impl(channel, guild_id)
-    finally:
-        _closing_guilds.discard(guild_id)
-
-
-async def _close_drop_impl(channel, guild_id):
     session_state[guild_id] = "closed"
-    # Remove this guild's session from every manager so DM commands don't linger
-    for uid, sessions in list(manager_session.items()):
-        manager_session[uid] = [s for s in sessions if s["guild_id"] != guild_id]
     pin = pinned_message.pop(guild_id, None)
     if pin:
         try:
@@ -815,20 +760,28 @@ async def _close_drop_impl(channel, guild_id):
         except (discord.NotFound, discord.HTTPException):
             pass
 
-    # Post final summary
-    embed = build_claimlist_embed(guild_id, title="🔴  Drop CLOSED — Final Claim List")
-    await channel.send(embed=embed)
+    # Post fresh final claim list with paid/unpaid status
+    final_cl_embed = build_live_claimlist_embed(guild_id)
+    final_cl_embed.title = "🔴  Drop CLOSED — Final Claim List"
+    final_cl_embed.color = discord.Color.red()
+    await channel.send(embed=final_cl_embed)
 
-    if not pb_existing:
-        board_msg = await channel.send(embed=build_payment_board_embed(guild_id))
-        payment_board_message[guild_id] = board_msg
+    # Always post a fresh payment board on close
+    final_pb_embed = build_payment_board_embed(guild_id)
+    final_pb_embed.title = "💳  Final Payment Board"
+    board_msg = await channel.send(embed=final_pb_embed)
+    payment_board_message[guild_id] = board_msg
+
+    # Remind buyers they can view their order anytime
+    await channel.send(
+        "📋  **Want to see your order?** Type `!myhistory` anytime to view "
+        "your claim history and payment status across all past drops."
+    )
 
     payment_info = build_payment_info(guild_id)
 
     claimer_totals = defaultdict(list)
     for key, claim_list in claims[guild_id].items():
-        if key not in stock[guild_id]:
-            continue
         for c in claim_list:
             subtotal = c["qty"] * stock[guild_id][key]["price"]
             claimer_totals[c["user"]].append((stock[guild_id][key]["display"], c["qty"], subtotal))
@@ -931,17 +884,8 @@ async def on_command_error(ctx, error):
         )
     elif isinstance(error, commands.CommandNotFound):
         pass  # Ignore unknown commands silently
-    elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"⚠️  Missing argument: `{error.param.name}`. Check command usage.", delete_after=8)
     else:
-        # Log internally and give user a generic error message
-        import traceback
-        print(f"Unhandled command error in {ctx.command}: {error}")
-        traceback.print_exc()
-        try:
-            await ctx.author.send(f"⚠️  Something went wrong with `!{ctx.command}`. The error has been logged.")
-        except discord.Forbidden:
-            pass
+        raise error
 
 @bot.event
 async def on_ready():
@@ -976,7 +920,6 @@ async def on_reaction_add(reaction, user):
 
     user_pmts = payments[guild_id][buyer_id]
     pending   = [p for p in user_pmts if not p["confirmed"]]
-    total_already_confirmed = sum(p["amount"] for p in user_pmts if p["confirmed"] and p not in pending)
     for p in pending:
         p["confirmed"] = True
     total_confirmed = sum(p["amount"] for p in pending)
@@ -1011,19 +954,10 @@ async def on_reaction_add(reaction, user):
 
     asyncio.create_task(update_all_live_boards(guild_id))
 
-    total_owed = get_user_total_owed(guild_id, buyer_id)
-    new_total_confirmed = total_already_confirmed + total_confirmed
-    remaining = total_owed - new_total_confirmed
-    underpaid = remaining > 0.01
-
     guild = reaction.message.guild
     buyer = guild.get_member(buyer_id)
     if buyer:
-        confirm_msg = f"✅  Your payment of **${total_confirmed:.2f}** has been confirmed! "
-        if underpaid:
-            confirm_msg += f"You still owe **${remaining:.2f}** — please send the rest when you can. Thanks!"
-        else:
-            confirm_msg += "Thanks so much — enjoy! 🎉"
+        confirm_msg = f"✅  Your payment of **${total_confirmed:.2f}** has been confirmed! Thanks so much — enjoy! 🎉"
         if confirmed_raffle_spots:
             spots_str = ", ".join(f"**{r}** Spot #{n}" for r, n in confirmed_raffle_spots)
             confirm_msg += f"\n🎟️  Raffle spot(s) confirmed: {spots_str}"
@@ -1032,11 +966,8 @@ async def on_reaction_add(reaction, user):
         except discord.Forbidden:
             pass
 
-    edit_note = f"\n✅  Confirmed by **{user.display_name}**"
-    if underpaid:
-        edit_note += f" — ⚠️ still owes ${remaining:.2f}"
     try:
-        await reaction.message.edit(content=reaction.message.content + edit_note)
+        await reaction.message.edit(content=reaction.message.content + f"\n✅  Confirmed by **{user.display_name}**")
     except (discord.Forbidden, discord.NotFound):
         pass
 
@@ -1177,14 +1108,9 @@ async def cmd_drop(ctx):
     payment_board_message.pop(guild_id, None)
     live_claimlist_message.pop(guild_id, None)
     _pending_board_update.pop(guild_id, None)
-    # Clear only THIS guild's stale reaction listeners — leave other guilds intact
-    global pending_payment_messages
-    pending_payment_messages = {
-        k: v for k, v in pending_payment_messages.items()
-        if v["guild_id"] != guild_id
-    }
+    pending_payment_messages.clear()  # clear any stale reaction listeners
     autoclose[guild_id] = True
-    manager_session.setdefault(ctx.author.id, []).append({"guild_id": guild_id, "channel": drop_ch})
+    manager_session[ctx.author.id] = {"guild_id": guild_id, "channel": drop_ch}
     await silent(ctx)
     await dm(ctx, f"✅  Drop session started for **{ctx.guild.name}**! Drop will post in **#{drop_ch.name}**.\n\nCommands available now: `!addstock`, `!editstock`, `!removestockitem`, `!preview`, `!countdown`, `!release`, `!claimlist`, `!autoclose`, `!enddrop`\n\n💡  Auto-close is **ON**.")
 
@@ -1276,11 +1202,6 @@ async def cmd_editstock(ctx, *, args=""):
             names = ", ".join(f"`{s['display']}`" for s in stock[guild_id].values())
             await dm(ctx, f"⚠️  Item not found. Current stock: {names}")
             return
-    already_claimed = sum(c["qty"] for c in claims[guild_id][key])
-    if qty < already_claimed:
-        await dm(ctx, f"⚠️  {already_claimed} units of **{stock[guild_id][key]['display']}** are already claimed. "
-                      f"New qty ({qty}) would be less than claims. Set qty to at least {already_claimed} or use `!removestockitem` to remove.")
-        return
     stock[guild_id][key]["qty"] = qty
     stock[guild_id][key]["price"] = price
     if session_state[guild_id] == "live":
@@ -1310,27 +1231,7 @@ async def cmd_removestockitem(ctx, *, item_name=""):
             await dm(ctx, f"⚠️  Item not found. Current stock: {names}")
             return
     removed = stock[guild_id].pop(key)
-    # Notify and remove any existing claims for this item
-    removed_claims = claims[guild_id].pop(key, [])
-    waitlist[guild_id].pop(key, None)
-    waitlist_notified[guild_id].pop(key, None)
-    if removed_claims:
-        guild_obj = ctx.guild or bot.get_guild(guild_id)
-        guild_name = guild_obj.name if guild_obj else "the server"
-        for c in removed_claims:
-            try:
-                await c["user"].send(
-                    f"ℹ️  **{removed['display']}** has been removed from the drop on **{guild_name}**. "
-                    f"Your claim for this item has been cancelled."
-                )
-            except discord.Forbidden:
-                pass
-        # Refresh live boards if drop is active
-        if session_state[guild_id] == "live":
-            asyncio.create_task(update_all_live_boards(guild_id))
-        await dm(ctx, f"🗑️  **{removed['display']}** removed. {len(removed_claims)} claim(s) cancelled and buyers notified.")
-    else:
-        await dm(ctx, f"🗑️  **{removed['display']}** removed.")
+    await dm(ctx, f"🗑️  **{removed['display']}** removed.")
 
 
 @bot.command(name="preview")
@@ -1470,38 +1371,12 @@ async def cmd_enddrop(ctx):
         return
     if ctx.guild:
         await silent(ctx)
-    if session_state[guild_id] != "live" or guild_id in _closing_guilds:
+    if session_state[guild_id] != "live":
         await dm(ctx, "⚠️  No active drop to end.")
         return
-    # Clear this guild's session for this manager so DM commands don't linger
-    if ctx.author.id in manager_session:
-        manager_session[ctx.author.id] = [
-            s for s in manager_session[ctx.author.id] if s["guild_id"] != guild_id
-        ]
+    # Clear manager session so DM commands don't linger
+    manager_session.pop(ctx.author.id, None)
     await close_drop(drop_channel, guild_id)
-
-
-@bot.command(name="session")
-async def cmd_session(ctx):
-    """Show current active drop session (DM only)."""
-    if ctx.guild:
-        return
-    sessions = manager_session.get(ctx.author.id, [])
-    if not sessions:
-        await ctx.author.send("No active drop session.")
-        return
-    lines = []
-    for s in sessions:
-        guild = bot.get_guild(s["guild_id"])
-        name = guild.name if guild else f"Guild {s['guild_id']}"
-        lines.append(f"• **{name}** (channel: #{s['channel'].name})")
-    active = sessions[-1]
-    active_guild = bot.get_guild(active["guild_id"])
-    active_name = active_guild.name if active_guild else str(active["guild_id"])
-    await ctx.author.send(
-        f"Active DM commands target: **{active_name}**\n"
-        + ("All sessions:\n" + "\n".join(lines) if len(lines) > 1 else "")
-    )
 
 
 @bot.command(name="claimlist")
@@ -1584,14 +1459,6 @@ async def cmd_confirm(ctx):
         await dm(ctx, f"⚠️  No pending payments found for **{user.display_name}**.")
         return
 
-    # Capture amounts already confirmed BEFORE flipping this batch
-    total_already_confirmed = sum(p["amount"] for p in user_pmts if p["confirmed"] and p not in pending)
-    if isinstance(archived_pmts, dict) and user.id in archived_pmts:
-        total_already_confirmed += sum(
-            p["amount"] for p in archived_pmts[user.id]
-            if p["confirmed"] and p not in pending
-        )
-
     for p in pending:
         p["confirmed"] = True
 
@@ -1601,25 +1468,11 @@ async def cmd_confirm(ctx):
     # Update confirmed status in DB
     await db_update_user_claim_confirmed(guild_id, user.id)
 
-    total_owed = get_user_total_owed(guild_id, user.id)
-    new_total_confirmed = total_already_confirmed + total_confirmed
-    remaining = total_owed - new_total_confirmed
-    underpaid = remaining > 0.01
-
-    buyer_msg = f"✅  Your payment of **${total_confirmed:.2f}** has been confirmed! "
-    if underpaid:
-        buyer_msg += f"You still owe **${remaining:.2f}** — please send the rest when you can. Thanks!"
-    else:
-        buyer_msg += "Thanks so much — enjoy your order! 🎉"
     try:
-        await user.send(buyer_msg)
+        await user.send(f"✅  Your payment of **${total_confirmed:.2f}** has been confirmed! Thanks so much — enjoy your order! 🎉")
     except discord.Forbidden:
         pass
-
-    feedback = f"✅  Confirmed **${total_confirmed:.2f}** from **{user.display_name}**."
-    if underpaid:
-        feedback += f"\n⚠️  Still owes ${remaining:.2f}"
-    await dm(ctx, feedback)
+    await dm(ctx, f"✅  Confirmed **${total_confirmed:.2f}** from **{user.display_name}**.")
 
 
 # ── PUBLIC COMMANDS ───────────────────────────────────────────────────────────
@@ -1672,28 +1525,11 @@ async def cmd_paid(ctx, *, args=""):
         await silent(ctx)
         return
 
-    # Allow "prev"/"previous" prefix to directly target the previous drop, bypassing the interactive prompt
-    target_prev = False
-    args_parts = args.split()
-    if args_parts and args_parts[0].lower() in ("prev", "previous"):
-        target_prev = True
-        args = " ".join(args_parts[1:])
-
     # Default using_archive to False — set correctly in the drop routing below
     using_archive = False
 
-    if target_prev:
-        if not has_archived_claim:
-            await ctx.author.send("⚠️  You don't have any claims in the previous drop.")
-            await silent(ctx)
-            return
-        claims_ref = archived_claims
-        stock_ref = archived.get("stock", {})
-        payments_ref = archived.get("payments", defaultdict(list))
-        using_archive = True
-
-    elif has_live_claim and has_archived_claim:
-        # Buyer has claims in BOTH drops — ask which one they're paying for
+    # If buyer has claims in BOTH drops — ask which one they're paying for
+    if has_live_claim and has_archived_claim:
         live_total = sum(
             c["qty"] * stock[guild_id][key]["price"]
             for key, cl in claims_ref.items()
@@ -1710,8 +1546,10 @@ async def cmd_paid(ctx, *, args=""):
         await ctx.send(
             f"You have claims in two drops, {ctx.author.display_name}!\n"
             f"Reply with **`1`** for the current drop (${live_total:.2f} owed) or "
-            f"**`2`** for the previous drop (${arch_total:.2f} owed)."
+            f"**`2`** for the previous drop (${arch_total:.2f} owed).\n"
+            "Or run `!paid` twice to report both."
         )
+
 
         def check(m):
             return m.author.id == ctx.author.id and m.channel.id == ctx.channel.id and m.content.strip() in ["1", "2"]
@@ -1728,10 +1566,7 @@ async def cmd_paid(ctx, *, args=""):
                 payments_ref = payments[guild_id]
                 using_archive = False
         except asyncio.TimeoutError:
-            await ctx.send(
-                f"⏰  Timed out — defaulting to **current drop**.\n"
-                f"To pay for the previous drop instead, use `!paid prev <method> <amount>`."
-            )
+            await ctx.send(f"⏰  Timed out — defaulting to current drop. Run `!paid` again to report for the previous drop.")
             stock_ref = stock[guild_id]
             payments_ref = payments[guild_id]
             using_archive = False
@@ -1750,10 +1585,7 @@ async def cmd_paid(ctx, *, args=""):
 
     parts = args.split()
     if len(parts) < 2:
-        await ctx.author.send(
-            "Usage: `!paid <method> <amount>`  e.g. `!paid venmo $125`\n"
-            "For the previous drop: `!paid prev <method> <amount>`  e.g. `!paid prev venmo $125`"
-        )
+        await ctx.author.send("Usage: `!paid <method> <amount>`  e.g. `!paid venmo $125`")
         await silent(ctx)
         return
 
@@ -1826,22 +1658,14 @@ async def cmd_paid(ctx, *, args=""):
         spots_label = ", ".join(f"**{r}** Spot #{n}" for r, n in raffle_spots)
         confirm_hint = (
             f"React \u2705 to confirm payment & raffle spot(s): {spots_label}\n"
-            f"Or use `/raffle confirm <name>` to confirm a raffle spot only."
+            f"Or use `/raffle confirm {name}` to confirm raffle only."
         )
     else:
         confirm_hint = f"React \u2705 to confirm or use `!confirm @{ctx.author.display_name}`."
 
-    # Previously reported total (all reports except the one just added) for manager context
-    prev_total = sum(p["amount"] for p in payments_ref[ctx.author.id][:-1])
-    ping_content = (
-        f"\U0001f4b0  {manager_mentions} \u2014 **{ctx.author.display_name}** reported payment of "
-        f"**${amount:.2f}** via **{method.title()}**."
-        + (f" (Previously reported: **${prev_total:.2f}** / **${total_owed:.2f}** owed)"
-           if prev_total > 0 else f" (**${total_owed:.2f}** owed)")
-        + f"\n{confirm_hint}"
-    )
     ping_msg = await drop_ch.send(
-        ping_content,
+        f"\U0001f4b0  {manager_mentions} \u2014 **{ctx.author.display_name}** reported payment of "
+        f"**${amount:.2f}** via **{method.title()}**.\n{confirm_hint}",
         allowed_mentions=discord.AllowedMentions(users=True)
     )
     await ping_msg.add_reaction("\u2705")
@@ -1944,9 +1768,6 @@ async def cmd_claim(ctx, *, args=""):
         existing["qty"] += qty
     else:
         claims[guild_id][key].append({"user": ctx.author, "qty": qty, "time": datetime.datetime.utcnow()})
-    # User successfully claimed — take them off the waitlist for this item
-    waitlist[guild_id][key] = [u for u in waitlist[guild_id][key] if u.id != ctx.author.id]
-    waitlist_notified[guild_id][key].discard(ctx.author.id)
     new_remaining = remaining - qty
     total_cost = qty * info["price"]
     await ctx.send(f"✅  **{ctx.author.display_name}** claimed **{qty}x {info['display']}** — ${total_cost:.2f}  •  {new_remaining} left")
@@ -2003,8 +1824,6 @@ async def cmd_unclaim(ctx, *, args=""):
         existing["qty"] -= qty
         await ctx.send(f"↩️  **{ctx.author.display_name}** removed **{qty}x {stock[guild_id][key]['display']}** from their claim. ({existing['qty']} still claimed)")
     asyncio.create_task(update_all_live_boards(guild_id))
-    # Reset notified set so the freshly-opened slots trigger new pings to waitlisters
-    waitlist_notified[guild_id][key].clear()
     await notify_waitlist(guild_id, key, freed)
 
 
@@ -2478,8 +2297,11 @@ async def cmd_help(ctx):
         inline=False
     )
     embed.add_field(
-        name="History",
-        value="`!myhistory` — View your personal claim history across past drops",
+        name="Your Order History",
+        value=(
+            "`!myhistory` — View all your past claims and payment status\n"
+            "Works anytime — even after a drop closes!"
+        ),
         inline=False
     )
     embed.add_field(
@@ -2598,14 +2420,13 @@ async def _db_save_slot(guild_id: int, name: str, spot_num: int):
     s = server_raffles[guild_id][name]["slots"][spot_num]
     async with db_pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO raffle_slots (guild_id, raffle_name, spot_num, user_id, username, paid, locked)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            INSERT INTO raffle_slots (guild_id, raffle_name, spot_num, user_id, username, paid)
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (guild_id, raffle_name, spot_num) DO UPDATE SET
                 user_id  = EXCLUDED.user_id,
                 username = EXCLUDED.username,
-                paid     = EXCLUDED.paid,
-                locked   = EXCLUDED.locked
-        """, guild_id, name, spot_num, s["user_id"], s["username"], s["paid"], s.get("locked", False))
+                paid     = EXCLUDED.paid
+        """, guild_id, name, spot_num, s["user_id"], s["username"], s["paid"])
 
 
 async def _db_delete_raffle(guild_id: int, name: str):
@@ -2628,11 +2449,10 @@ async def _db_save_raffle_channel(guild_id: int, channel_id: int):
 # ── RAFFLE EMBED BUILDER ──────────────────────────────────────────────────────
 
 def _raffle_embed(name: str, raffle: dict) -> discord.Embed:
-    slots        = raffle["slots"]
-    total        = raffle["spots"]
-    claimed      = sum(1 for s in slots.values() if s["user_id"] is not None)
-    locked_empty = sum(1 for s in slots.values() if s.get("locked") and s["user_id"] is None)
-    remaining    = total - claimed - locked_empty
+    slots     = raffle["slots"]
+    total     = raffle["spots"]
+    claimed   = sum(1 for s in slots.values() if s["user_id"] is not None)
+    remaining = total - claimed
 
     if raffle["status"] == "complete":
         color = discord.Color.gold()
@@ -2650,10 +2470,7 @@ def _raffle_embed(name: str, raffle: dict) -> discord.Embed:
     for num in sorted(slots.keys()):
         s = slots[num]
         if s["user_id"] is None:
-            if s.get("locked"):
-                lines.append(f"`{num:>2}` \ud83d\udd12 Mini Round")
-            else:
-                lines.append(f"`{num:>2}` Open")
+            lines.append(f"`{num:>2}` Open")
         elif s["paid"]:
             lines.append(f"`{num:>2}` Paid: {s['username']}")
         else:
@@ -2663,9 +2480,8 @@ def _raffle_embed(name: str, raffle: dict) -> discord.Embed:
     embed.add_field(name="Spots",  value="\n".join(lines[:mid]) or "--", inline=True)
     embed.add_field(name="\u200b", value="\n".join(lines[mid:]) or "--", inline=True)
 
-    mini_note = f" \u00b7 {locked_empty} spot(s) reserved for mini round" if locked_empty else ""
     status_map = {
-        "open":     f"Open -- tap a button to claim a spot!{mini_note}",
+        "open":     "Open -- tap a button to claim a spot!",
         "closed":   "All spots claimed -- awaiting payment confirmations",
         "complete": "Raffle complete",
     }
@@ -2699,22 +2515,13 @@ def _build_raffle_payment_dm(guild_id: int, host_num: int = 0) -> str:
 def _build_raffle_view(guild_id: int, name: str, raffle: dict) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
     for num in sorted(raffle["slots"].keys()):
-        s      = raffle["slots"][num]
-        taken  = s["user_id"] is not None
-        locked = s.get("locked", False) and not taken
-        if locked:
-            label = f"🔒 #{num}"
-            style = discord.ButtonStyle.secondary
-        elif taken:
-            label = f"#{num} -- {s['username'][:12]}"
-            style = discord.ButtonStyle.danger
-        else:
-            label = f"Spot {num}"
-            style = discord.ButtonStyle.success
-        btn = discord.ui.Button(
+        s     = raffle["slots"][num]
+        taken = s["user_id"] is not None
+        label = f"Spot {num}" if not taken else f"#{num} -- {s['username'][:12]}"
+        btn   = discord.ui.Button(
             label     = label,
-            style     = style,
-            disabled  = taken or locked or raffle["status"] != "open",
+            style     = discord.ButtonStyle.danger if taken else discord.ButtonStyle.success,
+            disabled  = taken or raffle["status"] != "open",
             custom_id = f"raffle:{guild_id}:{name}:{num}",
             row       = (num - 1) // 5,
         )
@@ -2776,19 +2583,11 @@ async def on_interaction(interaction: discord.Interaction):
         )
         return
 
-    if slot.get("locked"):
-        await interaction.followup.send(
-            f"Spot #{spot_num} is reserved for a mini round and can't be claimed here.",
-            ephemeral=True,
-        )
-        return
-
     username = str(interaction.user)
-    raffle["slots"][spot_num] = {"user_id": interaction.user.id, "username": username, "paid": False, "locked": False}
+    raffle["slots"][spot_num] = {"user_id": interaction.user.id, "username": username, "paid": False}
     await _db_save_slot(guild_id, name, spot_num)
 
-    open_slots = [s for s in raffle["slots"].values() if not s.get("locked")]
-    all_claimed = bool(open_slots) and all(s["user_id"] is not None for s in open_slots)
+    all_claimed = all(s["user_id"] is not None for s in raffle["slots"].values())
     if all_claimed:
         raffle["status"] = "closed"
         await _db_save_raffle(guild_id, name)
@@ -2803,11 +2602,9 @@ async def on_interaction(interaction: discord.Interaction):
             pass
 
     if all_claimed and channel:
-        locked_nums = sorted(n for n, s in raffle["slots"].items() if s.get("locked") and s["user_id"] is None)
-        mini_note = f" Spots {', '.join(f'#{n}' for n in locked_nums)} are reserved for mini rounds." if locked_nums else ""
         await channel.send(
-            f"All open spots in **{name}** are claimed!"
-            f" Waiting on payment confirmations before the spin.{mini_note}"
+            f"All spots in **{name}** are claimed! "
+            f"Waiting on payment confirmations before the spin."
         )
 
     await interaction.followup.send(
@@ -2863,10 +2660,10 @@ async def slash_raffle_setchannel(interaction: discord.Interaction, channel: dis
 )
 async def slash_raffle_create(interaction: discord.Interaction, name: str, spots: int, price: str, host: int = 0):
     await interaction.response.defer(ephemeral=True)
-    guild_id = interaction.guild_id
-    if not (interaction.guild.owner_id == interaction.user.id or is_manager(guild_id, interaction.user.id)):
-        await interaction.followup.send("Only server managers can do this.", ephemeral=True)
+    if interaction.guild.owner_id != interaction.user.id:
+        await interaction.followup.send("Only the server owner can create raffles.", ephemeral=True)
         return
+    guild_id = interaction.guild_id
     if spots < 2 or spots > 10:
         await interaction.followup.send("Spots must be between 2 and 10.", ephemeral=True)
         return
@@ -2902,7 +2699,7 @@ async def slash_raffle_create(interaction: discord.Interaction, name: str, spots
         "message_id": None,
         "status":     "open",
         "host_num":   host,
-        "slots":      {n: {"user_id": None, "username": None, "paid": False, "locked": False}
+        "slots":      {n: {"user_id": None, "username": None, "paid": False}
                        for n in range(1, spots + 1)},
     }
     server_raffles[guild_id][name] = raffle
@@ -3012,10 +2809,10 @@ async def slash_raffle_confirm(interaction: discord.Interaction, name: str, user
 )
 async def slash_raffle_wheel(interaction: discord.Interaction, name: str, force: bool = False):
     await interaction.response.defer(ephemeral=True)
-    guild_id = interaction.guild_id
-    if not (interaction.guild.owner_id == interaction.user.id or is_manager(guild_id, interaction.user.id)):
-        await interaction.followup.send("Only server managers can do this.", ephemeral=True)
+    if interaction.guild.owner_id != interaction.user.id:
+        await interaction.followup.send("Only the server owner can start the wheel.", ephemeral=True)
         return
+    guild_id = interaction.guild_id
     if name not in server_raffles[guild_id]:
         await interaction.followup.send(f"No raffle named **{name}**.", ephemeral=True)
         return
@@ -3071,10 +2868,10 @@ async def slash_raffle_wheel(interaction: discord.Interaction, name: str, force:
 )
 async def slash_raffle_winner(interaction: discord.Interaction, name: str, spot: int):
     await interaction.response.defer(ephemeral=True)
-    guild_id = interaction.guild_id
-    if not (interaction.guild.owner_id == interaction.user.id or is_manager(guild_id, interaction.user.id)):
-        await interaction.followup.send("Only server managers can do this.", ephemeral=True)
+    if interaction.guild.owner_id != interaction.user.id:
+        await interaction.followup.send("Only the server owner can record the winner.", ephemeral=True)
         return
+    guild_id = interaction.guild_id
     if name not in server_raffles[guild_id]:
         await interaction.followup.send(f"No raffle named **{name}**.", ephemeral=True)
         return
@@ -3142,10 +2939,10 @@ async def slash_raffle_winner(interaction: discord.Interaction, name: str, spot:
 @discord.app_commands.describe(name="Raffle name")
 async def slash_raffle_cancel(interaction: discord.Interaction, name: str):
     await interaction.response.defer(ephemeral=True)
-    guild_id = interaction.guild_id
-    if not (interaction.guild.owner_id == interaction.user.id or is_manager(guild_id, interaction.user.id)):
-        await interaction.followup.send("Only server managers can do this.", ephemeral=True)
+    if interaction.guild.owner_id != interaction.user.id:
+        await interaction.followup.send("Only the server owner can cancel raffles.", ephemeral=True)
         return
+    guild_id = interaction.guild_id
     if name not in server_raffles[guild_id]:
         await interaction.followup.send(f"No raffle named **{name}**.", ephemeral=True)
         return
@@ -3261,7 +3058,7 @@ async def slash_raffle_release(interaction: discord.Interaction, name: str):
     released = []
     for num in user_spots:
         if not raffle["slots"][num]["paid"]:
-            raffle["slots"][num] = {"user_id": None, "username": None, "paid": False, "locked": False}
+            raffle["slots"][num] = {"user_id": None, "username": None, "paid": False}
             await _db_save_slot(guild_id, name, num)
             released.append(num)
 
@@ -3318,10 +3115,13 @@ async def slash_raffle_swap(
 ):
     await interaction.response.defer(ephemeral=True)
 
-    guild_id = interaction.guild_id
-    if not (interaction.guild.owner_id == interaction.user.id or is_manager(guild_id, interaction.user.id)):
-        await interaction.followup.send("Only server managers can do this.", ephemeral=True)
+    if interaction.guild.owner_id != interaction.user.id:
+        await interaction.followup.send(
+            "Only the server owner can swap raffle spots.", ephemeral=True
+        )
         return
+
+    guild_id = interaction.guild_id
 
     if name not in server_raffles.get(guild_id, {}):
         await interaction.followup.send(f"No raffle named **{name}**.", ephemeral=True)
@@ -3352,7 +3152,7 @@ async def slash_raffle_swap(
     if user is None:
         # Clear the spot
         old_user_id = current_slot.get("user_id")
-        raffle["slots"][spot] = {"user_id": None, "username": None, "paid": False, "locked": False}
+        raffle["slots"][spot] = {"user_id": None, "username": None, "paid": False}
         await _db_save_slot(guild_id, name, spot)
 
         # Reopen raffle if it was closed
@@ -3396,8 +3196,7 @@ async def slash_raffle_swap(
         raffle["slots"][spot] = {
             "user_id":  user.id,
             "username": str(user),
-            "paid":     False,
-            "locked":   False,
+            "paid":     False,  # reset paid status on swap
         }
         await _db_save_slot(guild_id, name, spot)
 
@@ -3452,10 +3251,13 @@ async def slash_raffle_swap(
 async def slash_raffle_close(interaction: discord.Interaction, name: str):
     await interaction.response.defer(ephemeral=True)
 
-    guild_id = interaction.guild_id
-    if not (interaction.guild.owner_id == interaction.user.id or is_manager(guild_id, interaction.user.id)):
-        await interaction.followup.send("Only server managers can do this.", ephemeral=True)
+    if interaction.guild.owner_id != interaction.user.id:
+        await interaction.followup.send(
+            "Only the server owner can close raffles.", ephemeral=True
+        )
         return
+
+    guild_id = interaction.guild_id
 
     if name not in server_raffles.get(guild_id, {}):
         await interaction.followup.send(f"No raffle named **{name}**.", ephemeral=True)
@@ -3507,9 +3309,10 @@ async def slash_raffle_sethost(
 ):
     await interaction.response.defer(ephemeral=True)
 
-    guild_id = interaction.guild_id
-    if not (interaction.guild.owner_id == interaction.user.id or is_manager(guild_id, interaction.user.id)):
-        await interaction.followup.send("Only server managers can do this.", ephemeral=True)
+    if interaction.guild.owner_id != interaction.user.id:
+        await interaction.followup.send(
+            "Only the server owner can configure raffle hosts.", ephemeral=True
+        )
         return
 
     if host not in (1, 2):
@@ -3518,6 +3321,7 @@ async def slash_raffle_sethost(
         )
         return
 
+    guild_id = interaction.guild_id
     raffle_hosts[guild_id][host] = {
         "name":     name,
         "venmo":    venmo    or None,
@@ -3539,132 +3343,6 @@ async def slash_raffle_sethost(
         "✅  Host saved:\n" + "\n".join(lines),
         ephemeral=True
     )
-
-@raffle_group.command(
-    name="lock",
-    description="Lock spots for a mini round — prevents regular button claims on those spots",
-)
-@discord.app_commands.describe(
-    name  = "Name of the raffle",
-    spots = "Spot numbers to lock, e.g. '3 5 7' or '3,5,7'",
-)
-@discord.app_commands.autocomplete(name=_raffle_name_autocomplete)
-async def slash_raffle_lock(interaction: discord.Interaction, name: str, spots: str):
-    await interaction.response.defer(ephemeral=True)
-    if interaction.guild.owner_id != interaction.user.id:
-        await interaction.followup.send("Only the server owner can lock raffle spots.", ephemeral=True)
-        return
-    guild_id = interaction.guild_id
-    if name not in server_raffles.get(guild_id, {}):
-        await interaction.followup.send(f"No raffle named **{name}**.", ephemeral=True)
-        return
-    raffle = server_raffles[guild_id][name]
-
-    spot_nums = []
-    for token in spots.replace(",", " ").split():
-        try:
-            spot_nums.append(int(token))
-        except ValueError:
-            pass
-    if not spot_nums:
-        await interaction.followup.send(
-            "Couldn't parse spot numbers. Use e.g. `3 5 7` or `3,5,7`.", ephemeral=True
-        )
-        return
-
-    locked, skipped = [], []
-    for n in spot_nums:
-        if n not in raffle["slots"]:
-            skipped.append(f"#{n} (doesn't exist)")
-            continue
-        slot = raffle["slots"][n]
-        if slot["user_id"] is not None:
-            skipped.append(f"#{n} (already claimed by {slot['username'][:12]})")
-            continue
-        if slot.get("locked"):
-            skipped.append(f"#{n} (already locked)")
-            continue
-        raffle["slots"][n]["locked"] = True
-        await _db_save_slot(guild_id, name, n)
-        locked.append(n)
-
-    if locked:
-        channel = bot.get_channel(raffle["channel_id"])
-        if channel and raffle["message_id"]:
-            try:
-                msg  = await channel.fetch_message(raffle["message_id"])
-                await msg.edit(embed=_raffle_embed(name, raffle), view=_build_raffle_view(guild_id, name, raffle))
-            except (discord.NotFound, discord.HTTPException):
-                pass
-
-    parts = []
-    if locked:
-        parts.append(f"🔒 Locked: {', '.join(f'#{n}' for n in sorted(locked))}")
-    if skipped:
-        parts.append(f"⚠️ Skipped: {', '.join(skipped)}")
-    await interaction.followup.send("\n".join(parts) or "Nothing was locked.", ephemeral=True)
-
-
-@raffle_group.command(
-    name="unlock",
-    description="Unlock spots previously reserved for a mini round, returning them to the open pool",
-)
-@discord.app_commands.describe(
-    name  = "Name of the raffle",
-    spots = "Spot numbers to unlock, e.g. '3 5 7' or '3,5,7'",
-)
-@discord.app_commands.autocomplete(name=_raffle_name_autocomplete)
-async def slash_raffle_unlock(interaction: discord.Interaction, name: str, spots: str):
-    await interaction.response.defer(ephemeral=True)
-    if interaction.guild.owner_id != interaction.user.id:
-        await interaction.followup.send("Only the server owner can unlock raffle spots.", ephemeral=True)
-        return
-    guild_id = interaction.guild_id
-    if name not in server_raffles.get(guild_id, {}):
-        await interaction.followup.send(f"No raffle named **{name}**.", ephemeral=True)
-        return
-    raffle = server_raffles[guild_id][name]
-
-    spot_nums = []
-    for token in spots.replace(",", " ").split():
-        try:
-            spot_nums.append(int(token))
-        except ValueError:
-            pass
-    if not spot_nums:
-        await interaction.followup.send(
-            "Couldn't parse spot numbers. Use e.g. `3 5 7` or `3,5,7`.", ephemeral=True
-        )
-        return
-
-    unlocked, skipped = [], []
-    for n in spot_nums:
-        if n not in raffle["slots"]:
-            skipped.append(f"#{n} (doesn't exist)")
-            continue
-        if not raffle["slots"][n].get("locked"):
-            skipped.append(f"#{n} (not locked)")
-            continue
-        raffle["slots"][n]["locked"] = False
-        await _db_save_slot(guild_id, name, n)
-        unlocked.append(n)
-
-    if unlocked:
-        channel = bot.get_channel(raffle["channel_id"])
-        if channel and raffle["message_id"]:
-            try:
-                msg  = await channel.fetch_message(raffle["message_id"])
-                await msg.edit(embed=_raffle_embed(name, raffle), view=_build_raffle_view(guild_id, name, raffle))
-            except (discord.NotFound, discord.HTTPException):
-                pass
-
-    parts = []
-    if unlocked:
-        parts.append(f"🔓 Unlocked: {', '.join(f'#{n}' for n in sorted(unlocked))}")
-    if skipped:
-        parts.append(f"ℹ️ Skipped: {', '.join(skipped)}")
-    await interaction.followup.send("\n".join(parts) or "Nothing was unlocked.", ephemeral=True)
-
 
 # Register slash command group
 bot.tree.add_command(raffle_group)
@@ -3831,5 +3509,342 @@ async def cmd_payments(ctx):
         await ctx.author.send(embed=embed)
     except discord.Forbidden:
         await ctx.send("⚠️  I couldn't DM you — please open your DMs and try again.")
+
+
+@bot.command(name="addtracking")
+async def cmd_addtracking(ctx, *, args=""):
+    """Attach a tracking number to a buyer. Usage: !addtracking @user <tracking#>"""
+    if not ctx.guild:
+        await ctx.author.send("⚠️  Please run `!addtracking` in your server channel.")
+        return
+    guild_id = ctx.guild.id
+    if not is_manager(guild_id, ctx.author.id):
+        return
+    await silent(ctx)
+    if not ctx.message.mentions:
+        await dm(ctx, "Usage: `!addtracking @user <tracking number>`")
+        return
+    user = ctx.message.mentions[0]
+    # Strip the mention from args to get tracking number
+    tracking = args.replace(f"<@{user.id}>", "").replace(f"<@!{user.id}>", "").strip()
+    if not tracking:
+        await dm(ctx, "Usage: `!addtracking @user <tracking number>`\\nExample: `!addtracking @SpacemanG 1Z999AA10123456784`")
+        return
+    tracking_numbers[guild_id][user.id] = tracking
+    await dm(ctx, f"✅  Tracking number **{tracking}** saved for **{user.display_name}**.")
+    # DM the buyer their tracking number
+    try:
+        await user.send(
+            f"📦  Your order has shipped! Here is your tracking number:\\n"
+            f"**{tracking}**\\n\\n"
+            f"You can use `!myhistory` to view your full order history."
+        )
+    except discord.Forbidden:
+        await dm(ctx, f"⚠️  Saved, but couldn't DM **{user.display_name}** — their DMs may be closed.")
+
+
+@bot.command(name="export")
+async def cmd_export(ctx):
+    """Generate and DM an Excel export of the current drop."""
+    if not ctx.guild:
+        await ctx.author.send("⚠️  Please run `!export` in your server channel.")
+        return
+    guild_id = ctx.guild.id
+    if not is_manager(guild_id, ctx.author.id):
+        return
+    await silent(ctx)
+
+    stock_ref  = stock[guild_id]  if stock[guild_id]  else last_drop_snapshot.get(guild_id, {}).get("stock",  {})
+    claims_ref = claims[guild_id] if claims[guild_id] else last_drop_snapshot.get(guild_id, {}).get("claims", {})
+    archived   = archived_payments.get(guild_id, {})
+
+    # ── Styles ────────────────────────────────────────────────────────────────
+    wb = openpyxl.Workbook()
+
+    HEADER_FILL   = PatternFill("solid", fgColor="1E1E2E")
+    HEADER_FONT   = Font(bold=True, color="FFFFFF", size=11)
+    PAID_FILL     = PatternFill("solid", fgColor="D4EDDA")
+    PENDING_FILL  = PatternFill("solid", fgColor="FFF3CD")
+    UNPAID_FILL   = PatternFill("solid", fgColor="F8D7DA")
+    ALT_FILL      = PatternFill("solid", fgColor="F5F5F5")
+    BORDER_SIDE   = Side(style="thin", color="CCCCCC")
+    THIN_BORDER   = Border(left=BORDER_SIDE, right=BORDER_SIDE,
+                           top=BORDER_SIDE, bottom=BORDER_SIDE)
+    CENTER        = Alignment(horizontal="center", vertical="center")
+    LEFT          = Alignment(horizontal="left", vertical="center")
+
+    def style_header_row(ws, row, cols):
+        for col in range(1, cols + 1):
+            cell = ws.cell(row=row, column=col)
+            cell.fill   = HEADER_FILL
+            cell.font   = HEADER_FONT
+            cell.border = THIN_BORDER
+            cell.alignment = CENTER
+
+    def style_data_row(ws, row, cols, fill=None):
+        for col in range(1, cols + 1):
+            cell = ws.cell(row=row, column=col)
+            if fill:
+                cell.fill = fill
+            cell.border = THIN_BORDER
+            cell.alignment = LEFT
+
+    def auto_width(ws, min_width=10, max_width=40):
+        for col in ws.columns:
+            max_len = 0
+            col_letter = get_column_letter(col[0].column)
+            for cell in col:
+                try:
+                    if cell.value:
+                        max_len = max(max_len, len(str(cell.value)))
+                except:
+                    pass
+            ws.column_dimensions[col_letter].width = min(max(max_len + 2, min_width), max_width)
+
+    # ── SHEET 1: Orders ───────────────────────────────────────────────────────
+    ws1 = wb.active
+    ws1.title = "Orders"
+    ws1.freeze_panes = "A2"
+
+    headers1 = ["Buyer", "Item", "Qty", "Unit Price", "Subtotal",
+                 "Total Owed", "Confirmed", "Outstanding", "Status", "Tracking #"]
+    for col, h in enumerate(headers1, 1):
+        ws1.cell(row=1, column=col, value=h)
+    style_header_row(ws1, 1, len(headers1))
+
+    row = 2
+    # Build per-user order data
+    user_totals = {}
+    for key, claim_list in claims_ref.items():
+        if key not in stock_ref:
+            continue
+        for c in claim_list:
+            uid = c["user"].id
+            if uid not in user_totals:
+                user_totals[uid] = {
+                    "name":   c["user"].display_name,
+                    "items":  [],
+                    "owed":   0.0,
+                }
+            subtotal = c["qty"] * stock_ref[key]["price"]
+            user_totals[uid]["items"].append({
+                "display":  stock_ref[key]["display"],
+                "qty":      c["qty"],
+                "price":    stock_ref[key]["price"],
+                "subtotal": subtotal,
+            })
+            user_totals[uid]["owed"] += subtotal
+
+    for uid, udata in user_totals.items():
+        confirmed = sum(p["amount"] for p in payments[guild_id].get(uid, []) if p["confirmed"])
+        outstanding = max(udata["owed"] - confirmed, 0)
+        tracking = tracking_numbers.get(guild_id, {}).get(uid, "")
+        if outstanding <= 0.01 and confirmed > 0:
+            status = "✅ Paid"
+            fill = PAID_FILL
+        elif confirmed > 0:
+            status = "⏳ Partial"
+            fill = PENDING_FILL
+        else:
+            status = "❌ Unpaid"
+            fill = UNPAID_FILL
+
+        first = True
+        for item in udata["items"]:
+            ws1.cell(row=row, column=1, value=udata["name"] if first else "")
+            ws1.cell(row=row, column=2, value=item["display"])
+            ws1.cell(row=row, column=3, value=item["qty"])
+            ws1.cell(row=row, column=4, value=round(item["price"], 2))
+            ws1.cell(row=row, column=5, value=round(item["subtotal"], 2))
+            ws1.cell(row=row, column=6, value=round(udata["owed"], 2) if first else "")
+            ws1.cell(row=row, column=7, value=round(confirmed, 2) if first else "")
+            ws1.cell(row=row, column=8, value=round(outstanding, 2) if first else "")
+            ws1.cell(row=row, column=9, value=status if first else "")
+            ws1.cell(row=row, column=10, value=tracking if first else "")
+            style_data_row(ws1, row, len(headers1), fill)
+            ws1.cell(row=row, column=4).number_format = "$#,##0.00"
+            ws1.cell(row=row, column=5).number_format = "$#,##0.00"
+            if first:
+                ws1.cell(row=row, column=6).number_format = "$#,##0.00"
+                ws1.cell(row=row, column=7).number_format = "$#,##0.00"
+                ws1.cell(row=row, column=8).number_format = "$#,##0.00"
+            first = False
+            row += 1
+
+    auto_width(ws1)
+
+    # ── SHEET 2: Payment Summary ───────────────────────────────────────────────
+    ws2 = wb.create_sheet("Payment Summary")
+    ws2.freeze_panes = "A2"
+
+    headers2 = ["Buyer", "Total Owed", "Confirmed", "Outstanding",
+                 "Payment Methods", "Status", "Tracking #"]
+    for col, h in enumerate(headers2, 1):
+        ws2.cell(row=1, column=col, value=h)
+    style_header_row(ws2, 1, len(headers2))
+
+    row2 = 2
+    for uid, udata in user_totals.items():
+        uid_pmts    = payments[guild_id].get(uid, [])
+        confirmed   = sum(p["amount"] for p in uid_pmts if p["confirmed"])
+        outstanding = max(udata["owed"] - confirmed, 0)
+        methods     = ", ".join(
+            f"{p['method'].title()} ${p['amount']:.2f}"
+            for p in uid_pmts if p["confirmed"]
+        ) or "None"
+        tracking = tracking_numbers.get(guild_id, {}).get(uid, "")
+        if outstanding <= 0.01 and confirmed > 0:
+            status = "✅ Paid"
+            fill = PAID_FILL
+        elif confirmed > 0:
+            status = "⏳ Partial"
+            fill = PENDING_FILL
+        else:
+            status = "❌ Unpaid"
+            fill = UNPAID_FILL
+
+        ws2.cell(row=row2, column=1, value=udata["name"])
+        ws2.cell(row=row2, column=2, value=round(udata["owed"], 2))
+        ws2.cell(row=row2, column=3, value=round(confirmed, 2))
+        ws2.cell(row=row2, column=4, value=round(outstanding, 2))
+        ws2.cell(row=row2, column=5, value=methods)
+        ws2.cell(row=row2, column=6, value=status)
+        ws2.cell(row=row2, column=7, value=tracking)
+        style_data_row(ws2, row2, len(headers2), fill)
+        for col in [2, 3, 4]:
+            ws2.cell(row=row2, column=col).number_format = "$#,##0.00"
+        row2 += 1
+
+    # Totals row
+    if user_totals:
+        ws2.cell(row=row2, column=1, value="TOTAL")
+        ws2.cell(row=row2, column=1).font = Font(bold=True)
+        total_owed = sum(u["owed"] for u in user_totals.values())
+        total_conf = sum(
+            sum(p["amount"] for p in payments[guild_id].get(uid, []) if p["confirmed"])
+            for uid in user_totals
+        )
+        ws2.cell(row=row2, column=2, value=round(total_owed, 2))
+        ws2.cell(row=row2, column=3, value=round(total_conf, 2))
+        ws2.cell(row=row2, column=4, value=round(max(total_owed - total_conf, 0), 2))
+        for col in [2, 3, 4]:
+            ws2.cell(row=row2, column=col).number_format = "$#,##0.00"
+            ws2.cell(row=row2, column=col).font = Font(bold=True)
+        style_data_row(ws2, row2, len(headers2))
+
+    auto_width(ws2)
+
+    # ── SHEET 3: Raffles ──────────────────────────────────────────────────────
+    ws3 = wb.create_sheet("Raffles")
+    ws3.freeze_panes = "A2"
+
+    headers3 = ["Raffle Name", "Spot #", "Buyer", "Price", "Paid", "Host"]
+    for col, h in enumerate(headers3, 1):
+        ws3.cell(row=1, column=col, value=h)
+    style_header_row(ws3, 1, len(headers3))
+
+    row3 = 2
+    for r_name, raffle in server_raffles.get(guild_id, {}).items():
+        host_num  = raffle.get("host_num", 0)
+        host_data = raffle_hosts.get(guild_id, {}).get(host_num, {})
+        host_name = host_data.get("name", "Server Default") if host_num in (1, 2) else "Server Default"
+        for spot_num in sorted(raffle["slots"].keys()):
+            s    = raffle["slots"][spot_num]
+            fill = PAID_FILL if s["paid"] else (PENDING_FILL if s["user_id"] else ALT_FILL)
+            ws3.cell(row=row3, column=1, value=r_name)
+            ws3.cell(row=row3, column=2, value=spot_num)
+            ws3.cell(row=row3, column=3, value=s["username"] or "Open")
+            ws3.cell(row=row3, column=4, value=raffle["price"])
+            ws3.cell(row=row3, column=5, value="✅ Yes" if s["paid"] else ("⏳ Pending" if s["user_id"] else "Open"))
+            ws3.cell(row=row3, column=6, value=host_name)
+            style_data_row(ws3, row3, len(headers3), fill)
+            row3 += 1
+
+    auto_width(ws3)
+
+    # ── SHEET 4: Previous Drop ────────────────────────────────────────────────
+    arch_claims_data = archived.get("claims", {})
+    arch_stock_data  = archived.get("stock",  {})
+    arch_pmts_data   = archived.get("payments", {})
+
+    if arch_claims_data:
+        ws4 = wb.create_sheet("Previous Drop")
+        ws4.freeze_panes = "A2"
+
+        headers4 = ["Buyer", "Item", "Qty", "Unit Price", "Subtotal",
+                     "Total Owed", "Confirmed", "Outstanding", "Status"]
+        for col, h in enumerate(headers4, 1):
+            ws4.cell(row=1, column=col, value=h)
+        style_header_row(ws4, 1, len(headers4))
+
+        arch_user_totals = {}
+        for key, claim_list in arch_claims_data.items():
+            if key not in arch_stock_data:
+                continue
+            for c in claim_list:
+                uid = c["user"].id
+                if uid not in arch_user_totals:
+                    arch_user_totals[uid] = {
+                        "name":  c["user"].display_name,
+                        "items": [],
+                        "owed":  0.0,
+                    }
+                subtotal = c["qty"] * arch_stock_data[key]["price"]
+                arch_user_totals[uid]["items"].append({
+                    "display":  arch_stock_data[key]["display"],
+                    "qty":      c["qty"],
+                    "price":    arch_stock_data[key]["price"],
+                    "subtotal": subtotal,
+                })
+                arch_user_totals[uid]["owed"] += subtotal
+
+        row4 = 2
+        for uid, udata in arch_user_totals.items():
+            confirmed   = sum(p["amount"] for p in arch_pmts_data.get(uid, []) if p["confirmed"])
+            outstanding = max(udata["owed"] - confirmed, 0)
+            if outstanding <= 0.01 and confirmed > 0:
+                status = "✅ Paid"
+                fill = PAID_FILL
+            elif confirmed > 0:
+                status = "⏳ Partial"
+                fill = PENDING_FILL
+            else:
+                status = "❌ Unpaid"
+                fill = UNPAID_FILL
+            first = True
+            for item in udata["items"]:
+                ws4.cell(row=row4, column=1, value=udata["name"] if first else "")
+                ws4.cell(row=row4, column=2, value=item["display"])
+                ws4.cell(row=row4, column=3, value=item["qty"])
+                ws4.cell(row=row4, column=4, value=round(item["price"], 2))
+                ws4.cell(row=row4, column=5, value=round(item["subtotal"], 2))
+                ws4.cell(row=row4, column=6, value=round(udata["owed"], 2) if first else "")
+                ws4.cell(row=row4, column=7, value=round(confirmed, 2) if first else "")
+                ws4.cell(row=row4, column=8, value=round(outstanding, 2) if first else "")
+                ws4.cell(row=row4, column=9, value=status if first else "")
+                style_data_row(ws4, row4, len(headers4), fill)
+                first = False
+                row4 += 1
+        auto_width(ws4)
+
+    # ── Save to bytes and DM ──────────────────────────────────────────────────
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    guild   = ctx.guild
+    date_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+    filename = f"VaultDrop_{guild.name.replace(' ', '_')}_{date_str}.xlsx"
+
+    try:
+        await ctx.author.send(
+            f"📊  **Drop Export — {guild.name}** ({date_str})\\n"
+            f"Sheets: Orders | Payment Summary | Raffles"
+            + (" | Previous Drop" if arch_claims_data else ""),
+            file=discord.File(buf, filename=filename)
+        )
+    except discord.Forbidden:
+        await ctx.send("⚠️  I couldn\\'t DM you the file — please open your DMs and try again.")
+
 
 bot.run(BOT_TOKEN)
