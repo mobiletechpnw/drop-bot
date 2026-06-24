@@ -1,54 +1,90 @@
 """
 Vault & Pine Drop Bot
 =====================
+
 Setup (first time in a new server):
   !setup                           — Register yourself as admin, set drop channel + payment info
 
-Admin only:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ADMIN ONLY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   !addmanager @user                — Grant manager role
   !removemanager @user             — Revoke manager role
   !managers                        — List admin and managers
   !setpayment                      — Update payment info
   !setdropchannel #channel         — Update drop channel
 
-Creator only (DM the bot):
-  !creator servers                 — List all servers the bot is in
-  !creator info <guild_id>         — See a server's settings, admin, and managers
-  !creator setpayment <guild_id>   — Update payment info for a server
-  !creator setdropchannel <guild_id> <#channel_id> — Update drop channel for a server
-  !creator resetadmin <guild_id> @user — Reassign the admin for a server
-  !creator announce <guild_id> <message> — Post an announcement in a server's drop channel
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CREATOR ONLY (DM the bot)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  !creator servers                              — List all servers the bot is in
+  !creator info <guild_id>                      — See a server settings, admin, and managers
+  !creator setpayment <guild_id>                — Update payment info for a server
+  !creator setdropchannel <guild_id> <chan_id>  — Update drop channel for a server
+  !creator resetadmin <guild_id> <user_id>      — Reassign the admin for a server
+  !creator announce <guild_id> <message>        — Post announcement in a server drop channel
 
-Manager/Admin commands (server or DM after !drop):
-  !drop                            — Start a new drop session (must run in server)
-  !addstock <item> <qty> <price> [limit <n>]
-  !editstock <item> <qty> <price>
-  !removestockitem <item>
-  !preview
-  !countdown <minutes>
-  !release
-  !autoclose on/off
-  !claimlist
-  !unpaid                          — List buyers who haven't been confirmed yet
-  !paymentboard                    — Post or refresh the live payment board
-  !payments                        — Full payment summary across all drops and raffles (DM)
-  !confirm @user                   — Mark a buyer as fully paid
-  !bump @user                      — DM a buyer a payment reminder
-  !remind                          — Tag all unpaid buyers in the drop channel
-  !announce <message>              — Post a formatted announcement in the drop channel
-  !history                         — View last 10 drop summaries
-  !export                          — Generate Excel spreadsheet of current drop (orders, payments, raffles)
-  !addtracking @user <tracking#>  — Attach a tracking number to a buyer's order
-  !enddrop
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MANAGER / ADMIN COMMANDS (server or DM after !drop)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Drop lifecycle:
+    !drop                            — Start a new drop session (must run in server)
+    !addstock <item> <qty> <price> [limit <n>]  — Add an item to the drop
+    !editstock <item> <qty> <price>  — Edit an existing stock item
+    !removestockitem <item>          — Remove an item from stock
+    !preview                         — Preview the stock embed (DM)
+    !countdown <minutes>             — Post a countdown and auto-release at end
+    !release                         — Go live — posts stock, claim list, payment boards
+    !autoclose on/off                — Toggle auto-close when all items claimed
+    !enddrop                         — Close the drop and send order summaries
 
-Public commands (anyone, in server only):
-  !claim <item> <qty>
-  !unclaim <item> <qty>
-  !waitlist <item>
-  !paid <method> <amount>          — works during and after drop
-  !stock
-  !myclaims
-  !myhistory                       — View your personal claim history across all drops (going forward from deployment)
+  During a drop:
+    !claimlist                       — DM the full claim list with payment status
+    !unpaid                          — DM a list of buyers who still owe
+    !confirm @user                   — Mark a buyer as fully paid
+    !bump @user                      — DM a buyer a payment reminder
+    !remind                          — Ping all unpaid buyers in the drop channel
+    !announce <message>              — Post a formatted announcement in the drop channel
+    !paymentboard                    — Post or refresh the live payment board
+
+  Reporting & tracking:
+    !payments                        — Full payment summary across all drops and raffles (DM)
+    !history                         — View last 10 drop summaries (DM)
+    !export                          — Generate Excel spreadsheet: orders, payments, raffles (DM)
+    !addtracking @user <tracking#>   — Attach a tracking number and notify the buyer
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PUBLIC COMMANDS (anyone, in server only)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  !claim <item> <qty>              — Claim an item (first come first served)
+  !unclaim <item> <qty>            — Release a claim
+  !waitlist <item>                 — Join waitlist for a sold out item
+  !paid <method> <amount>          — Report a payment (venmo/zelle/cashapp/applepay)
+  !stock                           — See what is available
+  !myclaims                        — See your current drop claims and total
+  !myhistory                       — View your personal claim history across all past drops
+  !help                            — Show a quick reference of buyer commands
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RAFFLE COMMANDS — OWNER ONLY (slash)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  /raffle setchannel #channel      — Set the raffle channel (one-time setup)
+  /raffle sethost 1|2 <name> ...   — Configure payment info for Host 1 or Host 2
+  /raffle create <name> <spots> <price> [host] — Create a raffle with button UI
+  /raffle confirm <name> @user     — Confirm a user payment (owner or manager)
+  /raffle wheel <name> [force]     — Get Wheel of Names entry list for live spin
+  /raffle winner <name> <spot>     — Record the winner and mark raffle complete
+  /raffle swap <name> <spot> [@user] — Reassign or clear a spot
+  /raffle cancel <name>            — Cancel and remove a raffle entirely
+  /raffle close <name>             — Archive a completed raffle (removes from active list)
+  /raffle status <name>            — Show current raffle state (ephemeral)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RAFFLE COMMANDS — PUBLIC (slash)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  /raffles                         — List all active raffles
+  /raffle release <name>           — Release your own unclaimed spot back to open
+  Spot claiming is button-based — no commands needed, just tap the button!
 """
 
 import discord
@@ -3597,7 +3633,7 @@ async def cmd_export(ctx):
                 try:
                     if cell.value:
                         max_len = max(max_len, len(str(cell.value)))
-                except:
+                except (TypeError, AttributeError):
                     pass
             ws.column_dimensions[col_letter].width = min(max(max_len + 2, min_width), max_width)
 
