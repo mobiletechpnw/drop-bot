@@ -1728,7 +1728,11 @@ async def cmd_claim(ctx, *, args=""):
         return
 
     # ── EASTER EGGS ────────────────────────────────────────────────
-    if args.strip().lower() == "all":
+    lowered = args.strip().lower()
+    # Strip surrounding punctuation/whitespace for phrase matching
+    normalized_phrase = " ".join(lowered.replace("!", " ").replace(".", " ").split())
+
+    if lowered == "all":
         oak_response = (
             "🔴  *Oak's words echoed: "
             "'There's a time and place for everything, but not now.' "
@@ -1743,7 +1747,29 @@ async def cmd_claim(ctx, *, args=""):
         await ctx.send(random.choice(responses))
         return
 
-    if "luck" in args.lower():
+    # Greedy "one of each / one of every / all the things" attempts
+    GREEDY_PHRASES = (
+        "one of each", "1 of each", "one of every", "1 of every",
+        "one of everything", "one of all", "each of them", "each one",
+        "of each", "of every", "everything", "every item", "all items",
+        "all of them", "all of it", "all of the", "all the", "the lot",
+        "whole drop", "entire drop", "the drop", "gimme all", "give me all",
+        "one each", "1 each", "two of each", "2 of each",
+    )
+    if any(phrase in normalized_phrase for phrase in GREEDY_PHRASES):
+        greedy_responses = [
+            "🐷  Whoa there, Snorlax. You can't `!claim one of each` — claim items one at a time: `!claim <item> <qty>`.",
+            "🎒  Your bag is full! Trainers grab one item at a time around here. Use `!claim <item> <qty>`.",
+            "🚫  *That's not how the PokéMart works.* No bulk grabs — `!claim <item> <qty>`, please.",
+            "🤑  Nice try, but the whole drop isn't a single Poké Ball. Claim items individually: `!claim <item> <qty>`.",
+            "🛑  Officer Jenny pulled you over for greedy driving. One claim at a time: `!claim <item> <qty>`.",
+            "😼  Team Rocket would be proud, but no — you've gotta `!claim <item> <qty>` for each thing you want.",
+            "📦  *Wild GREED appeared!* It fled when it saw the rules. Claim one item at a time: `!claim <item> <qty>`.",
+        ]
+        await ctx.send(random.choice(greedy_responses))
+        return
+
+    if "luck" in lowered:
         await ctx.send(
             "🎰  Even Arceus couldn't find *luck* in this drop. "
             "It's not in stock. Check `!stock` for what's real."
@@ -1762,6 +1788,15 @@ async def cmd_claim(ctx, *, args=""):
         return
     if qty < 1:
         await ctx.send("⚠️  Qty must be at least 1.")
+        return
+    if qty >= 1000:
+        absurd_responses = [
+            f"🪙  **{qty}**? That's more than Bill's PC can hold. Try a real number: `!claim <item> <qty>`.",
+            f"🐉  Even a Wailord can't carry **{qty}** of these. Dial it back a bit.",
+            f"💸  *Trainer wants to claim {qty}.* The Game Corner has a limit, you know. Pick a sane qty.",
+            f"🤖  ERROR: **{qty}** exceeds the laws of this universe. Claim a believable amount instead.",
+        ]
+        await ctx.send(random.choice(absurd_responses))
         return
     key = normalize(item_name)
     if key not in stock[guild_id]:
