@@ -77,21 +77,38 @@ the env var.
 
 ## Deploying on Railway (two services, one database)
 
-The repo's `Procfile` defines two process types:
+This repo runs as **two services from the same codebase** — the Discord bot and
+the web dashboard. Each service is driven by its own Railway config file so their
+start commands stay independent:
 
-```
-worker: python -u drop_bot.py                                   # the Discord bot
-web:    uvicorn webapp:app --host 0.0.0.0 --port $PORT          # the dashboard
-```
+- `railway.toml` → the **bot** (`python -u drop_bot.py`) — your existing service,
+  unchanged.
+- `railway.web.toml` → the **web dashboard**
+  (`uvicorn webapp:app --host 0.0.0.0 --port $PORT`).
 
-1. Keep your existing service running the **bot** (`worker`).
-2. Add a **second service** in the same Railway project from the same repo, and
-   set its start command to:
-   `uvicorn webapp:app --host 0.0.0.0 --port $PORT`
-3. Give the web service the shared Postgres variables (reference the same
-   Postgres plugin) plus `WEB_SECRET`. Optionally set `WEB_BASE_URL` on the bot
-   service to the web service's public URL so `!webkey` links straight to login.
-4. Expose the web service publicly (Railway → Settings → Generate Domain).
+Steps:
+
+1. Leave your existing **bot** service as-is (it already uses `railway.toml`).
+2. **Add a second service** in the same Railway project from the same repo.
+3. Point it at its config: web service → **Settings → Config-as-code /
+   "Railway Config File"** → set to `railway.web.toml`.
+4. Give the web service the shared Postgres variable (Variables → Add Reference →
+   point `DATABASE_URL` at the Postgres plugin) plus `WEB_SECRET` and, for
+   creator oversight, `CREATOR_WEB_KEY`. Keep `WEB_SECURE_COOKIES=true`.
+5. Expose the web service publicly (Settings → Networking → Generate Domain).
+6. Optionally set `WEB_BASE_URL` on the **bot** service to the web service's
+   public URL so `!webkey` links straight to the login page.
+
+> Why two config files? A `startCommand` in `railway.toml` takes precedence over
+> a service's dashboard setting, so it would force *both* services to run the same
+> process. Giving the web service its own config file avoids that and leaves the
+> bot service completely untouched.
+
+Generate the secrets with:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
 
 Both services share the one database, so records stay in sync. The bot picks up
 web config changes within ~60s; tracking edits are visible to the bot
