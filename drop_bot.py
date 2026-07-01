@@ -51,7 +51,7 @@ MANAGER / ADMIN COMMANDS (server or DM after !drop)
     !payments                        — Full payment summary across all drops and raffles (DM)
     !history                         — View last 10 drop summaries (DM)
     !export                          — Generate Excel spreadsheet: orders, payments, raffles (DM)
-    !addtracking @user <tracking#>   — Attach a tracking number and notify the buyer
+    !addtracking @user [drop #] <tracking#> — Attach tracking (defaults to their latest drop) and notify the buyer
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PUBLIC COMMANDS (anyone, in server only)
@@ -96,6 +96,7 @@ import io
 import json
 import os
 import random
+import re
 import asyncpg
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -356,27 +357,49 @@ async def db_update_user_claim_confirmed(guild_id, user_id):
         """, guild_id, user_id)
 
 
-async def db_set_user_claim_tracking(guild_id, user_id, tracking):
-    """Attach a tracking number to a buyer's most recent drop.
+async def db_set_user_claim_tracking(guild_id, user_id, tracking, drop_number=None):
+    """Attach a tracking number to one of a buyer's drops.
 
     Tracking is stored per drop in user_claims so it becomes a permanent
-    part of the buyer's order history. Returns the drop_number the tracking
-    was attached to, or None if the buyer has no saved claims yet.
+    part of the buyer's order history. If drop_number is None the buyer's
+    most recent drop is used. Returns the drop_number the tracking was
+    attached to, or None if the buyer has no saved claims in that drop.
     """
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT MAX(drop_number) AS dn FROM user_claims
-            WHERE guild_id = $1 AND user_id = $2
-        """, guild_id, user_id)
-        if not row or row["dn"] is None:
-            return None
-        dn = row["dn"]
+        if drop_number is None:
+            row = await conn.fetchrow("""
+                SELECT MAX(drop_number) AS dn FROM user_claims
+                WHERE guild_id = $1 AND user_id = $2
+            """, guild_id, user_id)
+            if not row or row["dn"] is None:
+                return None
+            dn = row["dn"]
+        else:
+            row = await conn.fetchrow("""
+                SELECT 1 FROM user_claims
+                WHERE guild_id = $1 AND user_id = $2 AND drop_number = $3
+                LIMIT 1
+            """, guild_id, user_id, drop_number)
+            if not row:
+                return None
+            dn = drop_number
         await conn.execute("""
             UPDATE user_claims
             SET tracking = $3
             WHERE guild_id = $1 AND user_id = $2 AND drop_number = $4
         """, guild_id, user_id, tracking, dn)
         return dn
+
+
+async def db_get_user_drop_numbers(guild_id, user_id):
+    """List of drop numbers a buyer has saved orders in (ascending)."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT DISTINCT drop_number FROM user_claims
+            WHERE guild_id = $1 AND user_id = $2
+            ORDER BY drop_number
+        """, guild_id, user_id)
+    return [r["drop_number"] for r in rows]
 
 
 async def db_get_drop_count(guild_id):
@@ -3638,7 +3661,11 @@ async def cmd_payments(ctx):
 
 @bot.command(name="addtracking")
 async def cmd_addtracking(ctx, *, args=""):
-    """Attach a tracking number to a buyer. Usage: !addtracking @user <tracking#>"""
+    """Attach a tracking number to a buyer.
+
+    Usage: !addtracking @user [drop <#>] <tracking#>
+    Defaults to the buyer's most recent drop if no drop is given.
+    """
     if not ctx.guild:
         await ctx.author.send("⚠️  Please run `!addtracking` in your server channel.")
         return
@@ -3647,23 +3674,55 @@ async def cmd_addtracking(ctx, *, args=""):
         return
     await silent(ctx)
     if not ctx.message.mentions:
-        await dm(ctx, "Usage: `!addtracking @user <tracking number>`")
+        await dm(ctx, "Usage: `!addtracking @user [drop <#>] <tracking number>`")
         return
     user = ctx.message.mentions[0]
-    # Strip the mention from args to get tracking number
-    tracking = args.replace(f"<@{user.id}>", "").replace(f"<@!{user.id}>", "").strip()
+    # Strip the mention from args to get the rest
+    rest = args.replace(f"<@{user.id}>", "").replace(f"<@!{user.id}>", "").strip()
+
+    # Optional leading drop specifier: "drop 7", "drop #7", "#7", or "d7"
+    requested_drop = None
+    m = re.match(r"^\s*(?:drop\s*#?|d|#)\s*(\d+)\s+(.*)$", rest, re.IGNORECASE)
+    if m:
+        requested_drop = int(m.group(1))
+        tracking = m.group(2).strip()
+    else:
+        tracking = rest
+
     if not tracking:
-        await dm(ctx, "Usage: `!addtracking @user <tracking number>`\\nExample: `!addtracking @SpacemanG 1Z999AA10123456784`")
-        return
-    # Persist the tracking number to the buyer's most recent drop in the DB so
-    # it becomes a permanent part of their order history (survives restarts).
-    drop_no = await db_set_user_claim_tracking(guild_id, user.id, tracking)
-    if drop_no is None:
         await dm(
             ctx,
-            f"⚠️  **{user.display_name}** has no saved orders yet, so there's nothing to "
-            f"attach tracking to. Orders are saved once a drop closes (`!enddrop`)."
+            "Usage: `!addtracking @user [drop <#>] <tracking number>`\n"
+            "Examples:\n"
+            "• `!addtracking @SpacemanG 1Z999AA10123456784` (most recent drop)\n"
+            "• `!addtracking @SpacemanG drop 7 1Z999AA10123456784`"
         )
+        return
+    # Persist the tracking number to the chosen drop in the DB so it becomes a
+    # permanent part of the buyer's order history (survives restarts).
+    drop_no = await db_set_user_claim_tracking(guild_id, user.id, tracking, requested_drop)
+    if drop_no is None:
+        if requested_drop is not None:
+            drops = await db_get_user_drop_numbers(guild_id, user.id)
+            if drops:
+                have = ", ".join(f"#{d}" for d in drops)
+                await dm(
+                    ctx,
+                    f"⚠️  **{user.display_name}** has no order in **Drop #{requested_drop}**. "
+                    f"They have orders in: {have}."
+                )
+            else:
+                await dm(
+                    ctx,
+                    f"⚠️  **{user.display_name}** has no saved orders yet. "
+                    f"Orders are saved once a drop closes (`!enddrop`)."
+                )
+        else:
+            await dm(
+                ctx,
+                f"⚠️  **{user.display_name}** has no saved orders yet, so there's nothing to "
+                f"attach tracking to. Orders are saved once a drop closes (`!enddrop`)."
+            )
         return
     await dm(
         ctx,
