@@ -48,6 +48,31 @@ buyer in that drop who has a saved tracking number, using the same outbox. Use
 it to (re)deliver tracking for a whole drop at once; buyers get the same message
 as `!addtracking`.
 
+## Paid / unpaid status — how it syncs with Discord
+
+Marking an order **paid** or **unpaid** on the dashboard and doing it in Discord
+both read and write the **same database column** (`user_claims.confirmed`), so
+the two stay in sync automatically — there is no separate copy to drift:
+
+- Dashboard **Mark paid** / **Undo** (and **Mark all paid**) set that column
+  `TRUE` / `FALSE` for the buyer's rows in that drop.
+- On Discord, `!myhistory` reads the column **fresh from the database every
+  time**, so a dashboard change shows up the next time it's run. Excel exports
+  read the same column.
+- It works the other way too: `!markpaid` / `!confirm` in Discord write the
+  same column the dashboard reads.
+
+Drop numbers line up on both sides (both are 1-based by close order), so
+"Drop #13" on the dashboard is the buyer's Drop #13.
+
+**This applies to *closed* drops only** — which is all the dashboard shows. A
+drop that is **currently live** is not in the database yet: its claims and
+payment status live in the bot's memory until the drop closes (`!enddrop`), at
+which point the final paid status is snapshotted into `user_claims`. So while a
+drop is live, confirm payments in Discord (`!markpaid` / `!confirm` / `!paid`);
+the dashboard has nothing to edit for that drop until it closes, and then it
+stays in sync as described above.
+
 ## Signing in
 
 Auth is a **per-server access key**. In Discord, a manager runs:
