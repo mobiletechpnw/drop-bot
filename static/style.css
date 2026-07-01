@@ -112,6 +112,9 @@ td .inline { margin-top: 6px; }
 .pill { display: inline-block; padding: 2px 9px; border-radius: 20px; font-size: .78rem; }
 .pill.ok { background: rgba(67,181,129,.18); color: var(--ok); }
 .pill.warn { background: rgba(250,166,26,.18); color: var(--warn); }
+.pill.small { padding: 1px 7px; font-size: .72rem; margin-top: 4px; }
+
+tr.inactive-row { opacity: .65; }
 
 .alert { padding: 10px 14px; border-radius: 8px; margin: 14px 0; font-size: .9rem; }
 .alert.ok { background: rgba(67,181,129,.15); color: var(--ok); border: 1px solid rgba(67,181,129,.3); }

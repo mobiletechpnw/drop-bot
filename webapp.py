@@ -62,6 +62,12 @@ async def ensure_schema(pool):
         "ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS web_access_key TEXT",
         "ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS guild_name TEXT",
         "ALTER TABLE user_claims ADD COLUMN IF NOT EXISTS tracking TEXT",
+        """CREATE TABLE IF NOT EXISTS bot_guilds (
+               guild_id   BIGINT PRIMARY KEY,
+               guild_name TEXT,
+               active     BOOLEAN NOT NULL DEFAULT TRUE,
+               last_seen  TIMESTAMP NOT NULL DEFAULT NOW()
+           )""",
     ]
     async with pool.acquire() as conn:
         for stmt in statements:
@@ -241,28 +247,41 @@ async def admin_overview(request: Request):
             """SELECT guild_id, COALESCE(SUM(subtotal), 0) AS outstanding
                FROM user_claims WHERE confirmed = FALSE GROUP BY guild_id"""
         )
+        presence = await conn.fetch(
+            "SELECT guild_id, guild_name, active FROM bot_guilds"
+        )
     names = {r["guild_id"]: r["guild_name"] for r in settings}
     agg_map = {r["guild_id"]: r for r in agg}
     out_map = {r["guild_id"]: float(r["outstanding"]) for r in outstanding}
+    presence_map = {r["guild_id"]: r for r in presence}
 
     stores = []
-    for gid in set(names) | set(agg_map) | set(out_map):
+    for gid in set(names) | set(agg_map) | set(out_map) | set(presence_map):
         a = agg_map.get(gid)
+        p = presence_map.get(gid)
+        # Bot presence is only confirmed by an explicit active=TRUE row,
+        # written on join and reconciled on every startup. No row at all
+        # (data predates this feature) is treated the same as "left" —
+        # we can't confirm the bot is still there.
+        bot_present = bool(p and p["active"])
+        display_name = names.get(gid) or (p["guild_name"] if p else None) or str(gid)
         stores.append({
             "guild_id": gid,
-            "name": names.get(gid) or str(gid),
+            "name": display_name,
             "drops": a["drops"] if a else 0,
             "revenue": float(a["revenue"]) if a else 0.0,
             "items": a["items"] if a else 0,
             "buyers": a["buyers"] if a else 0,
             "last_drop": a["last_drop"] if a else None,
             "outstanding": out_map.get(gid, 0.0),
+            "bot_present": bot_present,
         })
     stores.sort(
         key=lambda s: s["last_drop"] or datetime.datetime.min, reverse=True
     )
     totals = {
         "stores": len(stores),
+        "active_stores": sum(1 for s in stores if s["bot_present"]),
         "drops": sum(s["drops"] for s in stores),
         "revenue": sum(s["revenue"] for s in stores),
         "outstanding": sum(s["outstanding"] for s in stores),

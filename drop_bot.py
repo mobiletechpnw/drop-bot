@@ -231,6 +231,14 @@ async def init_db():
             ALTER TABLE server_settings
             ADD COLUMN IF NOT EXISTS guild_name TEXT
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_guilds (
+                guild_id   BIGINT PRIMARY KEY,
+                guild_name TEXT,
+                active     BOOLEAN NOT NULL DEFAULT TRUE,
+                last_seen  TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        """)
     print("✅  Database ready.")
 
 
@@ -441,6 +449,58 @@ async def db_get_web_access_key(guild_id):
             "SELECT web_access_key FROM server_settings WHERE guild_id = $1", guild_id
         )
     return row["web_access_key"] if row else None
+
+
+async def db_mark_guild_active(guild_id, guild_name):
+    """Record that the bot is (still) a member of this guild.
+
+    Lets the web dashboard's all-servers view distinguish servers the bot
+    currently manages from stale ones it has left, whose historical
+    drop/order data otherwise looks identical in the database.
+    """
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO bot_guilds (guild_id, guild_name, active, last_seen)
+            VALUES ($1, $2, TRUE, NOW())
+            ON CONFLICT (guild_id) DO UPDATE SET
+                guild_name = $2, active = TRUE, last_seen = NOW()
+        """, guild_id, guild_name)
+
+
+async def db_mark_guild_inactive(guild_id):
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO bot_guilds (guild_id, active, last_seen)
+            VALUES ($1, FALSE, NOW())
+            ON CONFLICT (guild_id) DO UPDATE SET active = FALSE, last_seen = NOW()
+        """, guild_id)
+
+
+async def db_reconcile_guilds(current_guilds):
+    """Sync bot_guilds with the guilds the bot is actually in right now.
+
+    Runs at startup to catch joins/leaves that happened while the bot was
+    offline (on_guild_join/on_guild_remove only fire for live events).
+    """
+    current_ids = {g.id for g in current_guilds}
+    async with db_pool.acquire() as conn:
+        for g in current_guilds:
+            await conn.execute("""
+                INSERT INTO bot_guilds (guild_id, guild_name, active, last_seen)
+                VALUES ($1, $2, TRUE, NOW())
+                ON CONFLICT (guild_id) DO UPDATE SET
+                    guild_name = $2, active = TRUE, last_seen = NOW()
+            """, g.id, g.name)
+        stale_rows = await conn.fetch(
+            "SELECT guild_id FROM bot_guilds WHERE active = TRUE"
+        )
+        stale_ids = [r["guild_id"] for r in stale_rows if r["guild_id"] not in current_ids]
+        if stale_ids:
+            await conn.execute(
+                "UPDATE bot_guilds SET active = FALSE, last_seen = NOW() "
+                "WHERE guild_id = ANY($1::bigint[])",
+                stale_ids,
+            )
 
 
 async def db_refresh_caches():
@@ -1071,6 +1131,12 @@ async def on_ready():
     await init_db()
     await db_load_all()
     await bot.tree.sync()
+    # Sync which guilds the bot is actually in — catches joins/leaves that
+    # happened while offline, so the web dashboard can flag stale servers.
+    try:
+        await db_reconcile_guilds(bot.guilds)
+    except Exception as e:
+        print(f"⚠️  guild reconcile failed: {e}")
     if not _refresh_task_started:
         _refresh_task_started = True
         bot.loop.create_task(_config_refresh_loop())
@@ -1081,6 +1147,22 @@ async def on_ready():
                 view = _build_raffle_view(guild_id, name, raffle)
                 bot.add_view(view)
     print(f"✅  Logged in as {bot.user} ({bot.user.id})")
+
+
+@bot.event
+async def on_guild_join(guild):
+    try:
+        await db_mark_guild_active(guild.id, guild.name)
+    except Exception as e:
+        print(f"⚠️  failed to record guild join for {guild.id}: {e}")
+
+
+@bot.event
+async def on_guild_remove(guild):
+    try:
+        await db_mark_guild_inactive(guild.id)
+    except Exception as e:
+        print(f"⚠️  failed to record guild leave for {guild.id}: {e}")
 
 
 @bot.event
