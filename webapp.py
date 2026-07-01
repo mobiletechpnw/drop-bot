@@ -51,11 +51,32 @@ SECURE_COOKIES = os.getenv("WEB_SECURE_COOKIES", "true").lower() == "true"
 CREATOR_WEB_KEY = os.getenv("CREATOR_WEB_KEY", "")
 
 
+async def ensure_schema(pool):
+    """Make sure the columns the dashboard reads exist.
+
+    The bot's init_db() normally creates these, but the dashboard shouldn't
+    depend on the bot having redeployed first. These statements are idempotent
+    and safe to run on every startup.
+    """
+    statements = [
+        "ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS web_access_key TEXT",
+        "ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS guild_name TEXT",
+        "ALTER TABLE user_claims ADD COLUMN IF NOT EXISTS tracking TEXT",
+    ]
+    async with pool.acquire() as conn:
+        for stmt in statements:
+            try:
+                await conn.execute(stmt)
+            except Exception as e:  # table may not exist yet on a brand-new DB
+                print(f"⚠️  ensure_schema skipped: {stmt} — {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set.")
     app.state.pool = await asyncpg.create_pool(DATABASE_URL)
+    await ensure_schema(app.state.pool)
     yield
     await app.state.pool.close()
 
