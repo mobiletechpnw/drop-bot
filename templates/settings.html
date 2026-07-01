@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+{% block content %}
+<h1>Server settings</h1>
+{% if saved %}<div class="alert ok">Settings saved. The bot will pick them up within ~60 seconds.</div>{% endif %}
+
+<form method="post" action="/settings" class="stack">
+  <h2>Payment methods</h2>
+  <p class="muted small">Shown to buyers when a drop closes. Leave blank to hide a method.</p>
+
+  <label>Venmo</label>
+  <input name="venmo" value="{{ (s.venmo if s else '') or '' }}" placeholder="@your-venmo">
+
+  <label>Zelle</label>
+  <input name="zelle" value="{{ (s.zelle if s else '') or '' }}" placeholder="email or phone">
+
+  <label>Cash App</label>
+  <input name="cashapp" value="{{ (s.cashapp if s else '') or '' }}" placeholder="$yourcashtag">
+
+  <label>Apple Pay</label>
+  <input name="applepay" value="{{ (s.applepay if s else '') or '' }}" placeholder="phone or email">
+
+  <h2>Channels</h2>
+  <p class="muted small">Discord channel IDs (right-click a channel → Copy Channel ID, with Developer Mode on).</p>
+
+  <label>Drop channel ID</label>
+  <input name="drop_channel_id" value="{{ (s.drop_channel_id if s else '') or '' }}" placeholder="e.g. 123456789012345678">
+
+  <label>Raffle channel ID</label>
+  <input name="raffle_channel_id" value="{{ (s.raffle_channel_id if s else '') or '' }}" placeholder="e.g. 123456789012345678">
+
+  <div><button type="submit">Save settings</button></div>
+</form>
+{% endblock %}

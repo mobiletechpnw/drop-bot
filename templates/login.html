@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · Drop Bot</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="login-body">
+  <div class="login-card">
+    <h1>🛒 Drop Bot</h1>
+    <p class="muted">Enter your server's access key to manage its drops.</p>
+    {% if error %}<div class="alert error">{{ error }}</div>{% endif %}
+    <form method="post" action="/login">
+      <label for="key">Access key</label>
+      <input type="password" id="key" name="key" autocomplete="off"
+             autofocus placeholder="Paste the key from !webkey">
+      <button type="submit">Sign in</button>
+    </form>
+    <p class="muted small">
+      Get a key by running <code>!webkey</code> in your Discord server
+      (managers only). It will be DM'd to you.
+    </p>
+  </div>
+</body>
+</html>

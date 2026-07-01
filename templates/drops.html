@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Drops{% endblock %}
+{% block content %}
+<h1>Drops</h1>
+{% if drops %}
+<table>
+  <thead><tr><th>Drop</th><th>Closed</th><th>Revenue</th><th>Items</th><th>Buyers</th><th></th></tr></thead>
+  <tbody>
+    {% for d in drops %}
+    <tr>
+      <td>#{{ d.drop_number }}</td>
+      <td>{{ d.closed_at.strftime('%b %d, %Y') }}</td>
+      <td>{{ d.total_revenue | money }}</td>
+      <td>{{ d.total_items }}</td>
+      <td>{{ d.unique_buyers }}</td>
+      <td>
+        <a class="btn small" href="/drops/{{ d.drop_number }}">View</a>
+        <a class="btn small" href="/drops/{{ d.drop_number }}/export.xlsx">Excel</a>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">No closed drops yet.</p>
+{% endif %}
+{% endblock %}

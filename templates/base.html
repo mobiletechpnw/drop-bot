@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Drop Bot{% endblock %} · Drop Bot</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><a href="/">🛒 Drop Bot</a></div>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a href="/drops">Drops</a>
+      <a href="/orders">Orders</a>
+      <a href="/settings">Settings</a>
+      <a href="/managers">Managers</a>
+    </nav>
+    <div class="who">
+      <span class="server">{{ guild_name }}</span>
+      <a class="logout" href="/logout">Log out</a>
+    </div>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="foot">
+    Managing records only. Start/close drops and take claims in Discord —
+    changes here reach the bot within ~60s.
+  </footer>
+</body>
+</html>

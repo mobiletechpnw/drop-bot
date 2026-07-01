@@ -52,6 +52,7 @@ MANAGER / ADMIN COMMANDS (server or DM after !drop)
     !history                         — View last 10 drop summaries (DM)
     !export                          — Generate Excel spreadsheet: orders, payments, raffles (DM)
     !addtracking @user [drop #] <tracking#> — Attach tracking (defaults to their latest drop) and notify the buyer
+    !webkey [reset]                  — DM your web dashboard access key (add/manage info from the browser)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PUBLIC COMMANDS (anyone, in server only)
@@ -97,6 +98,7 @@ import json
 import os
 import random
 import re
+import secrets
 import asyncpg
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -142,7 +144,9 @@ async def init_db():
                 venmo TEXT,
                 zelle TEXT,
                 cashapp TEXT,
-                applepay TEXT
+                applepay TEXT,
+                web_access_key TEXT,
+                guild_name TEXT
             )
         """)
         await conn.execute("""
@@ -218,6 +222,14 @@ async def init_db():
         await conn.execute("""
             ALTER TABLE user_claims
             ADD COLUMN IF NOT EXISTS tracking TEXT
+        """)
+        await conn.execute("""
+            ALTER TABLE server_settings
+            ADD COLUMN IF NOT EXISTS web_access_key TEXT
+        """)
+        await conn.execute("""
+            ALTER TABLE server_settings
+            ADD COLUMN IF NOT EXISTS guild_name TEXT
         """)
     print("✅  Database ready.")
 
@@ -409,6 +421,57 @@ async def db_get_drop_count(guild_id):
             "SELECT COUNT(*) AS cnt FROM drop_history WHERE guild_id = $1", guild_id
         )
     return row["cnt"] if row else 0
+
+
+async def db_set_web_access_key(guild_id, key, guild_name=None):
+    """Store (or replace) the web dashboard access key for a guild."""
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO server_settings (guild_id, web_access_key, guild_name)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (guild_id) DO UPDATE SET
+                web_access_key = $2,
+                guild_name = COALESCE($3, server_settings.guild_name)
+        """, guild_id, key, guild_name)
+
+
+async def db_get_web_access_key(guild_id):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT web_access_key FROM server_settings WHERE guild_id = $1", guild_id
+        )
+    return row["web_access_key"] if row else None
+
+
+async def db_refresh_caches():
+    """Reload admins, managers and settings from the DB into memory.
+
+    Runs periodically so changes made through the web dashboard (payment
+    methods, managers, channels) take effect in the live bot without a
+    restart. Only touches DB-backed config caches — never live drop state.
+    """
+    global server_admins, server_managers, server_settings
+    new_admins = {}
+    new_managers = defaultdict(set)
+    new_settings = {}
+    async with db_pool.acquire() as conn:
+        for row in await conn.fetch("SELECT guild_id, user_id FROM server_admins"):
+            new_admins[row["guild_id"]] = row["user_id"]
+        for row in await conn.fetch("SELECT guild_id, user_id FROM server_managers"):
+            new_managers[row["guild_id"]].add(row["user_id"])
+        for row in await conn.fetch("SELECT * FROM server_settings"):
+            new_settings[row["guild_id"]] = {
+                "drop_channel_id": row["drop_channel_id"],
+                "venmo": row["venmo"],
+                "zelle": row["zelle"],
+                "cashapp": row["cashapp"],
+                "applepay": row["applepay"],
+            }
+            if row["raffle_channel_id"]:
+                server_raffle_channel[row["guild_id"]] = row["raffle_channel_id"]
+    server_admins = new_admins
+    server_managers = new_managers
+    server_settings = new_settings
 
 
 async def db_save_raffle_host(guild_id: int, host_num: int):
@@ -988,11 +1051,29 @@ async def on_command_error(ctx, error):
     else:
         raise error
 
+_refresh_task_started = False
+
+
+async def _config_refresh_loop():
+    """Periodically pull web-dashboard config changes into the live bot."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        await asyncio.sleep(60)
+        try:
+            await db_refresh_caches()
+        except Exception as e:
+            print(f"⚠️  config refresh failed: {e}")
+
+
 @bot.event
 async def on_ready():
+    global _refresh_task_started
     await init_db()
     await db_load_all()
     await bot.tree.sync()
+    if not _refresh_task_started:
+        _refresh_task_started = True
+        bot.loop.create_task(_config_refresh_loop())
     # Re-register persistent raffle Views so buttons work after restart
     for guild_id, raffles in server_raffles.items():
         for name, raffle in raffles.items():
@@ -3657,6 +3738,43 @@ async def cmd_payments(ctx):
         await ctx.author.send(embed=embed)
     except discord.Forbidden:
         await ctx.send("⚠️  I couldn't DM you — please open your DMs and try again.")
+
+
+@bot.command(name="webkey")
+async def cmd_webkey(ctx, action: str = ""):
+    """Show or reset this server's web dashboard access key.
+
+    Usage: !webkey            — show current key (creates one if missing)
+           !webkey reset      — generate a brand new key (old one stops working)
+    The key is DM'd to you, never posted in the channel.
+    """
+    if not ctx.guild:
+        await ctx.author.send("⚠️  Please run `!webkey` in your server channel.")
+        return
+    guild_id = ctx.guild.id
+    if not is_manager(guild_id, ctx.author.id):
+        return
+    await silent(ctx)
+
+    key = await db_get_web_access_key(guild_id)
+    action = action.strip().lower()
+    if action == "reset" or not key:
+        key = secrets.token_urlsafe(24)
+    # Always persist (refreshes stored server name; harmless no-op on show).
+    await db_set_web_access_key(guild_id, key, ctx.guild.name)
+    await db_refresh_caches()
+
+    base_url = os.getenv("WEB_BASE_URL", "").rstrip("/")
+    where = f"{base_url}/login" if base_url else "your Drop Bot web dashboard"
+    verb = "reset" if action == "reset" else "is ready"
+    await dm(
+        ctx,
+        f"🔑  **Web dashboard access key {verb} for {ctx.guild.name}:**\n"
+        f"```\n{key}\n```\n"
+        f"Go to {where} and paste this key to sign in.\n\n"
+        f"⚠️  Anyone with this key can manage the server's drop records — keep it "
+        f"private. Run `!webkey reset` to invalidate it and get a new one."
+    )
 
 
 @bot.command(name="addtracking")

@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Drop #{{ drop_number }}{% endblock %}
+{% block content %}
+<div class="row-between">
+  <h1>Drop #{{ drop_number }}</h1>
+  <a class="btn" href="/drops/{{ drop_number }}/export.xlsx">Download Excel</a>
+</div>
+{% if closed_at %}<p class="muted">Closed {{ closed_at.strftime('%b %d, %Y') }} · Total {{ total | money }}</p>{% endif %}
+{% if msg %}<div class="alert ok">{{ msg }}</div>{% endif %}
+
+{% if orders %}
+<table class="orders">
+  <thead>
+    <tr><th>Buyer</th><th>Items</th><th>Total</th><th>Paid</th><th>Tracking</th></tr>
+  </thead>
+  <tbody>
+    {% for o in orders %}
+    <tr>
+      <td>
+        <div class="buyer">{{ o.name }}</div>
+        <div class="muted small"><code>{{ o.user_id }}</code></div>
+      </td>
+      <td>
+        <ul class="items">
+          {% for it in o['items'] %}
+          <li>{{ it.display }} ×{{ it.qty }} — {{ it.subtotal | money }}</li>
+          {% endfor %}
+        </ul>
+      </td>
+      <td>{{ o.total | money }}</td>
+      <td>{% if o.confirmed %}<span class="pill ok">Paid</span>{% else %}<span class="pill warn">Pending</span>{% endif %}</td>
+      <td>
+        <form method="post" action="/drops/{{ drop_number }}/tracking" class="inline">
+          <input type="hidden" name="user_id" value="{{ o.user_id }}">
+          <input name="tracking" value="{{ o.tracking }}" placeholder="Tracking #" class="track-input">
+          <button class="btn small" type="submit">Save</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">No orders recorded for this drop.</p>
+{% endif %}
+<p><a href="/drops">← All drops</a></p>
+{% endblock %}
