@@ -20,7 +20,9 @@ import sys
 
 import asyncpg
 
-GUILD_NAME = "UCE'S PLUG CHAT"
+# UCE'S PLUG CHAT ✨ 🤙🏽 — matched by id so the curly apostrophe/emoji name
+# can't trip us up. Override with the GUILD_ID env var if ever needed.
+GUILD_ID = 1492850792175108149
 
 
 async def main():
@@ -30,25 +32,14 @@ async def main():
               "(host ends in .proxy.rlwy.net) and re-run.")
         sys.exit(1)
 
+    gid = int(os.getenv("GUILD_ID") or GUILD_ID)
     conn = await asyncpg.connect(dsn, timeout=30)
     try:
-        rows = await conn.fetch(
-            "SELECT guild_id, guild_name FROM server_settings "
-            "WHERE guild_name ILIKE $1", GUILD_NAME)
-        if not rows:
-            print(f"Could not find a guild named {GUILD_NAME!r}. All guilds:")
-            for r in await conn.fetch(
-                    "SELECT guild_id, guild_name FROM server_settings "
-                    "ORDER BY guild_name"):
-                print(f"   {r['guild_id']}  {r['guild_name']}")
-            return
-        if len(rows) > 1:
-            print("Multiple guilds match — pick the right guild_id:")
-            for r in rows:
-                print(f"   {r['guild_id']}  {r['guild_name']}")
-            return
-        gid = rows[0]["guild_id"]
-        print(f"Guild: {gid}  ({rows[0]['guild_name']})\n")
+        row = await conn.fetchrow(
+            "SELECT guild_id, guild_name FROM server_settings WHERE guild_id = $1",
+            gid)
+        name = row["guild_name"] if row else "(no server_settings row)"
+        print(f"Guild: {gid}  ({name})\n")
 
         drops = await conn.fetch(
             """SELECT ROW_NUMBER() OVER (ORDER BY closed_at) AS pos,
