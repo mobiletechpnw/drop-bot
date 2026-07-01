@@ -40,6 +40,14 @@ visible in `!myhistory` and the dashboard either way. Re-saving the same
 tracking value, or clearing it, does **not** send a DM — only a genuinely new
 value does.
 
+**Pushing DMs for tracking already saved:** because a single save only DMs on a
+*new* value, tracking numbers entered before this notify feature existed — or
+any a buyer never received — leave no per-buyer way to reach them. A drop's page
+has a **📦 Push tracking DMs (N)** button that enqueues the tracking DM for every
+buyer in that drop who has a saved tracking number, using the same outbox. Use
+it to (re)deliver tracking for a whole drop at once; buyers get the same message
+as `!addtracking`.
+
 ## Signing in
 
 Auth is a **per-server access key**. In Discord, a manager runs:

@@ -495,6 +495,7 @@ async def drop_detail(request: Request, drop_number: int, msg: str = "", view: s
         )
     total = sum(o["total"] for o in orders_all)
     unpaid_count = sum(1 for o in orders_all if not o["confirmed"])
+    tracked_count = sum(1 for o in orders_all if o["tracking"])
     show_unpaid = (view == "unpaid")
     orders = [o for o in orders_all if not o["confirmed"]] if show_unpaid else orders_all
     return templates.TemplateResponse(request, "drop_detail.html", _ctx(
@@ -502,12 +503,27 @@ async def drop_detail(request: Request, drop_number: int, msg: str = "", view: s
         drop_number=drop_number, orders=orders, total=total,
         closed_at=meta["closed_at"] if meta else None, msg=msg,
         show_unpaid=show_unpaid, unpaid_count=unpaid_count, all_count=len(orders_all),
+        tracked_count=tracked_count,
     ))
 
 
 def _drop_redirect(drop_number, msg, view=""):
     suffix = f"&view={view}" if view in ("unpaid",) else ""
     return RedirectResponse(f"/drops/{drop_number}?msg={msg}{suffix}", status_code=303)
+
+
+def _tracking_dm(drop_number, tracking):
+    """The DM text a buyer gets when their tracking number is delivered.
+
+    Kept in one place so the single-save flow and the bulk push below stay
+    identical to what `!addtracking` sends.
+    """
+    return (
+        f"📦  Your order from **Drop #{drop_number}** has shipped! "
+        f"Here is your tracking number:\n"
+        f"**{tracking}**\n\n"
+        f"You can use `!myhistory` to view your full order history."
+    )
 
 
 @app.post("/drops/{drop_number}/tracking")
@@ -540,12 +556,7 @@ async def drop_set_tracking(
                 # Only DM the buyer on a real, new tracking number — not when
                 # clearing it or re-saving the same value.
                 if tracking and tracking != old_tracking:
-                    message = (
-                        f"📦  Your order from **Drop #{drop_number}** has shipped! "
-                        f"Here is your tracking number:\n"
-                        f"**{tracking}**\n\n"
-                        f"You can use `!myhistory` to view your full order history."
-                    )
+                    message = _tracking_dm(drop_number, tracking)
                     await conn.execute(
                         """INSERT INTO pending_notifications (guild_id, user_id, message)
                            VALUES ($1, $2, $3)""",
@@ -594,6 +605,43 @@ async def drop_confirm_all(request: Request, drop_number: int):
     except (ValueError, IndexError):
         n_rows = 0
     label = "All+orders+marked+paid." if n_rows else "Nothing+to+update."
+    return _drop_redirect(drop_number, label)
+
+
+@app.post("/drops/{drop_number}/notify_tracking")
+async def drop_notify_tracking(request: Request, drop_number: int):
+    """Re-send the tracking DM to every buyer in a drop that already has a
+    saved tracking number.
+
+    The per-buyer Save only DMs when a tracking value *changes* to something
+    new, so trackings entered before the notify feature existed — or any that
+    a buyer never got — leave no way to reach the buyer. This enqueues one DM
+    per buyer with a saved tracking number, using the same outbox the bot
+    polls for the single-save flow.
+    """
+    gid, _ = _session_guild(request)
+    if gid is None:
+        return _redirect_login()
+    async with request.app.state.pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT DISTINCT ON (user_id) user_id, tracking
+               FROM user_claims
+               WHERE guild_id = $1 AND drop_number = $2
+                 AND tracking IS NOT NULL AND tracking <> ''
+               ORDER BY user_id, tracking""",
+            gid, drop_number,
+        )
+        for r in rows:
+            await conn.execute(
+                """INSERT INTO pending_notifications (guild_id, user_id, message)
+                   VALUES ($1, $2, $3)""",
+                gid, r["user_id"], _tracking_dm(drop_number, r["tracking"]),
+            )
+    n = len(rows)
+    label = (
+        f"Pushed+tracking+to+{n}+buyer{'s' if n != 1 else ''}+-+DMs+arrive+in+~15-30s."
+        if n else "No+saved+tracking+numbers+to+push."
+    )
     return _drop_redirect(drop_number, label)
 
 
