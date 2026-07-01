@@ -28,7 +28,23 @@
         </ul>
       </td>
       <td>{{ o.total | money }}</td>
-      <td>{% if o.confirmed %}<span class="pill ok">Paid</span>{% else %}<span class="pill warn">Pending</span>{% endif %}</td>
+      <td>
+        {% if o.confirmed %}
+          <span class="pill ok">Paid</span>
+          <form method="post" action="/drops/{{ drop_number }}/confirm" class="inline">
+            <input type="hidden" name="user_id" value="{{ o.user_id }}">
+            <input type="hidden" name="confirmed" value="0">
+            <button class="btn small ghost" type="submit">Undo</button>
+          </form>
+        {% else %}
+          <span class="pill warn">Pending</span>
+          <form method="post" action="/drops/{{ drop_number }}/confirm" class="inline">
+            <input type="hidden" name="user_id" value="{{ o.user_id }}">
+            <input type="hidden" name="confirmed" value="1">
+            <button class="btn small" type="submit">Mark paid</button>
+          </form>
+        {% endif %}
+      </td>
       <td>
         <form method="post" action="/drops/{{ drop_number }}/tracking" class="inline">
           <input type="hidden" name="user_id" value="{{ o.user_id }}">

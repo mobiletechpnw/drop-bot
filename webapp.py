@@ -389,6 +389,27 @@ async def drop_set_tracking(
                             status_code=303)
 
 
+@app.post("/drops/{drop_number}/confirm")
+async def drop_set_confirmed(
+    request: Request, drop_number: int,
+    user_id: str = Form(""), confirmed: str = Form(""),
+):
+    gid, _ = _session_guild(request)
+    if gid is None:
+        return _redirect_login()
+    user_id = (user_id or "").strip()
+    is_confirmed = (confirmed == "1")
+    if user_id.isdigit():
+        async with request.app.state.pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE user_claims SET confirmed = $4
+                   WHERE guild_id = $1 AND user_id = $2 AND drop_number = $3""",
+                gid, int(user_id), drop_number, is_confirmed,
+            )
+    verb = "Marked+paid." if is_confirmed else "Marked+unpaid."
+    return RedirectResponse(f"/drops/{drop_number}?msg={verb}", status_code=303)
+
+
 @app.get("/orders")
 async def orders_search(request: Request, q: str = ""):
     gid, gname = _session_guild(request)

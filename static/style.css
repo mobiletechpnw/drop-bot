@@ -83,6 +83,10 @@ button:hover, .btn:hover { background: var(--accent-hover); text-decoration: non
 .btn.small { padding: 5px 10px; font-size: .8rem; }
 .btn.danger, button.danger { background: var(--danger); }
 .btn.danger:hover, button.danger:hover { background: #c53539; }
+.btn.ghost, button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+.btn.ghost:hover, button.ghost:hover { background: var(--panel-2); color: var(--text); }
+
+td .inline { margin-top: 6px; }
 
 /* ── Bits ── */
 .muted { color: var(--muted); }

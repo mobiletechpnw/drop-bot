@@ -12,6 +12,7 @@ bot.
 - Add / remove managers by Discord user ID
 - Browse every closed drop with revenue, item, and buyer stats
 - View each drop's per-buyer orders, payment status, and tracking
+- Mark a past-drop order **paid / unpaid** (updates the saved history record)
 - Add / edit **tracking numbers** per buyer per drop (permanent, in history)
 - Search all orders by buyer name or Discord user ID
 - Download a per-drop Excel export
