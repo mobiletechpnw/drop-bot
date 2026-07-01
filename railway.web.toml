@@ -1,0 +1,13 @@
+# Railway config for the WEB DASHBOARD service.
+#
+# This repo runs as two Railway services from the same codebase. The bot
+# service uses the default `railway.toml`; the web service should be pointed
+# at THIS file via Settings → Config-as-code → "Railway Config File" =
+# railway.web.toml. That keeps the two services' start commands independent
+# without either overriding the other. See WEB.md.
+
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "uvicorn webapp:app --host 0.0.0.0 --port $PORT"
