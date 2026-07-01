@@ -8,19 +8,28 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="brand"><a href="/">🛒 Drop Bot</a></div>
+    <div class="brand"><a href="{{ '/admin' if is_creator else '/' }}">🛒 Drop Bot</a></div>
     <nav>
+      {% if guild_id %}
       <a href="/">Dashboard</a>
       <a href="/drops">Drops</a>
       <a href="/orders">Orders</a>
       <a href="/settings">Settings</a>
       <a href="/managers">Managers</a>
+      {% endif %}
     </nav>
     <div class="who">
-      <span class="server">{{ guild_name }}</span>
+      {% if is_creator %}<a href="/admin">All servers</a>{% endif %}
+      {% if guild_name %}<span class="server">{{ guild_name }}</span>{% endif %}
       <a class="logout" href="/logout">Log out</a>
     </div>
   </header>
+  {% if is_creator and guild_id %}
+  <div class="creator-strip">
+    👑 Creator view — overseeing <strong>{{ guild_name }}</strong> ·
+    <a href="/admin">back to all servers</a>
+  </div>
+  {% endif %}
   <main>
     {% block content %}{% endblock %}
   </main>

@@ -55,7 +55,24 @@ Open http://localhost:8000 .
 | `WEB_SECRET`          | web     | prod yes | Signs session cookies; set a stable value so logins survive restarts |
 | `WEB_SECURE_COOKIES`  | web     | no       | `true` (default) sets the Secure flag — keep on for HTTPS; set `false` for local http |
 | `WEB_BASE_URL`        | bot     | no       | If set, `!webkey` includes a direct login link, e.g. `https://drops.example.com` |
+| `CREATOR_WEB_KEY`     | web     | no       | Master key for the bot creator to oversee **all** servers. Leave unset to disable creator login. |
 | `PORT`                | web     | host     | Provided by Railway/host |
+
+## Creator oversight (all servers)
+
+Set `CREATOR_WEB_KEY` on the web service to a long secret of your choosing, e.g.:
+
+```bash
+export CREATOR_WEB_KEY=$(python -c "import secrets;print(secrets.token_urlsafe(32))")
+```
+
+Paste that key on the same login page. Instead of a single store you land on
+**All servers** (`/admin`): totals across every store plus a per-server table
+(drops, revenue, outstanding, last drop). Click **Manage** on any server to
+drop into it — every normal page (settings, orders, tracking, confirm, export)
+then acts on that store, with a banner and a "back to all servers" link. This
+key is the master credential; keep it very private and rotate it by changing
+the env var.
 
 ## Deploying on Railway (two services, one database)
 

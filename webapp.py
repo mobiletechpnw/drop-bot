@@ -23,6 +23,7 @@ Env:  DATABASE_URL (required, shared with the bot)
       PORT         (provided by the host)
 """
 
+import datetime
 import io
 import os
 import secrets
@@ -45,6 +46,9 @@ if not WEB_SECRET:
     print("⚠️  WEB_SECRET not set — using a temporary secret. "
           "Set WEB_SECRET in the environment so sessions survive restarts.")
 SECURE_COOKIES = os.getenv("WEB_SECURE_COOKIES", "true").lower() == "true"
+# Optional master key for the bot creator to oversee ALL servers. If unset,
+# creator login is disabled and only per-server access keys work.
+CREATOR_WEB_KEY = os.getenv("CREATOR_WEB_KEY", "")
 
 
 @asynccontextmanager
@@ -93,7 +97,12 @@ def _redirect_login():
 
 
 def _ctx(request: Request, gid, gname, **extra):
-    base = {"request": request, "guild_id": gid, "guild_name": gname}
+    base = {
+        "request": request,
+        "guild_id": gid,
+        "guild_name": gname,
+        "is_creator": bool(request.session.get("is_creator")),
+    }
     base.update(extra)
     return base
 
@@ -158,6 +167,12 @@ async def login_form(request: Request):
 async def login_submit(request: Request, key: str = Form("")):
     key = (key or "").strip()
     if key:
+        # Creator master key → oversee all servers.
+        if CREATOR_WEB_KEY and secrets.compare_digest(key, CREATOR_WEB_KEY):
+            request.session.clear()
+            request.session["is_creator"] = True
+            return RedirectResponse("/admin", status_code=303)
+        # Otherwise a per-server access key.
         async with request.app.state.pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT guild_id, guild_name FROM server_settings "
@@ -165,6 +180,7 @@ async def login_submit(request: Request, key: str = Form("")):
                 key,
             )
         if row:
+            request.session.clear()
             request.session["guild_id"] = row["guild_id"]
             request.session["guild_name"] = row["guild_name"] or str(row["guild_id"])
             return RedirectResponse("/", status_code=303)
@@ -179,6 +195,74 @@ async def login_submit(request: Request, key: str = Form("")):
 async def logout(request: Request):
     request.session.clear()
     return RedirectResponse("/login", status_code=303)
+
+
+# ── Creator (all-servers) oversight ───────────────────────────────────────────
+
+@app.get("/admin")
+async def admin_overview(request: Request):
+    if not request.session.get("is_creator"):
+        return _redirect_login()
+    async with request.app.state.pool.acquire() as conn:
+        settings = await conn.fetch(
+            "SELECT guild_id, guild_name FROM server_settings"
+        )
+        agg = await conn.fetch(
+            """SELECT guild_id, COUNT(*) AS drops,
+                      COALESCE(SUM(total_revenue), 0) AS revenue,
+                      COALESCE(SUM(total_items), 0) AS items,
+                      COALESCE(SUM(unique_buyers), 0) AS buyers,
+                      MAX(closed_at) AS last_drop
+               FROM drop_history GROUP BY guild_id"""
+        )
+        outstanding = await conn.fetch(
+            """SELECT guild_id, COALESCE(SUM(subtotal), 0) AS outstanding
+               FROM user_claims WHERE confirmed = FALSE GROUP BY guild_id"""
+        )
+    names = {r["guild_id"]: r["guild_name"] for r in settings}
+    agg_map = {r["guild_id"]: r for r in agg}
+    out_map = {r["guild_id"]: float(r["outstanding"]) for r in outstanding}
+
+    stores = []
+    for gid in set(names) | set(agg_map) | set(out_map):
+        a = agg_map.get(gid)
+        stores.append({
+            "guild_id": gid,
+            "name": names.get(gid) or str(gid),
+            "drops": a["drops"] if a else 0,
+            "revenue": float(a["revenue"]) if a else 0.0,
+            "items": a["items"] if a else 0,
+            "buyers": a["buyers"] if a else 0,
+            "last_drop": a["last_drop"] if a else None,
+            "outstanding": out_map.get(gid, 0.0),
+        })
+    stores.sort(
+        key=lambda s: s["last_drop"] or datetime.datetime.min, reverse=True
+    )
+    totals = {
+        "stores": len(stores),
+        "drops": sum(s["drops"] for s in stores),
+        "revenue": sum(s["revenue"] for s in stores),
+        "outstanding": sum(s["outstanding"] for s in stores),
+    }
+    return templates.TemplateResponse("admin.html", _ctx(
+        request, None, None, stores=stores, totals=totals,
+    ))
+
+
+@app.get("/admin/select/{guild_id}")
+async def admin_select(request: Request, guild_id: int):
+    if not request.session.get("is_creator"):
+        return _redirect_login()
+    async with request.app.state.pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT guild_name FROM server_settings WHERE guild_id = $1", guild_id
+        )
+    request.session["guild_id"] = guild_id
+    request.session["guild_name"] = (
+        row["guild_name"] if row and row["guild_name"] else str(guild_id)
+    )
+    return RedirectResponse("/", status_code=303)
 
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────

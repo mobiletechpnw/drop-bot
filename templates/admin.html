@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}All servers{% endblock %}
+{% block content %}
+<h1>👑 All servers</h1>
+<p class="muted">Creator oversight across every store using this bot.</p>
+
+<div class="cards">
+  <div class="card"><div class="num">{{ totals.stores }}</div><div class="lbl">Servers</div></div>
+  <div class="card"><div class="num">{{ totals.drops }}</div><div class="lbl">Drops closed</div></div>
+  <div class="card"><div class="num">{{ totals.revenue | money }}</div><div class="lbl">Total revenue</div></div>
+  <div class="card"><div class="num">{{ totals.outstanding | money }}</div><div class="lbl">Outstanding</div></div>
+</div>
+
+{% if stores %}
+<table>
+  <thead>
+    <tr><th>Server</th><th>Drops</th><th>Revenue</th><th>Outstanding</th><th>Last drop</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for s in stores %}
+    <tr>
+      <td>
+        <div class="buyer">{{ s.name }}</div>
+        <div class="muted small"><code>{{ s.guild_id }}</code></div>
+      </td>
+      <td>{{ s.drops }}</td>
+      <td>{{ s.revenue | money }}</td>
+      <td>{% if s.outstanding > 0 %}<span class="pill warn">{{ s.outstanding | money }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
+      <td>{% if s.last_drop %}{{ s.last_drop.strftime('%b %d, %Y') }}{% else %}<span class="muted">never</span>{% endif %}</td>
+      <td><a class="btn small" href="/admin/select/{{ s.guild_id }}">Manage →</a></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">No servers have any data yet.</p>
+{% endif %}
+{% endblock %}
