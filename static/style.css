@@ -94,6 +94,15 @@ button:hover, .btn:hover { background: var(--accent-hover); text-decoration: non
 
 td .inline { margin-top: 6px; }
 
+.controls { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 16px 0; flex-wrap: wrap; }
+.tabs { display: flex; gap: 6px; }
+.tab {
+  padding: 6px 14px; border-radius: 8px; color: var(--muted);
+  border: 1px solid var(--border); background: var(--panel); font-size: .88rem;
+}
+.tab:hover { color: var(--text); text-decoration: none; }
+.tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+
 /* ── Bits ── */
 .muted { color: var(--muted); }
 .small { font-size: .82rem; }

@@ -5,8 +5,21 @@
   <h1>Drop #{{ drop_number }}</h1>
   <a class="btn" href="/drops/{{ drop_number }}/export.xlsx">Download Excel</a>
 </div>
-{% if closed_at %}<p class="muted">Closed {{ closed_at.strftime('%b %d, %Y') }} · Total {{ total | money }}</p>{% endif %}
+{% if closed_at %}<p class="muted">Closed {{ closed_at.strftime('%b %d, %Y') }} · Total {{ total | money }} · {{ unpaid_count }} unpaid</p>{% endif %}
 {% if msg %}<div class="alert ok">{{ msg }}</div>{% endif %}
+
+<div class="controls">
+  <div class="tabs">
+    <a class="tab {{ 'active' if not show_unpaid else '' }}" href="/drops/{{ drop_number }}">All ({{ all_count }})</a>
+    <a class="tab {{ 'active' if show_unpaid else '' }}" href="/drops/{{ drop_number }}?view=unpaid">Unpaid ({{ unpaid_count }})</a>
+  </div>
+  {% if unpaid_count %}
+  <form method="post" action="/drops/{{ drop_number }}/confirm_all" class="inline"
+        onsubmit="return confirm('Mark all {{ unpaid_count }} unpaid order(s) in Drop #{{ drop_number }} as paid?');">
+    <button class="btn" type="submit">✓ Mark all paid ({{ unpaid_count }})</button>
+  </form>
+  {% endif %}
+</div>
 
 {% if orders %}
 <table class="orders">
@@ -34,6 +47,7 @@
           <form method="post" action="/drops/{{ drop_number }}/confirm" class="inline">
             <input type="hidden" name="user_id" value="{{ o.user_id }}">
             <input type="hidden" name="confirmed" value="0">
+            <input type="hidden" name="view" value="{{ 'unpaid' if show_unpaid else '' }}">
             <button class="btn small ghost" type="submit">Undo</button>
           </form>
         {% else %}
@@ -41,6 +55,7 @@
           <form method="post" action="/drops/{{ drop_number }}/confirm" class="inline">
             <input type="hidden" name="user_id" value="{{ o.user_id }}">
             <input type="hidden" name="confirmed" value="1">
+            <input type="hidden" name="view" value="{{ 'unpaid' if show_unpaid else '' }}">
             <button class="btn small" type="submit">Mark paid</button>
           </form>
         {% endif %}
@@ -48,6 +63,7 @@
       <td>
         <form method="post" action="/drops/{{ drop_number }}/tracking" class="inline">
           <input type="hidden" name="user_id" value="{{ o.user_id }}">
+          <input type="hidden" name="view" value="{{ 'unpaid' if show_unpaid else '' }}">
           <input name="tracking" value="{{ o.tracking }}" placeholder="Tracking #" class="track-input">
           <button class="btn small" type="submit">Save</button>
         </form>
@@ -57,7 +73,11 @@
   </tbody>
 </table>
 {% else %}
+{% if show_unpaid %}
+<p class="muted">🎉 No unpaid orders — everyone's paid up.</p>
+{% else %}
 <p class="muted">No orders recorded for this drop.</p>
+{% endif %}
 {% endif %}
 <p><a href="/drops">← All drops</a></p>
 {% endblock %}

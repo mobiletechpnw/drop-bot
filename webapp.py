@@ -433,29 +433,38 @@ async def drops_list(request: Request):
 
 
 @app.get("/drops/{drop_number}")
-async def drop_detail(request: Request, drop_number: int, msg: str = ""):
+async def drop_detail(request: Request, drop_number: int, msg: str = "", view: str = ""):
     gid, gname = _session_guild(request)
     if gid is None:
         return _redirect_login()
     async with request.app.state.pool.acquire() as conn:
-        orders = await _load_drop_orders(conn, gid, drop_number)
+        orders_all = await _load_drop_orders(conn, gid, drop_number)
         meta = await conn.fetchrow(
             """SELECT closed_at FROM drop_history WHERE guild_id = $1
                ORDER BY closed_at OFFSET $2 LIMIT 1""",
             gid, max(drop_number - 1, 0),
         )
-    total = sum(o["total"] for o in orders)
+    total = sum(o["total"] for o in orders_all)
+    unpaid_count = sum(1 for o in orders_all if not o["confirmed"])
+    show_unpaid = (view == "unpaid")
+    orders = [o for o in orders_all if not o["confirmed"]] if show_unpaid else orders_all
     return templates.TemplateResponse("drop_detail.html", _ctx(
         request, gid, gname,
         drop_number=drop_number, orders=orders, total=total,
         closed_at=meta["closed_at"] if meta else None, msg=msg,
+        show_unpaid=show_unpaid, unpaid_count=unpaid_count, all_count=len(orders_all),
     ))
+
+
+def _drop_redirect(drop_number, msg, view=""):
+    suffix = f"&view={view}" if view in ("unpaid",) else ""
+    return RedirectResponse(f"/drops/{drop_number}?msg={msg}{suffix}", status_code=303)
 
 
 @app.post("/drops/{drop_number}/tracking")
 async def drop_set_tracking(
     request: Request, drop_number: int,
-    user_id: str = Form(""), tracking: str = Form(""),
+    user_id: str = Form(""), tracking: str = Form(""), view: str = Form(""),
 ):
     gid, _ = _session_guild(request)
     if gid is None:
@@ -469,14 +478,13 @@ async def drop_set_tracking(
                    WHERE guild_id = $1 AND user_id = $2 AND drop_number = $3""",
                 gid, int(user_id), drop_number, tracking,
             )
-    return RedirectResponse(f"/drops/{drop_number}?msg=Tracking+updated.",
-                            status_code=303)
+    return _drop_redirect(drop_number, "Tracking+updated.", view)
 
 
 @app.post("/drops/{drop_number}/confirm")
 async def drop_set_confirmed(
     request: Request, drop_number: int,
-    user_id: str = Form(""), confirmed: str = Form(""),
+    user_id: str = Form(""), confirmed: str = Form(""), view: str = Form(""),
 ):
     gid, _ = _session_guild(request)
     if gid is None:
@@ -491,7 +499,27 @@ async def drop_set_confirmed(
                 gid, int(user_id), drop_number, is_confirmed,
             )
     verb = "Marked+paid." if is_confirmed else "Marked+unpaid."
-    return RedirectResponse(f"/drops/{drop_number}?msg={verb}", status_code=303)
+    return _drop_redirect(drop_number, verb, view)
+
+
+@app.post("/drops/{drop_number}/confirm_all")
+async def drop_confirm_all(request: Request, drop_number: int):
+    gid, _ = _session_guild(request)
+    if gid is None:
+        return _redirect_login()
+    async with request.app.state.pool.acquire() as conn:
+        result = await conn.execute(
+            """UPDATE user_claims SET confirmed = TRUE
+               WHERE guild_id = $1 AND drop_number = $2 AND confirmed = FALSE""",
+            gid, drop_number,
+        )
+    # result like "UPDATE <n>"
+    try:
+        n_rows = int(result.split()[-1])
+    except (ValueError, IndexError):
+        n_rows = 0
+    label = "All+orders+marked+paid." if n_rows else "Nothing+to+update."
+    return _drop_redirect(drop_number, label)
 
 
 @app.get("/orders")
