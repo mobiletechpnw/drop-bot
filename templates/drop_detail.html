@@ -19,6 +19,12 @@
     <button class="btn" type="submit">✓ Mark all paid ({{ unpaid_count }})</button>
   </form>
   {% endif %}
+  {% if tracked_count %}
+  <form method="post" action="/drops/{{ drop_number }}/notify_tracking" class="inline"
+        onsubmit="return confirm('Push the tracking DM to all {{ tracked_count }} buyer(s) with a saved tracking number in Drop #{{ drop_number }}?');">
+    <button class="btn" type="submit">📦 Push tracking DMs ({{ tracked_count }})</button>
+  </form>
+  {% endif %}
 </div>
 
 {% if orders %}
