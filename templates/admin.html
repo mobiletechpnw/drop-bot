@@ -5,7 +5,7 @@
 <p class="muted">Creator oversight across every store using this bot.</p>
 
 <div class="cards">
-  <div class="card"><div class="num">{{ totals.stores }}</div><div class="lbl">Servers</div></div>
+  <div class="card"><div class="num">{{ totals.active_stores }}<span class="muted small"> / {{ totals.stores }}</span></div><div class="lbl">Active servers</div></div>
   <div class="card"><div class="num">{{ totals.drops }}</div><div class="lbl">Drops closed</div></div>
   <div class="card"><div class="num">{{ totals.revenue | money }}</div><div class="lbl">Total revenue</div></div>
   <div class="card"><div class="num">{{ totals.outstanding | money }}</div><div class="lbl">Outstanding</div></div>
@@ -18,10 +18,13 @@
   </thead>
   <tbody>
     {% for s in stores %}
-    <tr>
+    <tr class="{{ 'inactive-row' if not s.bot_present else '' }}">
       <td>
         <div class="buyer">{{ s.name }}</div>
         <div class="muted small"><code>{{ s.guild_id }}</code></div>
+        {% if not s.bot_present %}
+        <div class="pill warn small">⚠️ Bot no longer in this server</div>
+        {% endif %}
       </td>
       <td>{{ s.drops }}</td>
       <td>{{ s.revenue | money }}</td>
@@ -32,6 +35,7 @@
     {% endfor %}
   </tbody>
 </table>
+<p class="muted small">Servers marked ⚠️ still have historical data on record, but the bot is no longer a member — records are kept for reporting but can't be managed live.</p>
 {% else %}
 <p class="muted">No servers have any data yet.</p>
 {% endif %}

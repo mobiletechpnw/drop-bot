@@ -75,6 +75,16 @@ then acts on that store, with a banner and a "back to all servers" link. This
 key is the master credential; keep it very private and rotate it by changing
 the env var.
 
+**Servers the bot has left:** the all-servers list shows *every* server with
+any historical data, including ones the bot is no longer a member of (kicked,
+removed, etc.) — their records aren't deleted. Those rows are dimmed and
+tagged **"⚠️ Bot no longer in this server"** so it's clear they can be viewed
+for reporting but not managed live. This is tracked in a `bot_guilds` table
+that the bot updates on join/leave and reconciles on every startup (so it
+also catches guilds left while the bot was offline). Note `!creator servers`
+in Discord only lists guilds the bot is *currently* in, so its count can be
+lower than the web dashboard's — that's expected.
+
 ## Deploying on Railway (two services, one database)
 
 This repo runs as **two services from the same codebase** — the Discord bot and
