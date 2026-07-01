@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Orders{% endblock %}
+{% block content %}
+<h1>Order search</h1>
+<form method="get" action="/orders" class="inline-form">
+  <input name="q" value="{{ q }}" placeholder="Buyer name or Discord user ID" autocomplete="off">
+  <button type="submit">Search</button>
+</form>
+
+{% if q %}
+  {% if results %}
+  <table>
+    <thead>
+      <tr><th>Drop</th><th>Buyer</th><th>Item</th><th>Qty</th><th>Subtotal</th><th>Paid</th><th>Tracking</th></tr>
+    </thead>
+    <tbody>
+      {% for r in results %}
+      <tr>
+        <td><a href="/drops/{{ r.drop_number }}">#{{ r.drop_number }}</a></td>
+        <td>{{ r.user_name }}<div class="muted small"><code>{{ r.user_id }}</code></div></td>
+        <td>{{ r.item_display }}</td>
+        <td>{{ r.qty }}</td>
+        <td>{{ r.subtotal | money }}</td>
+        <td>{% if r.confirmed %}✅{% else %}⏳{% endif %}</td>
+        <td>{% if r.tracking %}<code>{{ r.tracking }}</code>{% else %}<span class="muted">—</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">No orders found for “{{ q }}”.</p>
+  {% endif %}
+{% else %}
+<p class="muted">Search past orders by buyer name or Discord user ID.</p>
+{% endif %}
+{% endblock %}

@@ -51,7 +51,8 @@ MANAGER / ADMIN COMMANDS (server or DM after !drop)
     !payments                        — Full payment summary across all drops and raffles (DM)
     !history                         — View last 10 drop summaries (DM)
     !export                          — Generate Excel spreadsheet: orders, payments, raffles (DM)
-    !addtracking @user <tracking#>   — Attach a tracking number and notify the buyer
+    !addtracking @user [drop #] <tracking#> — Attach tracking (defaults to their latest drop) and notify the buyer
+    !webkey [reset]                  — DM your web dashboard access key (add/manage info from the browser)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PUBLIC COMMANDS (anyone, in server only)
@@ -96,6 +97,8 @@ import io
 import json
 import os
 import random
+import re
+import secrets
 import asyncpg
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -141,7 +144,9 @@ async def init_db():
                 venmo TEXT,
                 zelle TEXT,
                 cashapp TEXT,
-                applepay TEXT
+                applepay TEXT,
+                web_access_key TEXT,
+                guild_name TEXT
             )
         """)
         await conn.execute("""
@@ -167,7 +172,8 @@ async def init_db():
                 qty INT NOT NULL,
                 price NUMERIC NOT NULL,
                 subtotal NUMERIC NOT NULL,
-                confirmed BOOLEAN DEFAULT FALSE
+                confirmed BOOLEAN DEFAULT FALSE,
+                tracking TEXT
             )
         """)
         await conn.execute("""
@@ -212,6 +218,18 @@ async def init_db():
         await conn.execute("""
             ALTER TABLE server_settings
             ADD COLUMN IF NOT EXISTS raffle_channel_id BIGINT
+        """)
+        await conn.execute("""
+            ALTER TABLE user_claims
+            ADD COLUMN IF NOT EXISTS tracking TEXT
+        """)
+        await conn.execute("""
+            ALTER TABLE server_settings
+            ADD COLUMN IF NOT EXISTS web_access_key TEXT
+        """)
+        await conn.execute("""
+            ALTER TABLE server_settings
+            ADD COLUMN IF NOT EXISTS guild_name TEXT
         """)
     print("✅  Database ready.")
 
@@ -351,6 +369,111 @@ async def db_update_user_claim_confirmed(guild_id, user_id):
         """, guild_id, user_id)
 
 
+async def db_set_user_claim_tracking(guild_id, user_id, tracking, drop_number=None):
+    """Attach a tracking number to one of a buyer's drops.
+
+    Tracking is stored per drop in user_claims so it becomes a permanent
+    part of the buyer's order history. If drop_number is None the buyer's
+    most recent drop is used. Returns the drop_number the tracking was
+    attached to, or None if the buyer has no saved claims in that drop.
+    """
+    async with db_pool.acquire() as conn:
+        if drop_number is None:
+            row = await conn.fetchrow("""
+                SELECT MAX(drop_number) AS dn FROM user_claims
+                WHERE guild_id = $1 AND user_id = $2
+            """, guild_id, user_id)
+            if not row or row["dn"] is None:
+                return None
+            dn = row["dn"]
+        else:
+            row = await conn.fetchrow("""
+                SELECT 1 FROM user_claims
+                WHERE guild_id = $1 AND user_id = $2 AND drop_number = $3
+                LIMIT 1
+            """, guild_id, user_id, drop_number)
+            if not row:
+                return None
+            dn = drop_number
+        await conn.execute("""
+            UPDATE user_claims
+            SET tracking = $3
+            WHERE guild_id = $1 AND user_id = $2 AND drop_number = $4
+        """, guild_id, user_id, tracking, dn)
+        return dn
+
+
+async def db_get_user_drop_numbers(guild_id, user_id):
+    """List of drop numbers a buyer has saved orders in (ascending)."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT DISTINCT drop_number FROM user_claims
+            WHERE guild_id = $1 AND user_id = $2
+            ORDER BY drop_number
+        """, guild_id, user_id)
+    return [r["drop_number"] for r in rows]
+
+
+async def db_get_drop_count(guild_id):
+    """Number of drops already closed for a guild (0 if none)."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) AS cnt FROM drop_history WHERE guild_id = $1", guild_id
+        )
+    return row["cnt"] if row else 0
+
+
+async def db_set_web_access_key(guild_id, key, guild_name=None):
+    """Store (or replace) the web dashboard access key for a guild."""
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO server_settings (guild_id, web_access_key, guild_name)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (guild_id) DO UPDATE SET
+                web_access_key = $2,
+                guild_name = COALESCE($3, server_settings.guild_name)
+        """, guild_id, key, guild_name)
+
+
+async def db_get_web_access_key(guild_id):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT web_access_key FROM server_settings WHERE guild_id = $1", guild_id
+        )
+    return row["web_access_key"] if row else None
+
+
+async def db_refresh_caches():
+    """Reload admins, managers and settings from the DB into memory.
+
+    Runs periodically so changes made through the web dashboard (payment
+    methods, managers, channels) take effect in the live bot without a
+    restart. Only touches DB-backed config caches — never live drop state.
+    """
+    global server_admins, server_managers, server_settings
+    new_admins = {}
+    new_managers = defaultdict(set)
+    new_settings = {}
+    async with db_pool.acquire() as conn:
+        for row in await conn.fetch("SELECT guild_id, user_id FROM server_admins"):
+            new_admins[row["guild_id"]] = row["user_id"]
+        for row in await conn.fetch("SELECT guild_id, user_id FROM server_managers"):
+            new_managers[row["guild_id"]].add(row["user_id"])
+        for row in await conn.fetch("SELECT * FROM server_settings"):
+            new_settings[row["guild_id"]] = {
+                "drop_channel_id": row["drop_channel_id"],
+                "venmo": row["venmo"],
+                "zelle": row["zelle"],
+                "cashapp": row["cashapp"],
+                "applepay": row["applepay"],
+            }
+            if row["raffle_channel_id"]:
+                server_raffle_channel[row["guild_id"]] = row["raffle_channel_id"]
+    server_admins = new_admins
+    server_managers = new_managers
+    server_settings = new_settings
+
+
 async def db_save_raffle_host(guild_id: int, host_num: int):
     h = raffle_hosts[guild_id].get(host_num, {})
     async with db_pool.acquire() as conn:
@@ -422,8 +545,10 @@ server_raffles        = defaultdict(dict)   # guild_id -> {name -> raffle_dict}
 server_raffle_channel = {}                  # guild_id -> channel_id
 raffle_hosts          = defaultdict(dict)   # guild_id -> {1: {...}, 2: {...}}
 
-# Tracking numbers — guild_id -> user_id -> tracking number string
-tracking_numbers = defaultdict(dict)
+# Current drop number per guild (the number shown to buyers for the active /
+# most-recently-closed drop). Set when a drop is staged/goes live and reused
+# through close so buyers know which drop an order belongs to.
+current_drop_number = {}
 
 # Archived payments from previous drop — preserved when new drop starts
 # so buyers can still !paid and managers can still !confirm after a new drop begins
@@ -518,7 +643,9 @@ def get_user_total_owed(guild_id, user_id):
 
 
 def build_stock_embed(guild_id):
-    embed = discord.Embed(title="🛒  Drop Stock", color=discord.Color.gold(), timestamp=datetime.datetime.utcnow())
+    dn = current_drop_number.get(guild_id)
+    title = f"🛒  Drop #{dn} Stock" if dn else "🛒  Drop Stock"
+    embed = discord.Embed(title=title, color=discord.Color.gold(), timestamp=datetime.datetime.utcnow())
     for key, info in stock[guild_id].items():
         claimed = sum(c["qty"] for c in claims[guild_id][key])
         qty_left = info["qty"] - claimed
@@ -764,12 +891,13 @@ async def close_drop(channel, guild_id):
         history_summary[item_display] = {"qty": item_qty, "revenue": item_revenue}
     await db_save_drop_history(guild_id, total_revenue, total_items, len(buyers), history_summary)
 
-    # Get drop number for user claims
+    # Get drop number for user claims (drop_history now includes this drop)
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT COUNT(*) as cnt FROM drop_history WHERE guild_id = $1", guild_id
         )
         drop_number = row["cnt"] if row else 1
+    current_drop_number[guild_id] = drop_number
 
     # Save per-user claim records
     confirmed_users = {
@@ -798,7 +926,7 @@ async def close_drop(channel, guild_id):
 
     # Post fresh final claim list with paid/unpaid status
     final_cl_embed = build_live_claimlist_embed(guild_id)
-    final_cl_embed.title = "🔴  Drop CLOSED — Final Claim List"
+    final_cl_embed.title = f"🔴  Drop #{drop_number} CLOSED — Final Claim List"
     final_cl_embed.color = discord.Color.red()
     await channel.send(embed=final_cl_embed)
 
@@ -827,7 +955,7 @@ async def close_drop(channel, guild_id):
         lines = "\n".join(f"• **{display}**  ×{qty}  — ${subtotal:.2f}" for display, qty, subtotal in items)
         try:
             await user.send(
-                f"🧾  **Drop closed! Here's your order summary:**\n{lines}\n"
+                f"🧾  **Drop #{drop_number} closed! Here's your order summary:**\n{lines}\n"
                 f"**Total owed: ${total:.2f}**\n\n"
                 f"**Send payment using one of these methods:**\n{payment_info}\n\n"
                 f"Once you've sent payment, go back to the server and type:\n"
@@ -923,11 +1051,29 @@ async def on_command_error(ctx, error):
     else:
         raise error
 
+_refresh_task_started = False
+
+
+async def _config_refresh_loop():
+    """Periodically pull web-dashboard config changes into the live bot."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        await asyncio.sleep(60)
+        try:
+            await db_refresh_caches()
+        except Exception as e:
+            print(f"⚠️  config refresh failed: {e}")
+
+
 @bot.event
 async def on_ready():
+    global _refresh_task_started
     await init_db()
     await db_load_all()
     await bot.tree.sync()
+    if not _refresh_task_started:
+        _refresh_task_started = True
+        bot.loop.create_task(_config_refresh_loop())
     # Re-register persistent raffle Views so buttons work after restart
     for guild_id, raffles in server_raffles.items():
         for name, raffle in raffles.items():
@@ -1135,6 +1281,9 @@ async def cmd_drop(ctx):
         }
 
     session_state[guild_id] = "staging"
+    # The upcoming drop's number = drops closed so far + 1. Shown to buyers so
+    # they know which drop their order came from.
+    current_drop_number[guild_id] = await db_get_drop_count(guild_id) + 1
     stock[guild_id] = {}
     claims[guild_id] = defaultdict(list)
     waitlist[guild_id] = defaultdict(list)
@@ -1381,6 +1530,9 @@ async def cmd_release(ctx):
         await dm(ctx, "⚠️  No stock loaded.")
         return
     session_state[guild_id] = "live"
+    # Confirm the drop number now that we're going live.
+    current_drop_number[guild_id] = await db_get_drop_count(guild_id) + 1
+    dn = current_drop_number[guild_id]
     # Post all three live boards together
     stock_msg = await drop_channel.send(embed=build_stock_embed(guild_id))
     stock_message[guild_id] = stock_msg
@@ -1388,7 +1540,7 @@ async def cmd_release(ctx):
     live_claimlist_message[guild_id] = cl_msg
     pb_msg = await drop_channel.send(embed=build_payment_board_embed(guild_id))
     payment_board_message[guild_id] = pb_msg
-    await drop_channel.send("🟢  **Drop is LIVE!**  First come, first served!")
+    await drop_channel.send(f"🟢  **Drop #{dn} is LIVE!**  First come, first served!")
     await drop_channel.send(embed=build_howto_embed())
     try:
         await stock_msg.pin()
@@ -1728,7 +1880,11 @@ async def cmd_claim(ctx, *, args=""):
         return
 
     # ── EASTER EGGS ────────────────────────────────────────────────
-    if args.strip().lower() == "all":
+    lowered = args.strip().lower()
+    # Strip surrounding punctuation/whitespace for phrase matching
+    normalized_phrase = " ".join(lowered.replace("!", " ").replace(".", " ").split())
+
+    if lowered == "all":
         oak_response = (
             "🔴  *Oak's words echoed: "
             "'There's a time and place for everything, but not now.' "
@@ -1743,7 +1899,29 @@ async def cmd_claim(ctx, *, args=""):
         await ctx.send(random.choice(responses))
         return
 
-    if "luck" in args.lower():
+    # Greedy "one of each / one of every / all the things" attempts
+    GREEDY_PHRASES = (
+        "one of each", "1 of each", "one of every", "1 of every",
+        "one of everything", "one of all", "each of them", "each one",
+        "of each", "of every", "everything", "every item", "all items",
+        "all of them", "all of it", "all of the", "all the", "the lot",
+        "whole drop", "entire drop", "the drop", "gimme all", "give me all",
+        "one each", "1 each", "two of each", "2 of each",
+    )
+    if any(phrase in normalized_phrase for phrase in GREEDY_PHRASES):
+        greedy_responses = [
+            "🐷  Whoa there, Snorlax. You can't `!claim one of each` — claim items one at a time: `!claim <item> <qty>`.",
+            "🎒  Your bag is full! Trainers grab one item at a time around here. Use `!claim <item> <qty>`.",
+            "🚫  *That's not how the PokéMart works.* No bulk grabs — `!claim <item> <qty>`, please.",
+            "🤑  Nice try, but the whole drop isn't a single Poké Ball. Claim items individually: `!claim <item> <qty>`.",
+            "🛑  Officer Jenny pulled you over for greedy driving. One claim at a time: `!claim <item> <qty>`.",
+            "😼  Team Rocket would be proud, but no — you've gotta `!claim <item> <qty>` for each thing you want.",
+            "📦  *Wild GREED appeared!* It fled when it saw the rules. Claim one item at a time: `!claim <item> <qty>`.",
+        ]
+        await ctx.send(random.choice(greedy_responses))
+        return
+
+    if "luck" in lowered:
         await ctx.send(
             "🎰  Even Arceus couldn't find *luck* in this drop. "
             "It's not in stock. Check `!stock` for what's real."
@@ -1762,6 +1940,15 @@ async def cmd_claim(ctx, *, args=""):
         return
     if qty < 1:
         await ctx.send("⚠️  Qty must be at least 1.")
+        return
+    if qty >= 1000:
+        absurd_responses = [
+            f"🪙  **{qty}**? That's more than Bill's PC can hold. Try a real number: `!claim <item> <qty>`.",
+            f"🐉  Even a Wailord can't carry **{qty}** of these. Dial it back a bit.",
+            f"💸  *Trainer wants to claim {qty}.* The Game Corner has a limit, you know. Pick a sane qty.",
+            f"🤖  ERROR: **{qty}** exceeds the laws of this universe. Claim a believable amount instead.",
+        ]
+        await ctx.send(random.choice(absurd_responses))
         return
     key = normalize(item_name)
     if key not in stock[guild_id]:
@@ -2362,7 +2549,7 @@ async def cmd_myhistory(ctx):
 
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT drop_number, closed_at, item_display, qty, price, subtotal, confirmed
+            SELECT drop_number, closed_at, item_display, qty, price, subtotal, confirmed, tracking
             FROM user_claims
             WHERE guild_id = $1 AND user_id = $2
             ORDER BY closed_at DESC, drop_number DESC
@@ -2383,6 +2570,7 @@ async def cmd_myhistory(ctx):
                 "items": [],
                 "total": 0.0,
                 "confirmed": row["confirmed"],
+                "tracking": row["tracking"],
             }
         drops[dn]["items"].append({
             "display": row["item_display"],
@@ -2393,6 +2581,9 @@ async def cmd_myhistory(ctx):
         # confirmed = True if any item in drop is confirmed
         if row["confirmed"]:
             drops[dn]["confirmed"] = True
+        # tracking is per drop; keep the first non-empty value seen
+        if row["tracking"] and not drops[dn].get("tracking"):
+            drops[dn]["tracking"] = row["tracking"]
 
     embed = discord.Embed(
         title=f"📋  {ctx.author.display_name}'s Claim History",
@@ -2410,6 +2601,8 @@ async def cmd_myhistory(ctx):
             item_lines.append(f"- {item['display']}  x{item['qty']}  - ${item['subtotal']:.2f}")
         lines_str = "\n".join(item_lines)
         field_value = f"{lines_str}\n**Total: ${drop['total']:.2f}**\n{status}"
+        if drop.get("tracking"):
+            field_value += f"\n📦  Shipped — Tracking: `{drop['tracking']}`"
         if len(field_value) > 1024:
             field_value = field_value[:1020] + "..."
         embed.add_field(
@@ -3547,9 +3740,50 @@ async def cmd_payments(ctx):
         await ctx.send("⚠️  I couldn't DM you — please open your DMs and try again.")
 
 
+@bot.command(name="webkey")
+async def cmd_webkey(ctx, action: str = ""):
+    """Show or reset this server's web dashboard access key.
+
+    Usage: !webkey            — show current key (creates one if missing)
+           !webkey reset      — generate a brand new key (old one stops working)
+    The key is DM'd to you, never posted in the channel.
+    """
+    if not ctx.guild:
+        await ctx.author.send("⚠️  Please run `!webkey` in your server channel.")
+        return
+    guild_id = ctx.guild.id
+    if not is_manager(guild_id, ctx.author.id):
+        return
+    await silent(ctx)
+
+    key = await db_get_web_access_key(guild_id)
+    action = action.strip().lower()
+    if action == "reset" or not key:
+        key = secrets.token_urlsafe(24)
+    # Always persist (refreshes stored server name; harmless no-op on show).
+    await db_set_web_access_key(guild_id, key, ctx.guild.name)
+    await db_refresh_caches()
+
+    base_url = os.getenv("WEB_BASE_URL", "").rstrip("/")
+    where = f"{base_url}/login" if base_url else "your Drop Bot web dashboard"
+    verb = "reset" if action == "reset" else "is ready"
+    await dm(
+        ctx,
+        f"🔑  **Web dashboard access key {verb} for {ctx.guild.name}:**\n"
+        f"```\n{key}\n```\n"
+        f"Go to {where} and paste this key to sign in.\n\n"
+        f"⚠️  Anyone with this key can manage the server's drop records — keep it "
+        f"private. Run `!webkey reset` to invalidate it and get a new one."
+    )
+
+
 @bot.command(name="addtracking")
 async def cmd_addtracking(ctx, *, args=""):
-    """Attach a tracking number to a buyer. Usage: !addtracking @user <tracking#>"""
+    """Attach a tracking number to a buyer.
+
+    Usage: !addtracking @user [drop <#>] <tracking#>
+    Defaults to the buyer's most recent drop if no drop is given.
+    """
     if not ctx.guild:
         await ctx.author.send("⚠️  Please run `!addtracking` in your server channel.")
         return
@@ -3558,21 +3792,67 @@ async def cmd_addtracking(ctx, *, args=""):
         return
     await silent(ctx)
     if not ctx.message.mentions:
-        await dm(ctx, "Usage: `!addtracking @user <tracking number>`")
+        await dm(ctx, "Usage: `!addtracking @user [drop <#>] <tracking number>`")
         return
     user = ctx.message.mentions[0]
-    # Strip the mention from args to get tracking number
-    tracking = args.replace(f"<@{user.id}>", "").replace(f"<@!{user.id}>", "").strip()
+    # Strip the mention from args to get the rest
+    rest = args.replace(f"<@{user.id}>", "").replace(f"<@!{user.id}>", "").strip()
+
+    # Optional leading drop specifier: "drop 7", "drop #7", "#7", or "d7"
+    requested_drop = None
+    m = re.match(r"^\s*(?:drop\s*#?|d|#)\s*(\d+)\s+(.*)$", rest, re.IGNORECASE)
+    if m:
+        requested_drop = int(m.group(1))
+        tracking = m.group(2).strip()
+    else:
+        tracking = rest
+
     if not tracking:
-        await dm(ctx, "Usage: `!addtracking @user <tracking number>`\\nExample: `!addtracking @SpacemanG 1Z999AA10123456784`")
+        await dm(
+            ctx,
+            "Usage: `!addtracking @user [drop <#>] <tracking number>`\n"
+            "Examples:\n"
+            "• `!addtracking @SpacemanG 1Z999AA10123456784` (most recent drop)\n"
+            "• `!addtracking @SpacemanG drop 7 1Z999AA10123456784`"
+        )
         return
-    tracking_numbers[guild_id][user.id] = tracking
-    await dm(ctx, f"✅  Tracking number **{tracking}** saved for **{user.display_name}**.")
+    # Persist the tracking number to the chosen drop in the DB so it becomes a
+    # permanent part of the buyer's order history (survives restarts).
+    drop_no = await db_set_user_claim_tracking(guild_id, user.id, tracking, requested_drop)
+    if drop_no is None:
+        if requested_drop is not None:
+            drops = await db_get_user_drop_numbers(guild_id, user.id)
+            if drops:
+                have = ", ".join(f"#{d}" for d in drops)
+                await dm(
+                    ctx,
+                    f"⚠️  **{user.display_name}** has no order in **Drop #{requested_drop}**. "
+                    f"They have orders in: {have}."
+                )
+            else:
+                await dm(
+                    ctx,
+                    f"⚠️  **{user.display_name}** has no saved orders yet. "
+                    f"Orders are saved once a drop closes (`!enddrop`)."
+                )
+        else:
+            await dm(
+                ctx,
+                f"⚠️  **{user.display_name}** has no saved orders yet, so there's nothing to "
+                f"attach tracking to. Orders are saved once a drop closes (`!enddrop`)."
+            )
+        return
+    await dm(
+        ctx,
+        f"✅  Tracking number **{tracking}** saved for **{user.display_name}** "
+        f"on **Drop #{drop_no}**."
+    )
     # DM the buyer their tracking number
     try:
         await user.send(
-            f"📦  Your order has shipped! Here is your tracking number:\\n"
-            f"**{tracking}**\\n\\n"
+            f"📦  Your order from **Drop #{drop_no}** has shipped! "
+            f"Here is your tracking number:\n"
+            f"**{tracking}**\n\n"
             f"You can use `!myhistory` to view your full order history."
         )
     except discord.Forbidden:
@@ -3593,6 +3873,16 @@ async def cmd_export(ctx):
     stock_ref  = stock[guild_id]  if stock[guild_id]  else last_drop_snapshot.get(guild_id, {}).get("stock",  {})
     claims_ref = claims[guild_id] if claims[guild_id] else last_drop_snapshot.get(guild_id, {}).get("claims", {})
     archived   = archived_payments.get(guild_id, {})
+
+    # Most recent tracking number per buyer, pulled from persistent history.
+    async with db_pool.acquire() as conn:
+        trows = await conn.fetch("""
+            SELECT DISTINCT ON (user_id) user_id, tracking
+            FROM user_claims
+            WHERE guild_id = $1 AND tracking IS NOT NULL AND tracking <> ''
+            ORDER BY user_id, drop_number DESC
+        """, guild_id)
+    tracking_map = {r["user_id"]: r["tracking"] for r in trows}
 
     # ── Styles ────────────────────────────────────────────────────────────────
     wb = openpyxl.Workbook()
@@ -3674,7 +3964,7 @@ async def cmd_export(ctx):
     for uid, udata in user_totals.items():
         confirmed = sum(p["amount"] for p in payments[guild_id].get(uid, []) if p["confirmed"])
         outstanding = max(udata["owed"] - confirmed, 0)
-        tracking = tracking_numbers.get(guild_id, {}).get(uid, "")
+        tracking = tracking_map.get(uid, "")
         if outstanding <= 0.01 and confirmed > 0:
             status = "✅ Paid"
             fill = PAID_FILL
@@ -3728,7 +4018,7 @@ async def cmd_export(ctx):
             f"{p['method'].title()} ${p['amount']:.2f}"
             for p in uid_pmts if p["confirmed"]
         ) or "None"
-        tracking = tracking_numbers.get(guild_id, {}).get(uid, "")
+        tracking = tracking_map.get(uid, "")
         if outstanding <= 0.01 and confirmed > 0:
             status = "✅ Paid"
             fill = PAID_FILL

@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Managers{% endblock %}
+{% block content %}
+<h1>Managers</h1>
+{% if msg %}<div class="alert ok">{{ msg }}</div>{% endif %}
+
+<p class="muted small">
+  Managers can run drop commands in Discord and sign in here. Add them by Discord
+  user ID (enable Developer Mode, right-click a user → Copy User ID).
+</p>
+
+{% if admin %}
+<p><strong>Server admin:</strong> <code>{{ admin }}</code>
+  <span class="muted small">(managed in Discord)</span></p>
+{% endif %}
+
+<table>
+  <thead><tr><th>Manager (user ID)</th><th></th></tr></thead>
+  <tbody>
+    {% for m in managers %}
+    <tr>
+      <td><code>{{ m }}</code></td>
+      <td>
+        <form method="post" action="/managers/remove" class="inline">
+          <input type="hidden" name="user_id" value="{{ m }}">
+          <button class="btn small danger" type="submit">Remove</button>
+        </form>
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="2" class="muted">No managers yet.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<h2>Add a manager</h2>
+<form method="post" action="/managers/add" class="inline-form">
+  <input name="user_id" placeholder="Discord user ID" autocomplete="off">
+  <button type="submit">Add manager</button>
+</form>
+{% endblock %}
