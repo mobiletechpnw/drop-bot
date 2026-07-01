@@ -3765,13 +3765,20 @@ async def cmd_webkey(ctx, action: str = ""):
     await db_refresh_caches()
 
     base_url = os.getenv("WEB_BASE_URL", "").rstrip("/")
-    where = f"{base_url}/login" if base_url else "your Drop Bot web dashboard"
     verb = "reset" if action == "reset" else "is ready"
+    if base_url:
+        link_line = f"🔗  **Dashboard:** {base_url}/login\n"
+    else:
+        link_line = (
+            "🔗  **Dashboard:** open your Drop Bot web dashboard and go to `/login`\n"
+            "_(Tip: set `WEB_BASE_URL` on the bot to show the full link here.)_\n"
+        )
     await dm(
         ctx,
         f"🔑  **Web dashboard access key {verb} for {ctx.guild.name}:**\n"
         f"```\n{key}\n```\n"
-        f"Go to {where} and paste this key to sign in.\n\n"
+        f"{link_line}"
+        f"Paste this key on the login page to sign in.\n\n"
         f"⚠️  Anyone with this key can manage the server's drop records — keep it "
         f"private. Run `!webkey reset` to invalidate it and get a new one."
     )
