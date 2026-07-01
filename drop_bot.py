@@ -52,6 +52,7 @@ MANAGER / ADMIN COMMANDS (server or DM after !drop)
     !history                         — View last 10 drop summaries (DM)
     !export                          — Generate Excel spreadsheet: orders, payments, raffles (DM)
     !addtracking @user [drop #] <tracking#> — Attach tracking (defaults to their latest drop) and notify the buyer
+    !notifytracking <drop#>          — Re-send shipping DMs for all tracking already saved on a drop
     !webkey [reset]                  — DM your web dashboard access key (add/manage info from the browser)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -430,6 +431,22 @@ async def db_get_user_drop_numbers(guild_id, user_id):
             ORDER BY drop_number
         """, guild_id, user_id)
     return [r["drop_number"] for r in rows]
+
+
+async def db_get_drop_tracking(guild_id, drop_number):
+    """Distinct (user_id, tracking) pairs for a drop that already have a
+    tracking number saved — used to backfill notifications for tracking
+    that was set before the notify-on-save mechanism existed (e.g. tracking
+    added via the web dashboard before it started queuing DMs)."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT DISTINCT ON (user_id) user_id, user_name, tracking
+            FROM user_claims
+            WHERE guild_id = $1 AND drop_number = $2
+              AND tracking IS NOT NULL AND tracking <> ''
+            ORDER BY user_id
+        """, guild_id, drop_number)
+    return rows
 
 
 async def db_get_drop_count(guild_id):
@@ -4002,6 +4019,55 @@ async def cmd_addtracking(ctx, *, args=""):
         )
     except discord.Forbidden:
         await dm(ctx, f"⚠️  Saved, but couldn't DM **{user.display_name}** — their DMs may be closed.")
+
+
+@bot.command(name="notifytracking")
+async def cmd_notifytracking(ctx, drop_number: str = ""):
+    """Re-send the shipping DM for every tracking number already saved on a drop.
+
+    Usage: !notifytracking <drop#>
+
+    For tracking numbers that were added (e.g. via the web dashboard) before
+    they triggered a Discord DM, or if a buyer's original DM failed. Buyers
+    who already got the DM will get it again — this isn't diffed against
+    delivery history, so use it deliberately rather than routinely.
+    """
+    if not ctx.guild:
+        await ctx.author.send("⚠️  Please run `!notifytracking` in your server channel.")
+        return
+    guild_id = ctx.guild.id
+    if not is_manager(guild_id, ctx.author.id):
+        return
+    await silent(ctx)
+    if not drop_number.strip().isdigit():
+        await dm(ctx, "Usage: `!notifytracking <drop#>`  e.g. `!notifytracking 13`")
+        return
+    dn = int(drop_number.strip())
+
+    rows = await db_get_drop_tracking(guild_id, dn)
+    if not rows:
+        await dm(ctx, f"⚠️  No saved tracking numbers found for **Drop #{dn}**.")
+        return
+
+    sent, failed = 0, []
+    for row in rows:
+        message = (
+            f"📦  Your order from **Drop #{dn}** has shipped! "
+            f"Here is your tracking number:\n"
+            f"**{row['tracking']}**\n\n"
+            f"You can use `!myhistory` to view your full order history."
+        )
+        try:
+            user = bot.get_user(row["user_id"]) or await bot.fetch_user(row["user_id"])
+            await user.send(message)
+            sent += 1
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            failed.append(row["user_name"])
+
+    summary = f"✅  Notified **{sent}** buyer(s) for **Drop #{dn}**."
+    if failed:
+        summary += f"\n⚠️  Couldn't DM: {', '.join(failed)} (DMs may be closed)."
+    await dm(ctx, summary)
 
 
 @bot.command(name="export")
