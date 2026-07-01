@@ -180,7 +180,7 @@ async def login_form(request: Request):
     if request.session.get("guild_id"):
         return RedirectResponse("/", status_code=303)
     return templates.TemplateResponse(
-        "login.html", {"request": request, "error": None}
+        request, "login.html", {"error": None}
     )
 
 
@@ -206,8 +206,9 @@ async def login_submit(request: Request, key: str = Form("")):
             request.session["guild_name"] = row["guild_name"] or str(row["guild_id"])
             return RedirectResponse("/", status_code=303)
     return templates.TemplateResponse(
+        request,
         "login.html",
-        {"request": request, "error": "Invalid access key. Run !webkey in Discord."},
+        {"error": "Invalid access key. Run !webkey in Discord."},
         status_code=401,
     )
 
@@ -266,7 +267,7 @@ async def admin_overview(request: Request):
         "revenue": sum(s["revenue"] for s in stores),
         "outstanding": sum(s["outstanding"] for s in stores),
     }
-    return templates.TemplateResponse("admin.html", _ctx(
+    return templates.TemplateResponse(request, "admin.html", _ctx(
         request, None, None, stores=stores, totals=totals,
     ))
 
@@ -317,7 +318,7 @@ async def dashboard(request: Request):
                ) t""",
             gid,
         )
-    return templates.TemplateResponse("dashboard.html", _ctx(
+    return templates.TemplateResponse(request, "dashboard.html", _ctx(
         request, gid, gname,
         stats=dict(stats), recent=[dict(r) for r in recent],
         untracked=untracked["n"] if untracked else 0,
@@ -335,7 +336,7 @@ async def settings_form(request: Request, saved: int = 0):
         row = await conn.fetchrow(
             "SELECT * FROM server_settings WHERE guild_id = $1", gid
         )
-    return templates.TemplateResponse("settings.html", _ctx(
+    return templates.TemplateResponse(request, "settings.html", _ctx(
         request, gid, gname, s=dict(row) if row else None, saved=bool(saved),
     ))
 
@@ -392,7 +393,7 @@ async def managers_view(request: Request, msg: str = ""):
         arow = await conn.fetchrow(
             "SELECT user_id FROM server_admins WHERE guild_id = $1", gid
         )
-    return templates.TemplateResponse("managers.html", _ctx(
+    return templates.TemplateResponse(request, "managers.html", _ctx(
         request, gid, gname,
         managers=[r["user_id"] for r in mrows],
         admin=arow["user_id"] if arow else None,
@@ -448,7 +449,7 @@ async def drops_list(request: Request):
                ORDER BY closed_at DESC""",
             gid,
         )
-    return templates.TemplateResponse("drops.html", _ctx(
+    return templates.TemplateResponse(request, "drops.html", _ctx(
         request, gid, gname, drops=[dict(r) for r in rows],
     ))
 
@@ -469,7 +470,7 @@ async def drop_detail(request: Request, drop_number: int, msg: str = "", view: s
     unpaid_count = sum(1 for o in orders_all if not o["confirmed"])
     show_unpaid = (view == "unpaid")
     orders = [o for o in orders_all if not o["confirmed"]] if show_unpaid else orders_all
-    return templates.TemplateResponse("drop_detail.html", _ctx(
+    return templates.TemplateResponse(request, "drop_detail.html", _ctx(
         request, gid, gname,
         drop_number=drop_number, orders=orders, total=total,
         closed_at=meta["closed_at"] if meta else None, msg=msg,
@@ -571,7 +572,7 @@ async def orders_search(request: Request, q: str = ""):
                     gid, f"%{q}%",
                 )
         results = [dict(r) for r in rows]
-    return templates.TemplateResponse("orders.html", _ctx(
+    return templates.TemplateResponse(request, "orders.html", _ctx(
         request, gid, gname, q=q, results=results,
     ))
 
