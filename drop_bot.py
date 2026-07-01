@@ -250,6 +250,45 @@ async def init_db():
                 last_seen  TIMESTAMP NOT NULL DEFAULT NOW()
             )
         """)
+        # ── Live-drop mirror + dashboard write-back ───────────────────────────
+        # A live drop's claims and payment status live only in this process's
+        # memory until it closes. These two tables let the web dashboard *see*
+        # an in-progress drop (live_orders / live_drops, written by the bot) and
+        # *act* on it (pending_actions, an outbox the dashboard writes and the
+        # bot applies back into its in-memory state — the reverse of
+        # pending_notifications).
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS live_drops (
+                guild_id    BIGINT PRIMARY KEY,
+                drop_number INT,
+                is_live     BOOLEAN NOT NULL DEFAULT FALSE,
+                updated_at  TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS live_orders (
+                guild_id        BIGINT NOT NULL,
+                user_id         BIGINT NOT NULL,
+                user_name       TEXT NOT NULL,
+                drop_number     INT,
+                items           JSONB NOT NULL,
+                total           NUMERIC NOT NULL,
+                confirmed_total NUMERIC NOT NULL DEFAULT 0,
+                paid            BOOLEAN NOT NULL DEFAULT FALSE,
+                updated_at      TIMESTAMP NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (guild_id, user_id)
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_actions (
+                id         SERIAL PRIMARY KEY,
+                guild_id   BIGINT NOT NULL,
+                user_id    BIGINT NOT NULL,
+                action     TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                applied_at TIMESTAMP
+            )
+        """)
     print("✅  Database ready.")
 
 
@@ -907,6 +946,149 @@ async def update_all_live_boards(guild_id):
         except discord.HTTPException:
             pass
 
+    # Mirror the live drop to the DB so the web dashboard can see/act on it.
+    try:
+        await db_sync_live_orders(guild_id)
+    except Exception as e:
+        print(f"⚠️  live order sync failed for {guild_id}: {e}")
+
+
+def _live_buyer_orders(guild_id):
+    """Per-buyer orders for the *current* in-memory drop.
+
+    Returns {user_id: {"user_name", "items": [...], "total"}} computed from the
+    live claims and stock — the same numbers the live claim list shows.
+    """
+    stock_ref = stock[guild_id]
+    orders = {}
+    for key, claim_list in claims[guild_id].items():
+        if key not in stock_ref:
+            continue
+        price = stock_ref[key]["price"]
+        display = stock_ref[key]["display"]
+        for c in claim_list:
+            uid = c["user"].id
+            o = orders.setdefault(uid, {
+                "user_name": c["user"].display_name, "items": [], "total": 0.0,
+            })
+            subtotal = c["qty"] * price
+            o["items"].append({
+                "display": display, "qty": c["qty"], "subtotal": round(subtotal, 2),
+            })
+            o["total"] += subtotal
+    return orders
+
+
+def _live_owed(guild_id, user_id):
+    """What a single buyer owes in the current live drop."""
+    total = 0.0
+    for key, claim_list in claims[guild_id].items():
+        if key not in stock[guild_id]:
+            continue
+        price = stock[guild_id][key]["price"]
+        for c in claim_list:
+            if c["user"].id == user_id:
+                total += c["qty"] * price
+    return total
+
+
+async def db_sync_live_orders(guild_id):
+    """Write the current live drop's per-buyer orders to the DB mirror.
+
+    Called on every live board update (and at go-live / close). When no drop is
+    live the mirror is cleared, so the dashboard never shows a stale live drop.
+    """
+    live = session_state[guild_id] == "live"
+    dn = current_drop_number.get(guild_id)
+    orders = _live_buyer_orders(guild_id) if live else {}
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "DELETE FROM live_orders WHERE guild_id = $1", guild_id
+            )
+            for uid, o in orders.items():
+                confirmed_total = sum(
+                    p["amount"] for p in payments[guild_id][uid] if p["confirmed"]
+                )
+                paid = o["total"] > 0 and confirmed_total >= o["total"] - 0.01
+                await conn.execute("""
+                    INSERT INTO live_orders
+                        (guild_id, user_id, user_name, drop_number, items,
+                         total, confirmed_total, paid, updated_at)
+                    VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, NOW())
+                """, guild_id, uid, o["user_name"], dn, json.dumps(o["items"]),
+                    round(o["total"], 2), round(confirmed_total, 2), paid)
+            await conn.execute("""
+                INSERT INTO live_drops (guild_id, drop_number, is_live, updated_at)
+                VALUES ($1, $2, $3, NOW())
+                ON CONFLICT (guild_id)
+                DO UPDATE SET drop_number = $2, is_live = $3, updated_at = NOW()
+            """, guild_id, dn, live)
+
+
+async def _apply_pending_action(guild_id, user_id, action):
+    """Apply a paid/unpaid action the web dashboard queued for a live drop.
+
+    Mirrors what a manager does in Discord: `confirm` marks the buyer paid
+    (confirming any reported payments and topping up the rest so their order is
+    fully covered); `unconfirm` reverses it. Only applies while the drop is
+    live — once it closes, the dashboard edits history via user_claims instead.
+    """
+    if session_state[guild_id] != "live":
+        return
+    pmts = payments[guild_id][user_id]
+    if action == "confirm":
+        for p in pmts:
+            p["confirmed"] = True
+        owed = _live_owed(guild_id, user_id)
+        confirmed_total = sum(p["amount"] for p in pmts if p["confirmed"])
+        if owed - confirmed_total > 0.01:
+            pmts.append({
+                "method": "manual",
+                "amount": round(owed - confirmed_total, 2),
+                "time": datetime.datetime.utcnow(),
+                "confirmed": True,
+                "source": "dashboard",
+            })
+        buyer = bot.get_user(user_id)
+        if buyer:
+            try:
+                await buyer.send(
+                    "✅  Your payment for the current drop has been confirmed! "
+                    "Thanks so much — enjoy your order! 🎉"
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        asyncio.create_task(update_all_live_boards(guild_id))
+    elif action == "unconfirm":
+        # Drop dashboard top-ups entirely, un-confirm any real reported payments.
+        pmts[:] = [p for p in pmts if p.get("source") != "dashboard"]
+        for p in pmts:
+            p["confirmed"] = False
+        asyncio.create_task(update_all_live_boards(guild_id))
+
+
+async def _process_pending_actions():
+    """Apply dashboard-queued live-drop paid/unpaid actions into bot memory."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, guild_id, user_id, action FROM pending_actions
+            WHERE applied_at IS NULL ORDER BY created_at LIMIT 50
+        """)
+    for row in rows:
+        try:
+            await _apply_pending_action(
+                row["guild_id"], row["user_id"], row["action"]
+            )
+        except Exception as e:
+            print(f"⚠️  pending action {row['id']} failed: {e}")
+        finally:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE pending_actions SET applied_at = NOW() WHERE id = $1",
+                    row["id"],
+                )
+
 
 async def update_stock_embed(guild_id):
     msg = stock_message.get(guild_id)
@@ -995,6 +1177,13 @@ async def close_drop(channel, guild_id):
         guild_id, drop_number, closed_at,
         claims[guild_id], stock[guild_id], confirmed_users
     )
+
+    # Clear the live-drop mirror — this drop now lives in user_claims, and the
+    # dashboard should no longer show it as in-progress.
+    try:
+        await db_sync_live_orders(guild_id)
+    except Exception as e:
+        print(f"⚠️  live order clear failed for {guild_id}: {e}")
 
     # Final live update of claim list and payment board
     cl_msg = live_claimlist_message.get(guild_id)
@@ -1185,7 +1374,7 @@ async def _deliver_pending_notifications():
 
 
 async def _notification_loop():
-    """Poll for web-dashboard notifications and deliver them promptly."""
+    """Poll for web-dashboard notifications and dashboard actions."""
     await bot.wait_until_ready()
     while not bot.is_closed():
         await asyncio.sleep(15)
@@ -1193,6 +1382,10 @@ async def _notification_loop():
             await _deliver_pending_notifications()
         except Exception as e:
             print(f"⚠️  notification delivery loop failed: {e}")
+        try:
+            await _process_pending_actions()
+        except Exception as e:
+            print(f"⚠️  pending action loop failed: {e}")
 
 
 @bot.event
@@ -1645,6 +1838,10 @@ async def cmd_countdown(ctx, minutes: str = ""):
             pinned_message[guild_id] = stock_msg
         except (discord.Forbidden, discord.HTTPException):
             pass
+        try:
+            await db_sync_live_orders(guild_id)
+        except Exception as e:
+            print(f"⚠️  live order sync failed for {guild_id}: {e}")
 
     asyncio.create_task(auto_release())
 
@@ -1702,6 +1899,10 @@ async def cmd_release(ctx):
         pinned_message[guild_id] = stock_msg
     except (discord.Forbidden, discord.HTTPException):
         pass
+    try:
+        await db_sync_live_orders(guild_id)
+    except Exception as e:
+        print(f"⚠️  live order sync failed for {guild_id}: {e}")
     await dm(ctx, "🟢  Drop is live!")
 
 

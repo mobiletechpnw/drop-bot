@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}Live drop{% endblock %}
+{% block content %}
+<div class="row-between">
+  <h1>Live drop{% if is_live and drop_number %} · Drop #{{ drop_number }}{% endif %}</h1>
+  <a class="btn ghost" href="/live">↻ Refresh</a>
+</div>
+
+{% if msg %}<div class="alert ok">{{ msg }}</div>{% endif %}
+
+{% if not is_live %}
+<p class="muted">
+  🔌 No drop is live right now. Staging stock, taking claims, and going live
+  still happen in Discord — once a drop is live it appears here so you can mark
+  buyers paid without switching to Discord. Closed drops live under
+  <a href="/drops">Drops</a>.
+</p>
+{% else %}
+<p class="muted">
+  Total {{ total | money }} · {{ unpaid_count }} unpaid ·
+  Marking paid/unpaid here syncs to the bot in ~15s, same as
+  <code>!confirm</code> in Discord. Refresh to see it land.
+  {% if updated_at %}<br>Live data as of {{ updated_at.strftime('%b %d, %Y %H:%M UTC') }}.{% endif %}
+</p>
+
+{% if orders %}
+<table class="orders">
+  <thead>
+    <tr><th>Buyer</th><th>Items</th><th>Total</th><th>Paid</th></tr>
+  </thead>
+  <tbody>
+    {% for o in orders %}
+    <tr>
+      <td>
+        <div class="buyer">{{ o.name }}</div>
+        <div class="muted small"><code>{{ o.user_id }}</code></div>
+      </td>
+      <td>
+        <ul class="items">
+          {% for it in o['items'] %}
+          <li>{{ it.display }} ×{{ it.qty }} — {{ it.subtotal | money }}</li>
+          {% endfor %}
+        </ul>
+      </td>
+      <td>{{ o.total | money }}</td>
+      <td>
+        {% if o.paid %}
+          <span class="pill ok">Paid</span>
+          <form method="post" action="/live/unconfirm" class="inline">
+            <input type="hidden" name="user_id" value="{{ o.user_id }}">
+            <button class="btn small ghost" type="submit">Undo</button>
+          </form>
+        {% else %}
+          <span class="pill warn">{{ o.confirmed_total | money }} of {{ o.total | money }}</span>
+          <form method="post" action="/live/confirm" class="inline">
+            <input type="hidden" name="user_id" value="{{ o.user_id }}">
+            <button class="btn small" type="submit">Mark paid</button>
+          </form>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">No claims yet in this drop.</p>
+{% endif %}
+{% endif %}
+{% endblock %}

@@ -16,12 +16,15 @@ bot.
   or **mark every unpaid order paid** in one click (updates saved history)
 - Add / edit **tracking numbers** per buyer per drop (permanent, in history) —
   the buyer gets DM'd on Discord, same as `!addtracking` (see below)
+- **Watch a live drop and mark buyers paid / unpaid on it** — the in-progress
+  drop mirrors to the **Live** page while it's running (see below)
 - Search all orders by buyer name or Discord user ID
 - Download a per-drop Excel export
 
-**Can't (by design):** run a *live* drop — staging stock, taking claims, and
-closing a drop still happen in Discord, because that state lives in the bot's
-memory until the drop closes. Config you change here (payments, managers,
+**Can't (by design):** *stage* a drop — loading stock, taking claims, going
+live, and closing still happen in Discord, because that live state lives in the
+bot's memory. (You *can* now mark payments on a live drop from the dashboard;
+see "Marking a live drop" below.) Config you change here (payments, managers,
 channels) is picked up by the running bot within ~60 seconds via its periodic
 config refresh.
 
@@ -72,6 +75,35 @@ which point the final paid status is snapshotted into `user_claims`. So while a
 drop is live, confirm payments in Discord (`!markpaid` / `!confirm` / `!paid`);
 the dashboard has nothing to edit for that drop until it closes, and then it
 stays in sync as described above.
+
+## Marking a live drop from the dashboard
+
+A drop that's currently live isn't in the database — its claims and payment
+status live in the bot's memory until it closes. To let the dashboard show and
+act on a live drop anyway, the bot mirrors it to the database and reads back an
+action outbox (the same split as the tracking notifications, in both
+directions):
+
+- **Visibility:** while a drop is live, the bot writes each buyer's items,
+  total, and confirmed amount to a `live_orders` table (and a `live_drops` flag)
+  every time the live boards update — roughly every couple of seconds. The
+  dashboard's **Live** page reads that. When no drop is live the mirror is
+  cleared, so the page shows "no drop is live".
+- **Write-back:** clicking **Mark paid** / **Undo** on the Live page writes a
+  row to a `pending_actions` table. The bot polls it every ~15s and applies it
+  to its in-memory payments, exactly like a manager running `!confirm` /
+  reversing it in Discord — the live claim list and payment board update, and
+  the buyer gets the same confirmation DM. **Mark paid** confirms any payment
+  the buyer already reported with `!paid` and tops up the rest so their order is
+  fully covered; **Undo** removes that top-up and un-confirms the reported
+  payments. So the change is reflected on Discord within ~15–30 seconds; hit
+  **Refresh** on the Live page to see it land back.
+
+When the drop **closes**, its final paid status is snapshotted into
+`user_claims` (the normal history) and the live mirror is cleared — from then on
+it's a closed drop you edit under **Drops**, and paid status stays in sync as
+described above. An action queued a moment before the drop closed is skipped
+rather than applied to the wrong drop; just mark it on the closed drop instead.
 
 ## Signing in
 

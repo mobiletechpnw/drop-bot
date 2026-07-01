@@ -6,11 +6,13 @@ A lightweight web interface for managing the DB-backed parts of a Drop Bot
 server without using Discord: payment methods, managers, drop history, orders,
 and shipping tracking. It talks to the SAME PostgreSQL database as the bot.
 
-Scope note: this dashboard manages persistent records only. Running a LIVE
-drop (staging stock, taking claims, closing) still happens in Discord, because
-that state lives in the bot's memory until a drop closes. Config changes made
-here (payment methods, managers, channels) are picked up by the running bot
-within ~60s via its periodic config refresh.
+Scope note: staging stock, taking claims, and closing a drop still happen in
+Discord, because that live state lives in the bot's memory. The dashboard can
+now *watch* a live drop and *mark buyers paid/unpaid* on it: the bot mirrors the
+live drop into the live_orders/live_drops tables, and this app writes buyer
+paid/unpaid actions to a pending_actions outbox the bot applies back into its
+in-memory state (~15s). Config changes made here (payment methods, managers,
+channels) are picked up by the running bot within ~60s via its config refresh.
 
 Auth: per-server access key. A manager runs `!webkey` in Discord to get the
 key, then pastes it here to sign in. The signed session cookie remembers which
@@ -25,6 +27,7 @@ Env:  DATABASE_URL (required, shared with the bot)
 
 import datetime
 import io
+import json
 import os
 import secrets
 from contextlib import asynccontextmanager
@@ -75,6 +78,33 @@ async def ensure_schema(pool):
                message    TEXT NOT NULL,
                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                sent_at    TIMESTAMP
+           )""",
+        # Live-drop mirror (written by the bot) + write-back outbox (written here).
+        """CREATE TABLE IF NOT EXISTS live_drops (
+               guild_id    BIGINT PRIMARY KEY,
+               drop_number INT,
+               is_live     BOOLEAN NOT NULL DEFAULT FALSE,
+               updated_at  TIMESTAMP NOT NULL DEFAULT NOW()
+           )""",
+        """CREATE TABLE IF NOT EXISTS live_orders (
+               guild_id        BIGINT NOT NULL,
+               user_id         BIGINT NOT NULL,
+               user_name       TEXT NOT NULL,
+               drop_number     INT,
+               items           JSONB NOT NULL,
+               total           NUMERIC NOT NULL,
+               confirmed_total NUMERIC NOT NULL DEFAULT 0,
+               paid            BOOLEAN NOT NULL DEFAULT FALSE,
+               updated_at      TIMESTAMP NOT NULL DEFAULT NOW(),
+               PRIMARY KEY (guild_id, user_id)
+           )""",
+        """CREATE TABLE IF NOT EXISTS pending_actions (
+               id         SERIAL PRIMARY KEY,
+               guild_id   BIGINT NOT NULL,
+               user_id    BIGINT NOT NULL,
+               action     TEXT NOT NULL,
+               created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+               applied_at TIMESTAMP
            )""",
     ]
     async with pool.acquire() as conn:
@@ -459,6 +489,77 @@ async def managers_remove(request: Request, user_id: str = Form("")):
                 gid, int(user_id),
             )
     return RedirectResponse("/managers?msg=Manager+removed.", status_code=303)
+
+
+# ── Live drop ─────────────────────────────────────────────────────────────────
+
+@app.get("/live")
+async def live_drop(request: Request, msg: str = ""):
+    gid, gname = _session_guild(request)
+    if gid is None:
+        return _redirect_login()
+    async with request.app.state.pool.acquire() as conn:
+        meta = await conn.fetchrow(
+            "SELECT drop_number, is_live, updated_at FROM live_drops WHERE guild_id = $1",
+            gid,
+        )
+        rows = await conn.fetch(
+            """SELECT user_id, user_name, items, total, confirmed_total, paid
+               FROM live_orders WHERE guild_id = $1
+               ORDER BY user_name""",
+            gid,
+        )
+    is_live = bool(meta and meta["is_live"])
+    orders = []
+    for r in rows:
+        items = r["items"]
+        if isinstance(items, str):
+            items = json.loads(items)
+        orders.append({
+            "user_id": r["user_id"],
+            "name": r["user_name"],
+            "items": items,
+            "total": float(r["total"]),
+            "confirmed_total": float(r["confirmed_total"]),
+            "paid": r["paid"],
+        })
+    total = sum(o["total"] for o in orders)
+    unpaid_count = sum(1 for o in orders if not o["paid"])
+    return templates.TemplateResponse(request, "live.html", _ctx(
+        request, gid, gname,
+        is_live=is_live,
+        drop_number=meta["drop_number"] if meta else None,
+        updated_at=meta["updated_at"] if meta else None,
+        orders=orders, total=total, unpaid_count=unpaid_count, msg=msg,
+    ))
+
+
+async def _queue_live_action(request: Request, user_id: str, action: str):
+    gid, _ = _session_guild(request)
+    if gid is None:
+        return _redirect_login()
+    user_id = (user_id or "").strip()
+    if user_id.isdigit():
+        async with request.app.state.pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO pending_actions (guild_id, user_id, action)
+                   VALUES ($1, $2, $3)""",
+                gid, int(user_id), action,
+            )
+    verb = "Marked+paid" if action == "confirm" else "Marked+unpaid"
+    return RedirectResponse(
+        f"/live?msg={verb}+-+syncing+to+Discord+in+~15s.", status_code=303,
+    )
+
+
+@app.post("/live/confirm")
+async def live_confirm(request: Request, user_id: str = Form("")):
+    return await _queue_live_action(request, user_id, "confirm")
+
+
+@app.post("/live/unconfirm")
+async def live_unconfirm(request: Request, user_id: str = Form("")):
+    return await _queue_live_action(request, user_id, "unconfirm")
 
 
 # ── Drops & orders ────────────────────────────────────────────────────────────
