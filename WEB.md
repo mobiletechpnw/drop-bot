@@ -14,7 +14,8 @@ bot.
 - View each drop's per-buyer orders, payment status, and tracking
 - Mark a past-drop order **paid / unpaid**, filter a drop to **unpaid only**,
   or **mark every unpaid order paid** in one click (updates saved history)
-- Add / edit **tracking numbers** per buyer per drop (permanent, in history)
+- Add / edit **tracking numbers** per buyer per drop (permanent, in history) —
+  the buyer gets DM'd on Discord, same as `!addtracking` (see below)
 - Search all orders by buyer name or Discord user ID
 - Download a per-drop Excel export
 
@@ -23,6 +24,21 @@ closing a drop still happen in Discord, because that state lives in the bot's
 memory until the drop closes. Config you change here (payments, managers,
 channels) is picked up by the running bot within ~60 seconds via its periodic
 config refresh.
+
+## Discord notifications from the web dashboard
+
+The web dashboard and the bot are separate processes that only share the
+database — the dashboard has no direct connection to Discord. So actions that
+need to message a buyer (currently: **adding/changing a tracking number**)
+work via a small outbox: the dashboard writes a row to a
+`pending_notifications` table, and the bot polls that table every ~15 seconds
+and delivers the DM. In practice a tracking number saved on the web reaches
+the buyer's DMs within about 15–30 seconds — same message text as `!addtracking`.
+If the buyer has DMs closed, the notification is marked delivered (attempted)
+rather than retried forever; the tracking number itself is still saved and
+visible in `!myhistory` and the dashboard either way. Re-saving the same
+tracking value, or clearing it, does **not** send a DM — only a genuinely new
+value does.
 
 ## Signing in
 

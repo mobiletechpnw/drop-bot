@@ -68,6 +68,14 @@ async def ensure_schema(pool):
                active     BOOLEAN NOT NULL DEFAULT TRUE,
                last_seen  TIMESTAMP NOT NULL DEFAULT NOW()
            )""",
+        """CREATE TABLE IF NOT EXISTS pending_notifications (
+               id         SERIAL PRIMARY KEY,
+               guild_id   BIGINT NOT NULL,
+               user_id    BIGINT NOT NULL,
+               message    TEXT NOT NULL,
+               created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+               sent_at    TIMESTAMP
+           )""",
     ]
     async with pool.acquire() as conn:
         for stmt in statements:
@@ -512,14 +520,40 @@ async def drop_set_tracking(
         return _redirect_login()
     user_id = (user_id or "").strip()
     tracking = (tracking or "").strip() or None
+    notified = False
     if user_id.isdigit():
+        uid = int(user_id)
         async with request.app.state.pool.acquire() as conn:
-            await conn.execute(
-                """UPDATE user_claims SET tracking = $4
-                   WHERE guild_id = $1 AND user_id = $2 AND drop_number = $3""",
-                gid, int(user_id), drop_number, tracking,
-            )
-    return _drop_redirect(drop_number, "Tracking+updated.", view)
+            async with conn.transaction():
+                old_row = await conn.fetchrow(
+                    """SELECT tracking FROM user_claims
+                       WHERE guild_id = $1 AND user_id = $2 AND drop_number = $3
+                       LIMIT 1""",
+                    gid, uid, drop_number,
+                )
+                old_tracking = old_row["tracking"] if old_row else None
+                await conn.execute(
+                    """UPDATE user_claims SET tracking = $4
+                       WHERE guild_id = $1 AND user_id = $2 AND drop_number = $3""",
+                    gid, uid, drop_number, tracking,
+                )
+                # Only DM the buyer on a real, new tracking number — not when
+                # clearing it or re-saving the same value.
+                if tracking and tracking != old_tracking:
+                    message = (
+                        f"📦  Your order from **Drop #{drop_number}** has shipped! "
+                        f"Here is your tracking number:\n"
+                        f"**{tracking}**\n\n"
+                        f"You can use `!myhistory` to view your full order history."
+                    )
+                    await conn.execute(
+                        """INSERT INTO pending_notifications (guild_id, user_id, message)
+                           VALUES ($1, $2, $3)""",
+                        gid, uid, message,
+                    )
+                    notified = True
+    verb = "Tracking+updated+-+buyer+notified+in+Discord." if notified else "Tracking+updated."
+    return _drop_redirect(drop_number, verb, view)
 
 
 @app.post("/drops/{drop_number}/confirm")

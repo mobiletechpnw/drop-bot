@@ -232,6 +232,16 @@ async def init_db():
             ADD COLUMN IF NOT EXISTS guild_name TEXT
         """)
         await conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_notifications (
+                id         SERIAL PRIMARY KEY,
+                guild_id   BIGINT NOT NULL,
+                user_id    BIGINT NOT NULL,
+                message    TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                sent_at    TIMESTAMP
+            )
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS bot_guilds (
                 guild_id   BIGINT PRIMARY KEY,
                 guild_name TEXT,
@@ -1112,6 +1122,7 @@ async def on_command_error(ctx, error):
         raise error
 
 _refresh_task_started = False
+_notify_task_started = False
 
 
 async def _config_refresh_loop():
@@ -1125,9 +1136,51 @@ async def _config_refresh_loop():
             print(f"⚠️  config refresh failed: {e}")
 
 
+async def _deliver_pending_notifications():
+    """DM buyers for notifications queued by the web dashboard.
+
+    The web dashboard is a separate process with no direct Discord
+    connection, so actions like adding a tracking number there can't DM the
+    buyer directly. Instead it writes a row to pending_notifications; this
+    loop is what actually delivers it.
+    """
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, user_id, message FROM pending_notifications
+            WHERE sent_at IS NULL ORDER BY created_at LIMIT 25
+        """)
+        for row in rows:
+            try:
+                user = bot.get_user(row["user_id"]) or await bot.fetch_user(row["user_id"])
+                await user.send(row["message"])
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
+                print(f"⚠️  couldn't DM notification {row['id']} to {row['user_id']}: {e}")
+            except Exception as e:
+                print(f"⚠️  notification {row['id']} failed: {e}")
+            finally:
+                # Mark delivered either way — a closed-DM buyer would retry
+                # forever otherwise, and their tracking is still visible in
+                # !myhistory and on the dashboard.
+                await conn.execute(
+                    "UPDATE pending_notifications SET sent_at = NOW() WHERE id = $1",
+                    row["id"],
+                )
+
+
+async def _notification_loop():
+    """Poll for web-dashboard notifications and deliver them promptly."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        await asyncio.sleep(15)
+        try:
+            await _deliver_pending_notifications()
+        except Exception as e:
+            print(f"⚠️  notification delivery loop failed: {e}")
+
+
 @bot.event
 async def on_ready():
-    global _refresh_task_started
+    global _refresh_task_started, _notify_task_started
     await init_db()
     await db_load_all()
     await bot.tree.sync()
@@ -1140,6 +1193,9 @@ async def on_ready():
     if not _refresh_task_started:
         _refresh_task_started = True
         bot.loop.create_task(_config_refresh_loop())
+    if not _notify_task_started:
+        _notify_task_started = True
+        bot.loop.create_task(_notification_loop())
     # Re-register persistent raffle Views so buttons work after restart
     for guild_id, raffles in server_raffles.items():
         for name, raffle in raffles.items():
