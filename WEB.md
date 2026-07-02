@@ -20,13 +20,18 @@ bot.
   drop mirrors to the **Live** page while it's running (see below)
 - Search all orders by buyer name or Discord user ID
 - Download a per-drop Excel export
+- Browse **raffles** with per-spot claim/paid status, **create & start a
+  raffle** (the bot posts it in Discord within ~15-30s), and mark spots
+  paid/unpaid — the buyer gets the same confirmation DM as `/raffle confirm`
+  and the Discord raffle board refreshes automatically (see below)
 
 **Can't (by design):** *stage* a drop — loading stock, taking claims, going
 live, and closing still happen in Discord, because that live state lives in the
 bot's memory. (You *can* now mark payments on a live drop from the dashboard;
 see "Marking a live drop" below.) Config you change here (payments, managers,
 channels) is picked up by the running bot within ~60 seconds via its periodic
-config refresh.
+config refresh. For raffles, spot claiming (the buttons), the wheel spin,
+winner recording, swaps, and cancelling also stay in Discord.
 
 ## Discord notifications from the web dashboard
 
@@ -104,6 +109,30 @@ When the drop **closes**, its final paid status is snapshotted into
 it's a closed drop you edit under **Drops**, and paid status stays in sync as
 described above. An action queued a moment before the drop closed is skipped
 rather than applied to the wrong drop; just mark it on the closed drop instead.
+
+## Raffles from the web dashboard
+
+Raffle records live entirely in the database, so the dashboard can manage more
+of the raffle lifecycle than it can for drops:
+
+- **Browse raffles** (`/raffles`): every raffle with status, price, and
+  claimed/paid spot counts. Completed raffles stay listed until archived with
+  `/raffle close` in Discord (which deletes their records).
+- **Create & start a raffle**: fill in name, spots (2–10), price, and which
+  host collects payment. The raffle is saved as *pending* and the bot posts
+  the embed with tap-to-claim buttons in your raffle channel within ~15-30
+  seconds, then flips it to *open* — exactly like `/raffle create`. Requires
+  the raffle channel ID to be set (Settings page or `/raffle setchannel`);
+  hosts 1/2 must be configured with `/raffle sethost` before they can be
+  selected.
+- **Mark spots paid / unpaid**: the record updates instantly; on a genuinely
+  new confirmation the buyer gets the same DM as `/raffle confirm` (via the
+  `pending_notifications` outbox), and the bot refreshes the Discord raffle
+  board's Paid/Pending marks on its next ~15s sync pass.
+
+Still Discord-only: claiming spots (buyers tap the buttons), `/raffle wheel`,
+`/raffle winner`, `/raffle swap`, `/raffle cancel`, and `/raffle close` —
+those need live Discord interactions (announcements, DMs, embed deletion).
 
 ## Signing in
 

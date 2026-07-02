@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block title %}Raffles{% endblock %}
+{% block content %}
+<h1>Raffles</h1>
+{% if msg %}<div class="alert ok">{{ msg }}</div>{% endif %}
+{% if err %}<div class="alert error">{{ err }}</div>{% endif %}
+
+{% if raffles %}
+<table>
+  <thead><tr><th>Raffle</th><th>Status</th><th>Price / spot</th><th>Spots</th><th>Paid</th><th></th></tr></thead>
+  <tbody>
+    {% for r in raffles %}
+    <tr>
+      <td>{{ r.name }}</td>
+      <td>
+        {% if r.status == 'open' %}<span class="pill ok">{{ r.status_label }}</span>
+        {% elif r.status == 'complete' %}<span class="pill ok">{{ r.status_label }}</span>
+        {% else %}<span class="pill warn">{{ r.status_label }}</span>{% endif %}
+      </td>
+      <td>{{ r.price }}</td>
+      <td>{{ r.claimed }}/{{ r.spots }} claimed</td>
+      <td>{{ r.paid }}/{{ r.spots }}</td>
+      <td><a class="btn small" href="/raffles/{{ r.name | urlencode }}">View</a></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">No raffles yet — create one below.</p>
+{% endif %}
+
+<h2>Start a new raffle</h2>
+{% if raffle_channel_id %}
+<p class="muted small">
+  The bot posts it — with tap-to-claim spot buttons — in your raffle channel
+  within ~15-30 seconds. Spot claiming, the wheel spin, and recording the
+  winner still happen in Discord.
+</p>
+<form method="post" action="/raffles/create" class="stack">
+  <label>Raffle name</label>
+  <input name="name" maxlength="60" placeholder="e.g. ScarletVault" required>
+
+  <label>Spots (2–10)</label>
+  <input name="spots" type="number" min="2" max="10" value="10" required>
+
+  <label>Price per spot</label>
+  <input name="price" placeholder="e.g. $25" required>
+
+  <label>Payments go to</label>
+  <select name="host">
+    <option value="0">Server default payment methods</option>
+    {% for h in hosts %}
+    <option value="{{ h.host_num }}">Host {{ h.host_num }}{{ ' — ' + h.name if h.name }}</option>
+    {% endfor %}
+  </select>
+
+  <div><button type="submit">Create &amp; post raffle</button></div>
+</form>
+{% else %}
+<div class="alert warn">
+  No raffle channel is set for this server. Add the raffle channel ID in
+  <a href="/settings">Settings</a> (or run <code>/raffle setchannel</code> in
+  Discord), then come back here.
+</div>
+{% endif %}
+{% endblock %}
