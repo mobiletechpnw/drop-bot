@@ -28,6 +28,7 @@ import io
 import os
 import secrets
 from contextlib import asynccontextmanager
+from urllib.parse import quote, quote_plus
 
 import asyncpg
 import openpyxl
@@ -75,6 +76,36 @@ async def ensure_schema(pool):
                message    TEXT NOT NULL,
                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                sent_at    TIMESTAMP
+           )""",
+        """CREATE TABLE IF NOT EXISTS raffles (
+               guild_id   BIGINT  NOT NULL,
+               name       TEXT    NOT NULL,
+               spots      INTEGER NOT NULL,
+               price      TEXT    NOT NULL,
+               channel_id BIGINT  NOT NULL,
+               message_id BIGINT,
+               status     TEXT    NOT NULL DEFAULT 'open',
+               PRIMARY KEY (guild_id, name)
+           )""",
+        "ALTER TABLE raffles ADD COLUMN IF NOT EXISTS host_num INTEGER DEFAULT 0",
+        """CREATE TABLE IF NOT EXISTS raffle_slots (
+               guild_id    BIGINT  NOT NULL,
+               raffle_name TEXT    NOT NULL,
+               spot_num    INTEGER NOT NULL,
+               user_id     BIGINT,
+               username    TEXT,
+               paid        BOOLEAN NOT NULL DEFAULT FALSE,
+               PRIMARY KEY (guild_id, raffle_name, spot_num)
+           )""",
+        """CREATE TABLE IF NOT EXISTS raffle_hosts (
+               guild_id  BIGINT NOT NULL,
+               host_num  INTEGER NOT NULL,
+               name      TEXT,
+               venmo     TEXT,
+               zelle     TEXT,
+               cashapp   TEXT,
+               applepay  TEXT,
+               PRIMARY KEY (guild_id, host_num)
            )""",
     ]
     async with pool.acquire() as conn:
@@ -675,6 +706,215 @@ async def orders_search(request: Request, q: str = ""):
         results = [dict(r) for r in rows]
     return templates.TemplateResponse(request, "orders.html", _ctx(
         request, gid, gname, q=q, results=results,
+    ))
+
+
+# ── Raffles ───────────────────────────────────────────────────────────────────
+#
+# Raffle records are DB-backed, so the dashboard can read and edit them like
+# drops. The one thing it can't do is talk to Discord — so a raffle created
+# here is saved with status 'pending', and the bot's ~15s sync loop posts the
+# embed + claim buttons and flips it to 'open'. Paid toggles work the same
+# way in reverse: the dashboard updates raffle_slots directly (and queues the
+# buyer's confirmation DM), and the bot folds the change into its memory and
+# refreshes the Discord embed on its next pass.
+
+RAFFLE_STATUS_LABELS = {
+    "pending":  "Posting to Discord…",
+    "open":     "Open",
+    "closed":   "Full — awaiting payments",
+    "complete": "Complete",
+}
+
+
+def _raffles_redirect(msg="", err=""):
+    q = f"?msg={quote_plus(msg)}" if msg else (f"?err={quote_plus(err)}" if err else "")
+    return RedirectResponse(f"/raffles{q}", status_code=303)
+
+
+def _raffle_redirect(name, msg=""):
+    q = f"?msg={quote_plus(msg)}" if msg else ""
+    return RedirectResponse(f"/raffles/{quote(name, safe='')}{q}", status_code=303)
+
+
+@app.get("/raffles")
+async def raffles_list(request: Request, msg: str = "", err: str = ""):
+    gid, gname = _session_guild(request)
+    if gid is None:
+        return _redirect_login()
+    async with request.app.state.pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM raffles WHERE guild_id = $1", gid)
+        slot_rows = await conn.fetch(
+            """SELECT raffle_name,
+                      COUNT(user_id) FILTER (WHERE user_id IS NOT NULL) AS claimed,
+                      COUNT(*) FILTER (WHERE paid) AS paid
+               FROM raffle_slots WHERE guild_id = $1 GROUP BY raffle_name""", gid)
+        settings = await conn.fetchrow(
+            "SELECT raffle_channel_id FROM server_settings WHERE guild_id = $1", gid)
+        hosts = await conn.fetch(
+            "SELECT host_num, name FROM raffle_hosts WHERE guild_id = $1 "
+            "ORDER BY host_num", gid)
+    counts = {r["raffle_name"]: r for r in slot_rows}
+    order = {"pending": 0, "open": 1, "closed": 2, "complete": 3}
+    raffles = sorted((dict(r) for r in rows),
+                     key=lambda r: (order.get(r["status"], 9), r["name"].lower()))
+    for r in raffles:
+        c = counts.get(r["name"])
+        r["claimed"] = c["claimed"] if c else 0
+        r["paid"] = c["paid"] if c else 0
+        r["status_label"] = RAFFLE_STATUS_LABELS.get(r["status"], r["status"])
+    return templates.TemplateResponse(request, "raffles.html", _ctx(
+        request, gid, gname, raffles=raffles, msg=msg, err=err,
+        raffle_channel_id=settings["raffle_channel_id"] if settings else None,
+        hosts=[dict(h) for h in hosts],
+    ))
+
+
+@app.post("/raffles/create")
+async def raffle_create(
+    request: Request,
+    name: str = Form(""), spots: str = Form(""), price: str = Form(""),
+    host: str = Form("0"),
+):
+    gid, _ = _session_guild(request)
+    if gid is None:
+        return _redirect_login()
+
+    name = (name or "").strip()
+    price = (price or "").strip()
+    # ":" is the separator inside the claim buttons' custom_id, and Discord
+    # caps custom_ids at 100 chars — keep names simple like /raffle create does.
+    if not name or len(name) > 60 or ":" in name:
+        return _raffles_redirect(err="Raffle name is required — up to 60 characters, no ':'.")
+    try:
+        n_spots = int(spots)
+    except (TypeError, ValueError):
+        n_spots = 0
+    if not 2 <= n_spots <= 10:
+        return _raffles_redirect(err="Spots must be between 2 and 10.")
+    if not price:
+        return _raffles_redirect(err="Price per spot is required (e.g. $25).")
+    if not price.startswith("$"):
+        price = f"${price}"
+    try:
+        host_num = int(host)
+    except (TypeError, ValueError):
+        host_num = -1
+    if host_num not in (0, 1, 2):
+        return _raffles_redirect(err="Host must be server default, 1 or 2.")
+
+    async with request.app.state.pool.acquire() as conn:
+        settings = await conn.fetchrow(
+            "SELECT raffle_channel_id FROM server_settings WHERE guild_id = $1", gid)
+        channel_id = settings["raffle_channel_id"] if settings else None
+        if not channel_id:
+            return _raffles_redirect(
+                err="Set the raffle channel ID in Settings first.")
+        if host_num in (1, 2):
+            h = await conn.fetchrow(
+                "SELECT 1 FROM raffle_hosts WHERE guild_id = $1 AND host_num = $2",
+                gid, host_num)
+            if not h:
+                return _raffles_redirect(
+                    err=f"Host {host_num} has no payment info yet — "
+                        f"run /raffle sethost in Discord first.")
+        exists = await conn.fetchval(
+            "SELECT 1 FROM raffles WHERE guild_id = $1 AND name = $2", gid, name)
+        if exists:
+            return _raffles_redirect(
+                err=f"A raffle named “{name}” already exists.")
+        async with conn.transaction():
+            await conn.execute(
+                """INSERT INTO raffles
+                       (guild_id, name, spots, price, channel_id,
+                        message_id, status, host_num)
+                   VALUES ($1, $2, $3, $4, $5, NULL, 'pending', $6)""",
+                gid, name, n_spots, price, channel_id, host_num)
+            for num in range(1, n_spots + 1):
+                await conn.execute(
+                    """INSERT INTO raffle_slots
+                           (guild_id, raffle_name, spot_num, user_id, username, paid)
+                       VALUES ($1, $2, $3, NULL, NULL, FALSE)
+                       ON CONFLICT DO NOTHING""",
+                    gid, name, num)
+    return _raffles_redirect(
+        msg=f"Raffle “{name}” created — the bot posts it in Discord "
+            f"within ~15-30 seconds.")
+
+
+@app.post("/raffles/paid")
+async def raffle_set_paid(
+    request: Request,
+    name: str = Form(""), spot: str = Form(""), paid: str = Form(""),
+):
+    gid, _ = _session_guild(request)
+    if gid is None:
+        return _redirect_login()
+    name = (name or "").strip()
+    try:
+        spot_num = int(spot)
+    except (TypeError, ValueError):
+        return _raffles_redirect(err="Bad spot number.")
+    is_paid = (paid == "1")
+
+    async with request.app.state.pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """SELECT user_id, username, paid FROM raffle_slots
+                   WHERE guild_id = $1 AND raffle_name = $2 AND spot_num = $3""",
+                gid, name, spot_num)
+            if not row:
+                return _raffle_redirect(name, "That spot doesn't exist.")
+            if row["user_id"] is None:
+                return _raffle_redirect(name, "That spot is unclaimed.")
+            await conn.execute(
+                """UPDATE raffle_slots SET paid = $4
+                   WHERE guild_id = $1 AND raffle_name = $2 AND spot_num = $3""",
+                gid, name, spot_num, is_paid)
+            notified = False
+            # Same DM /raffle confirm sends — only on a genuinely new confirm.
+            if is_paid and not row["paid"]:
+                await conn.execute(
+                    """INSERT INTO pending_notifications (guild_id, user_id, message)
+                       VALUES ($1, $2, $3)""",
+                    gid, row["user_id"],
+                    f"Your payment for Spot #{spot_num} in the **{name}** raffle "
+                    f"is confirmed! Watch for the live spin announcement.")
+                notified = True
+    verb = ("Marked paid — buyer DM'd, Discord board updates in ~15s."
+            if notified else
+            ("Marked paid." if is_paid else "Marked unpaid — Discord board updates in ~15s."))
+    return _raffle_redirect(name, verb)
+
+
+@app.get("/raffles/{name:path}")
+async def raffle_detail(request: Request, name: str, msg: str = ""):
+    gid, gname = _session_guild(request)
+    if gid is None:
+        return _redirect_login()
+    async with request.app.state.pool.acquire() as conn:
+        raffle = await conn.fetchrow(
+            "SELECT * FROM raffles WHERE guild_id = $1 AND name = $2", gid, name)
+        if not raffle:
+            return _raffles_redirect(err=f"No raffle named “{name}”.")
+        slots = await conn.fetch(
+            """SELECT spot_num, user_id, username, paid FROM raffle_slots
+               WHERE guild_id = $1 AND raffle_name = $2 ORDER BY spot_num""",
+            gid, name)
+        host = None
+        if raffle["host_num"] in (1, 2):
+            host = await conn.fetchrow(
+                "SELECT host_num, name FROM raffle_hosts "
+                "WHERE guild_id = $1 AND host_num = $2", gid, raffle["host_num"])
+    slot_list = [dict(s) for s in slots]
+    claimed = sum(1 for s in slot_list if s["user_id"] is not None)
+    paid = sum(1 for s in slot_list if s["paid"])
+    return templates.TemplateResponse(request, "raffle_detail.html", _ctx(
+        request, gid, gname,
+        raffle=dict(raffle), slots=slot_list, claimed=claimed, paid_count=paid,
+        status_label=RAFFLE_STATUS_LABELS.get(raffle["status"], raffle["status"]),
+        host=dict(host) if host else None, msg=msg,
     ))
 
 

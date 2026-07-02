@@ -1184,6 +1184,95 @@ async def _deliver_pending_notifications():
                 )
 
 
+async def _sync_web_raffles():
+    """Pick up raffle work queued by the web dashboard.
+
+    The dashboard is a separate process with no Discord connection, so it
+    can't post a raffle embed or refresh one. Two sync jobs bridge that:
+
+    • Raffles created on the web are saved with status 'pending'. This posts
+      the embed + claim buttons in the raffle channel and flips them to
+      'open' — the same lifecycle as /raffle create, just deferred ~15s.
+    • Paid flags toggled on the web land in raffle_slots. This folds them
+      into the bot's in-memory state and re-edits the Discord embed so the
+      Paid/Pending marks stay accurate. (The dashboard queues the buyer's
+      confirmation DM itself via pending_notifications.)
+    """
+    async with db_pool.acquire() as conn:
+        pending = await conn.fetch("SELECT * FROM raffles WHERE status = 'pending'")
+        slot_rows = await conn.fetch(
+            "SELECT guild_id, raffle_name, spot_num, user_id, paid FROM raffle_slots"
+        )
+
+    # 1) Post dashboard-created raffles.
+    for row in pending:
+        guild_id, name = row["guild_id"], row["name"]
+        channel = bot.get_channel(row["channel_id"])
+        if channel is None:
+            try:
+                channel = await bot.fetch_channel(row["channel_id"])
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                print(f"⚠️  web raffle '{name}' ({guild_id}): channel "
+                      f"{row['channel_id']} unavailable — will retry")
+                continue
+        raffle = {
+            "spots":      row["spots"],
+            "price":      row["price"],
+            "channel_id": row["channel_id"],
+            "message_id": None,
+            "status":     "open",
+            "host_num":   row["host_num"] or 0,
+            "slots":      {n: {"user_id": None, "username": None, "paid": False}
+                           for n in range(1, row["spots"] + 1)},
+        }
+        payment_hint = _build_raffle_payment_dm(guild_id, raffle["host_num"])
+        embed        = _raffle_embed(name, raffle)
+        embed.description = (
+            f"Tap a button below to claim your spot!\n"
+            f"The bot will DM you payment details instantly.\n\n"
+            f"Payment accepted via:\n{payment_hint}"
+        )
+        view = _build_raffle_view(guild_id, name, raffle)
+        try:
+            msg = await channel.send(embed=embed, view=view)
+        except (discord.Forbidden, discord.HTTPException) as e:
+            print(f"⚠️  web raffle '{name}' ({guild_id}): couldn't post — {e}")
+            continue
+        raffle["message_id"] = msg.id
+        server_raffles[guild_id][name] = raffle
+        await _db_save_raffle(guild_id, name)
+        for spot_num in raffle["slots"]:
+            await _db_save_slot(guild_id, name, spot_num)
+        print(f"✅  posted web-created raffle '{name}' in guild {guild_id}")
+
+    # 2) Reconcile dashboard-toggled paid flags into memory, then refresh
+    #    the affected embeds. Only the paid flag is synced, and only when the
+    #    DB row still refers to the same claimant — a claim that landed after
+    #    our snapshot is left alone (the next pass sees the fresh row).
+    dirty = set()
+    for row in slot_rows:
+        gid, name, num = row["guild_id"], row["raffle_name"], row["spot_num"]
+        raffle = server_raffles.get(gid, {}).get(name)
+        if not raffle or raffle["status"] not in ("open", "closed"):
+            continue
+        slot = raffle["slots"].get(num)
+        if (slot and slot["user_id"] is not None
+                and slot["user_id"] == row["user_id"]
+                and slot["paid"] != row["paid"]):
+            slot["paid"] = row["paid"]
+            dirty.add((gid, name))
+    for gid, name in dirty:
+        raffle  = server_raffles[gid][name]
+        channel = bot.get_channel(raffle["channel_id"])
+        if channel and raffle.get("message_id"):
+            try:
+                msg = await channel.fetch_message(raffle["message_id"])
+                await msg.edit(embed=_raffle_embed(name, raffle),
+                               view=_build_raffle_view(gid, name, raffle))
+            except (discord.NotFound, discord.HTTPException):
+                pass
+
+
 async def _notification_loop():
     """Poll for web-dashboard notifications and deliver them promptly."""
     await bot.wait_until_ready()
@@ -1193,6 +1282,10 @@ async def _notification_loop():
             await _deliver_pending_notifications()
         except Exception as e:
             print(f"⚠️  notification delivery loop failed: {e}")
+        try:
+            await _sync_web_raffles()
+        except Exception as e:
+            print(f"⚠️  web raffle sync failed: {e}")
 
 
 @bot.event
