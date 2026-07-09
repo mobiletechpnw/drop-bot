@@ -180,6 +180,25 @@ def _money(value) -> str:
 templates.env.filters["money"] = _money
 
 
+def _asset_version() -> str:
+    """Short hash of the static asset mtimes, recomputed at startup. Appended
+    to CSS/JS URLs so browsers fetch fresh files after each deploy instead of
+    serving a stale cached copy."""
+    import hashlib
+    import pathlib
+
+    h = hashlib.md5()
+    for name in ("static/style.css", "static/app.js"):
+        try:
+            h.update(str(pathlib.Path(name).stat().st_mtime_ns).encode())
+        except OSError:
+            pass
+    return h.hexdigest()[:8]
+
+
+templates.env.globals["asset_ver"] = _asset_version()
+
+
 def _session_guild(request: Request):
     """Return (guild_id, guild_name) from the session, or (None, None)."""
     gid = request.session.get("guild_id")
