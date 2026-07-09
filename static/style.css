@@ -637,8 +637,8 @@ tr.inactive-row { opacity: 0.5; }
 :root[data-theme="light"] body::after { opacity: 0.35; }
 :root[data-theme="light"] .topbar { background: linear-gradient(180deg, rgba(255, 255, 255, 0.85), rgba(255, 255, 255, 0.6)); }
 :root[data-theme="light"] .topbar nav a:hover { background: rgba(17, 17, 34, 0.05); }
-:root[data-theme="light"] .card .num { background: linear-gradient(120deg, #14141f 20%, #7c3aed 95%); -webkit-background-clip: text; background-clip: text; color: transparent; }
-:root[data-theme="light"] .card.accent-warn .num { background: linear-gradient(120deg, #c2570a, #db2777); -webkit-background-clip: text; background-clip: text; color: transparent; }
+:root[data-theme="light"] .card .num { background: none; -webkit-text-fill-color: var(--text); color: var(--text); }
+:root[data-theme="light"] .card.accent-warn .num { background: none; -webkit-text-fill-color: var(--warn); color: var(--warn); }
 :root[data-theme="light"] .hero-title { background: linear-gradient(115deg, #14141f 15%, var(--accent) 60%, #c026d3 90%); -webkit-background-clip: text; background-clip: text; color: transparent; }
 :root[data-theme="light"] th { background: rgba(17, 17, 34, 0.03); }
 :root[data-theme="light"] tbody tr:hover { background: rgba(17, 17, 34, 0.03); }
