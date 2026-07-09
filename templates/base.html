@@ -3,7 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b0b10">
   <title>{% block title %}Drop Bot{% endblock %} · Drop Bot</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;550;600;650;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -11,13 +15,14 @@
     <div class="brand"><a href="{{ '/admin' if is_creator else '/' }}">🛒 Drop Bot</a></div>
     <nav>
       {% if guild_id %}
-      <a href="/">Dashboard</a>
-      <a href="/live">Live</a>
-      <a href="/drops">Drops</a>
-      <a href="/raffles">Raffles</a>
-      <a href="/orders">Orders</a>
-      <a href="/settings">Settings</a>
-      <a href="/managers">Managers</a>
+      {% set p = request.url.path %}
+      <a href="/" class="{{ 'active' if p == '/' }}">Dashboard</a>
+      <a href="/live" class="{{ 'active' if p.startswith('/live') }}">Live</a>
+      <a href="/drops" class="{{ 'active' if p.startswith('/drops') }}">Drops</a>
+      <a href="/raffles" class="{{ 'active' if p.startswith('/raffles') }}">Raffles</a>
+      <a href="/orders" class="{{ 'active' if p.startswith('/orders') }}">Orders</a>
+      <a href="/settings" class="{{ 'active' if p.startswith('/settings') }}">Settings</a>
+      <a href="/managers" class="{{ 'active' if p.startswith('/managers') }}">Managers</a>
       {% endif %}
     </nav>
     <div class="who">
