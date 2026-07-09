@@ -3,7 +3,7 @@
 {% block content %}
 <div class="row-between">
   <h1>Drop #{{ drop_number }}</h1>
-  <a class="btn" href="/drops/{{ drop_number }}/export.xlsx">Download Excel</a>
+  <a class="btn ghost" href="/drops/{{ drop_number }}/export.xlsx">⬇ Download Excel</a>
 </div>
 {% if closed_at %}<p class="muted">Closed {{ closed_at.strftime('%b %d, %Y') }} · Total {{ total | money }} · {{ unpaid_count }} unpaid</p>{% endif %}
 {% if msg %}<div class="alert ok">{{ msg }}</div>{% endif %}
