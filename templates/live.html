@@ -2,57 +2,75 @@
 {% block title %}Live drop{% endblock %}
 {% block content %}
 <div class="row-between">
-  <h1>Live drop{% if is_live and drop_number %} · Drop #{{ drop_number }}{% endif %}</h1>
+  <h1>
+    Live drop{% if is_live and drop_number %} · Drop #{{ drop_number }}{% endif %}
+    {% if is_live %}<span class="live-badge"><span class="live-dot"></span> Live</span>{% endif %}
+  </h1>
   <a class="btn ghost" href="/live">↻ Refresh</a>
 </div>
 
 {% if msg %}<div class="alert ok">{{ msg }}</div>{% endif %}
 
 {% if not is_live %}
-<p class="muted">
-  🔌 No drop is live right now. Staging stock, taking claims, and going live
-  still happen in Discord — once a drop is live it appears here so you can mark
-  buyers paid without switching to Discord. Closed drops live under
-  <a href="/drops">Drops</a>.
-</p>
+<div class="empty">
+  <div class="ico">🔌</div>
+  <h3>No drop is live right now</h3>
+  <p>
+    Staging stock, taking claims, and going live still happen in Discord.
+    Once a drop goes live it appears here so you can mark buyers paid without
+    switching apps.
+  </p>
+  <div class="actions">
+    <a class="btn" href="/drops">View closed drops</a>
+    <a class="btn ghost" href="/live">↻ Check again</a>
+  </div>
+</div>
 {% else %}
 <p class="muted">
   Total {{ total | money }} · {{ unpaid_count }} unpaid ·
   Marking paid/unpaid here syncs to the bot in ~15s, same as
-  <code>!confirm</code> in Discord. Refresh to see it land.
+  <code>!confirm</code> in Discord.
   {% if updated_at %}<br>Live data as of {{ updated_at.strftime('%b %d, %Y %H:%M UTC') }}.{% endif %}
 </p>
+<p class="refresh-note"><span class="live-dot"></span>Auto-refreshing every 25s · marks land automatically.</p>
 
+<div id="paidRegion" data-live-poll data-poll-url="/live">
 {% if orders %}
+{% set paid_count = orders | selectattr('paid') | list | length %}
+<div class="progress">
+  <div class="bar {{ 'warn' if paid_count < orders|length else '' }}"><span style="width: {{ (100 * paid_count / (orders|length)) | round(0, 'floor') }}%"></span></div>
+  <div class="pct">{{ paid_count }} / {{ orders|length }} paid</div>
+</div>
+<div class="table-wrap">
 <table class="orders">
   <thead>
-    <tr><th>Buyer</th><th>Items</th><th>Total</th><th>Paid</th></tr>
+    <tr><th>Buyer</th><th>Items</th><th class="right">Total</th><th>Paid</th></tr>
   </thead>
   <tbody>
     {% for o in orders %}
     <tr>
-      <td>
+      <td data-label="Buyer">
         <div class="buyer">{{ o.name }}</div>
         <div class="muted small"><code>{{ o.user_id }}</code></div>
       </td>
-      <td>
+      <td data-label="Items">
         <ul class="items">
           {% for it in o['items'] %}
           <li>{{ it.display }} ×{{ it.qty }} — {{ it.subtotal | money }}</li>
           {% endfor %}
         </ul>
       </td>
-      <td>{{ o.total | money }}</td>
-      <td>
+      <td data-label="Total" class="right money">{{ o.total | money }}</td>
+      <td data-label="Paid">
         {% if o.paid %}
           <span class="pill ok">Paid</span>
-          <form method="post" action="/live/unconfirm" class="inline">
+          <form method="post" action="/live/unconfirm" class="inline js-ajax" data-toast="Marked unpaid">
             <input type="hidden" name="user_id" value="{{ o.user_id }}">
             <button class="btn small ghost" type="submit">Undo</button>
           </form>
         {% else %}
           <span class="pill warn">{{ o.confirmed_total | money }} of {{ o.total | money }}</span>
-          <form method="post" action="/live/confirm" class="inline">
+          <form method="post" action="/live/confirm" class="inline js-ajax" data-toast="Marked paid">
             <input type="hidden" name="user_id" value="{{ o.user_id }}">
             <button class="btn small" type="submit">Mark paid</button>
           </form>
@@ -62,8 +80,15 @@
     {% endfor %}
   </tbody>
 </table>
+</div>
 {% else %}
-<p class="muted">No claims yet in this drop.</p>
+<div class="empty">
+  <div class="ico">🕓</div>
+  <h3>Waiting on the first claim</h3>
+  <p>No buyers have claimed in this drop yet. Claims appear here within
+    ~15 seconds of landing in Discord.</p>
+</div>
 {% endif %}
+</div>
 {% endif %}
 {% endblock %}

@@ -8,13 +8,14 @@
   <div class="card"><div class="num">{{ totals.active_stores }}<span class="muted small"> / {{ totals.stores }}</span></div><div class="lbl">Active servers</div></div>
   <div class="card"><div class="num">{{ totals.drops }}</div><div class="lbl">Drops closed</div></div>
   <div class="card"><div class="num">{{ totals.revenue | money }}</div><div class="lbl">Total revenue</div></div>
-  <div class="card"><div class="num">{{ totals.outstanding | money }}</div><div class="lbl">Outstanding</div></div>
+  <div class="card {{ 'accent-warn' if totals.outstanding and totals.outstanding > 0 else '' }}"><div class="num">{{ totals.outstanding | money }}</div><div class="lbl">Outstanding</div></div>
 </div>
 
 {% if stores %}
+<div class="table-wrap">
 <table>
   <thead>
-    <tr><th>Server</th><th>Drops</th><th>Revenue</th><th>Outstanding</th><th>Last drop</th><th></th></tr>
+    <tr><th>Server</th><th class="right">Drops</th><th class="right">Revenue</th><th class="right">Outstanding</th><th>Last drop</th><th></th></tr>
   </thead>
   <tbody>
     {% for s in stores %}
@@ -26,15 +27,16 @@
         <div class="pill warn small">⚠️ Bot no longer in this server</div>
         {% endif %}
       </td>
-      <td>{{ s.drops }}</td>
-      <td>{{ s.revenue | money }}</td>
-      <td>{% if s.outstanding > 0 %}<span class="pill warn">{{ s.outstanding | money }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
+      <td class="right">{{ s.drops }}</td>
+      <td class="right money">{{ s.revenue | money }}</td>
+      <td class="right">{% if s.outstanding > 0 %}<span class="pill warn">{{ s.outstanding | money }}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
       <td>{% if s.last_drop %}{{ s.last_drop.strftime('%b %d, %Y') }}{% else %}<span class="muted">never</span>{% endif %}</td>
-      <td><a class="btn small" href="/admin/select/{{ s.guild_id }}">Manage →</a></td>
+      <td class="right"><a class="btn small" href="/admin/select/{{ s.guild_id }}">Manage →</a></td>
     </tr>
     {% endfor %}
   </tbody>
 </table>
+</div>
 <p class="muted small">Servers marked ⚠️ still have historical data on record, but the bot is no longer a member — records are kept for reporting but can't be managed live.</p>
 {% else %}
 <p class="muted">No servers have any data yet.</p>

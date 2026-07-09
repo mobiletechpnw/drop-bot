@@ -14,13 +14,14 @@
   <span class="muted small">(managed in Discord)</span></p>
 {% endif %}
 
+<div class="table-wrap">
 <table>
   <thead><tr><th>Manager (user ID)</th><th></th></tr></thead>
   <tbody>
     {% for m in managers %}
     <tr>
       <td><code>{{ m }}</code></td>
-      <td>
+      <td class="right">
         <form method="post" action="/managers/remove" class="inline">
           <input type="hidden" name="user_id" value="{{ m }}">
           <button class="btn small danger" type="submit">Remove</button>
@@ -32,6 +33,7 @@
     {% endfor %}
   </tbody>
 </table>
+</div>
 
 <h2>Add a manager</h2>
 <form method="post" action="/managers/add" class="inline-form">

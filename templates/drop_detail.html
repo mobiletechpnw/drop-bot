@@ -8,6 +8,15 @@
 {% if closed_at %}<p class="muted">Closed {{ closed_at.strftime('%b %d, %Y') }} · Total {{ total | money }} · {{ unpaid_count }} unpaid</p>{% endif %}
 {% if msg %}<div class="alert ok">{{ msg }}</div>{% endif %}
 
+<div id="paidRegion">
+{% if all_count %}
+{% set paid_count = all_count - unpaid_count %}
+<div class="progress">
+  <div class="bar {{ 'warn' if unpaid_count else '' }}"><span style="width: {{ (100 * paid_count / all_count) | round(0, 'floor') }}%"></span></div>
+  <div class="pct">{{ paid_count }} / {{ all_count }} paid</div>
+</div>
+{% endif %}
+
 <div class="controls">
   <div class="tabs">
     <a class="tab {{ 'active' if not show_unpaid else '' }}" href="/drops/{{ drop_number }}">All ({{ all_count }})</a>
@@ -28,29 +37,30 @@
 </div>
 
 {% if orders %}
+<div class="table-wrap">
 <table class="orders">
   <thead>
-    <tr><th>Buyer</th><th>Items</th><th>Total</th><th>Paid</th><th>Tracking</th></tr>
+    <tr><th>Buyer</th><th>Items</th><th class="right">Total</th><th>Paid</th><th>Tracking</th></tr>
   </thead>
   <tbody>
     {% for o in orders %}
     <tr>
-      <td>
+      <td data-label="Buyer">
         <div class="buyer">{{ o.name }}</div>
         <div class="muted small"><code>{{ o.user_id }}</code></div>
       </td>
-      <td>
+      <td data-label="Items">
         <ul class="items">
           {% for it in o['items'] %}
           <li>{{ it.display }} ×{{ it.qty }} — {{ it.subtotal | money }}</li>
           {% endfor %}
         </ul>
       </td>
-      <td>{{ o.total | money }}</td>
-      <td>
+      <td data-label="Total" class="right money">{{ o.total | money }}</td>
+      <td data-label="Paid">
         {% if o.confirmed %}
           <span class="pill ok">Paid</span>
-          <form method="post" action="/drops/{{ drop_number }}/confirm" class="inline">
+          <form method="post" action="/drops/{{ drop_number }}/confirm" class="inline js-ajax" data-toast="Marked unpaid">
             <input type="hidden" name="user_id" value="{{ o.user_id }}">
             <input type="hidden" name="confirmed" value="0">
             <input type="hidden" name="view" value="{{ 'unpaid' if show_unpaid else '' }}">
@@ -58,7 +68,7 @@
           </form>
         {% else %}
           <span class="pill warn">Pending</span>
-          <form method="post" action="/drops/{{ drop_number }}/confirm" class="inline">
+          <form method="post" action="/drops/{{ drop_number }}/confirm" class="inline js-ajax" data-toast="Marked paid">
             <input type="hidden" name="user_id" value="{{ o.user_id }}">
             <input type="hidden" name="confirmed" value="1">
             <input type="hidden" name="view" value="{{ 'unpaid' if show_unpaid else '' }}">
@@ -66,8 +76,8 @@
           </form>
         {% endif %}
       </td>
-      <td>
-        <form method="post" action="/drops/{{ drop_number }}/tracking" class="inline">
+      <td data-label="Tracking">
+        <form method="post" action="/drops/{{ drop_number }}/tracking" class="inline js-ajax" data-toast="Tracking saved">
           <input type="hidden" name="user_id" value="{{ o.user_id }}">
           <input type="hidden" name="view" value="{{ 'unpaid' if show_unpaid else '' }}">
           <input name="tracking" value="{{ o.tracking }}" placeholder="Tracking #" class="track-input">
@@ -78,12 +88,23 @@
     {% endfor %}
   </tbody>
 </table>
+</div>
 {% else %}
 {% if show_unpaid %}
-<p class="muted">🎉 No unpaid orders — everyone's paid up.</p>
+<div class="empty">
+  <div class="ico">🎉</div>
+  <h3>Everyone's paid up</h3>
+  <p>No unpaid orders in this drop. Nice work.</p>
+  <div class="actions"><a class="btn ghost" href="/drops/{{ drop_number }}">View all orders</a></div>
+</div>
 {% else %}
-<p class="muted">No orders recorded for this drop.</p>
+<div class="empty">
+  <div class="ico">📭</div>
+  <h3>No orders recorded</h3>
+  <p>This drop closed without any claims on record.</p>
+</div>
 {% endif %}
 {% endif %}
+</div>
 <p><a href="/drops">← All drops</a></p>
 {% endblock %}

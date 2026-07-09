@@ -3,25 +3,35 @@
 {% block content %}
 <h1>Drops</h1>
 {% if drops %}
+<div class="table-wrap">
 <table>
-  <thead><tr><th>Drop</th><th>Closed</th><th>Revenue</th><th>Items</th><th>Buyers</th><th></th></tr></thead>
+  <thead><tr><th>Drop</th><th>Closed</th><th class="right">Revenue</th><th class="right">Items</th><th class="right">Buyers</th><th></th></tr></thead>
   <tbody>
     {% for d in drops %}
     <tr>
       <td>#{{ d.drop_number }}</td>
       <td>{{ d.closed_at.strftime('%b %d, %Y') }}</td>
-      <td>{{ d.total_revenue | money }}</td>
-      <td>{{ d.total_items }}</td>
-      <td>{{ d.unique_buyers }}</td>
-      <td>
+      <td class="right money">{{ d.total_revenue | money }}</td>
+      <td class="right">{{ d.total_items }}</td>
+      <td class="right">{{ d.unique_buyers }}</td>
+      <td class="right">
         <a class="btn small" href="/drops/{{ d.drop_number }}">View</a>
-        <a class="btn small" href="/drops/{{ d.drop_number }}/export.xlsx">Excel</a>
+        <a class="btn small ghost" href="/drops/{{ d.drop_number }}/export.xlsx">Excel</a>
       </td>
     </tr>
     {% endfor %}
   </tbody>
 </table>
+</div>
 {% else %}
-<p class="muted">No closed drops yet.</p>
+<div class="empty">
+  <div class="ico">📦</div>
+  <h3>No closed drops yet</h3>
+  <p>Once you close a drop in Discord it lands here with full order and
+    payment detail, plus a one-click Excel export.</p>
+  <div class="actions">
+    <a class="btn" href="/live">Watch a live drop</a>
+  </div>
+</div>
 {% endif %}
 {% endblock %}
