@@ -3,7 +3,7 @@
 {% block content %}
 <div class="row-between">
   <h1>Raffle — {{ raffle.name }}</h1>
-  <a class="btn" href="/raffles">← All raffles</a>
+  <a class="btn ghost" href="/raffles">← All raffles</a>
 </div>
 <p class="muted">
   {% if raffle.status == 'open' or raffle.status == 'complete' %}
@@ -24,13 +24,14 @@
 </div>
 {% endif %}
 
-<table>
+<div class="table-wrap">
+<table class="orders">
   <thead><tr><th>Spot</th><th>Claimed by</th><th>Paid</th></tr></thead>
   <tbody>
     {% for s in slots %}
     <tr>
-      <td>#{{ s.spot_num }}</td>
-      <td>
+      <td data-label="Spot">#{{ s.spot_num }}</td>
+      <td data-label="Claimed by">
         {% if s.user_id %}
           <div class="buyer">{{ s.username }}</div>
           <div class="muted small"><code>{{ s.user_id }}</code></div>
@@ -38,7 +39,7 @@
           <span class="muted">Open</span>
         {% endif %}
       </td>
-      <td>
+      <td data-label="Paid">
         {% if not s.user_id %}
           <span class="muted small">—</span>
         {% elif s.paid %}
@@ -63,6 +64,7 @@
     {% endfor %}
   </tbody>
 </table>
+</div>
 
 <p class="muted small">
   Marking a spot paid DMs the buyer and refreshes the Discord raffle board
