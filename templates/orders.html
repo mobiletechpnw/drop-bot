@@ -9,9 +9,10 @@
 
 {% if q %}
   {% if results %}
+  <div class="table-wrap">
   <table>
     <thead>
-      <tr><th>Drop</th><th>Buyer</th><th>Item</th><th>Qty</th><th>Subtotal</th><th>Paid</th><th>Tracking</th></tr>
+      <tr><th>Drop</th><th>Buyer</th><th>Item</th><th class="right">Qty</th><th class="right">Subtotal</th><th>Paid</th><th>Tracking</th></tr>
     </thead>
     <tbody>
       {% for r in results %}
@@ -19,14 +20,15 @@
         <td><a href="/drops/{{ r.drop_number }}">#{{ r.drop_number }}</a></td>
         <td>{{ r.user_name }}<div class="muted small"><code>{{ r.user_id }}</code></div></td>
         <td>{{ r.item_display }}</td>
-        <td>{{ r.qty }}</td>
-        <td>{{ r.subtotal | money }}</td>
-        <td>{% if r.confirmed %}✅{% else %}⏳{% endif %}</td>
+        <td class="right">{{ r.qty }}</td>
+        <td class="right money">{{ r.subtotal | money }}</td>
+        <td>{% if r.confirmed %}<span class="pill ok">Paid</span>{% else %}<span class="pill warn">Pending</span>{% endif %}</td>
         <td>{% if r.tracking %}<code>{{ r.tracking }}</code>{% else %}<span class="muted">—</span>{% endif %}</td>
       </tr>
       {% endfor %}
     </tbody>
   </table>
+  </div>
   {% else %}
   <p class="muted">No orders found for “{{ q }}”.</p>
   {% endif %}

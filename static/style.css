@@ -447,6 +447,51 @@ tr.inactive-row { opacity: 0.55; }
 .login-card button { width: 100%; margin-top: 18px; padding: 11px; }
 .login-card .muted.small { margin-top: 22px; line-height: 1.6; }
 
+/* ── Numeric columns ─────────────────────────────────────────────────── */
+th.right, td.right { text-align: right; }
+td.right, td.num-cell { font-variant-numeric: tabular-nums; }
+td.money { font-weight: 600; }
+
+/* ── Scrollable table wrapper (keeps wide tables usable on phones) ────── */
+.table-wrap {
+  margin: 18px 0;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  border-radius: var(--radius);
+}
+.table-wrap table { margin: 0; }
+
+/* ── Paid / unpaid progress ──────────────────────────────────────────── */
+.progress { display: flex; align-items: center; gap: 12px; margin: 6px 0; }
+.progress .bar {
+  flex: 1;
+  max-width: 280px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  box-shadow: inset 0 0 0 1px var(--border);
+  overflow: hidden;
+}
+.progress .bar > span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--ok), #6ee7b7);
+  transition: width 0.5s var(--ease);
+}
+.progress .bar.warn > span { background: linear-gradient(90deg, var(--warn), #fcd34d); }
+.progress .pct {
+  font-size: 0.8rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ── Accent stat card (e.g. money owed) ──────────────────────────────── */
+.card.accent-warn::before { opacity: 1; background: linear-gradient(90deg, var(--warn), #fcd34d); }
+.card.accent-warn .num { color: var(--warn); }
+.card.accent-ok::before { opacity: 1; background: linear-gradient(90deg, var(--ok), #6ee7b7); }
+
 /* ── Motion preference ───────────────────────────────────────────────── */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
@@ -461,4 +506,50 @@ tr.inactive-row { opacity: 0.55; }
   main { padding: 28px 18px 56px; }
   h1 { font-size: 1.9rem; }
   th, td { padding: 11px 13px; }
+  .progress .bar { max-width: none; }
+}
+
+/* Payment tables collapse into stacked cards on narrow screens so the
+   Mark-paid / tracking actions stay reachable without side-scrolling. */
+@media (max-width: 720px) {
+  .table-wrap:has(table.orders) { overflow: visible; }
+  table.orders,
+  table.orders tbody,
+  table.orders tr,
+  table.orders td {
+    display: block;
+    width: 100%;
+  }
+  table.orders {
+    background: transparent;
+    border: none;
+    box-shadow: none;
+  }
+  table.orders thead { display: none; }
+  table.orders tr {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow-sm);
+    padding: 6px 4px;
+    margin-bottom: 14px;
+  }
+  table.orders tr:hover { background: var(--panel); }
+  table.orders td {
+    border: none;
+    padding: 8px 16px;
+  }
+  table.orders td::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 4px;
+    color: var(--muted);
+    font-size: 0.68rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  table.orders td[data-label=""]::before { content: none; }
+  table.orders form.inline { margin-top: 6px; }
+  table.orders .track-input { width: 100%; }
 }

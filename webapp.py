@@ -406,10 +406,16 @@ async def dashboard(request: Request):
                ) t""",
             gid,
         )
+        outstanding = await conn.fetchrow(
+            """SELECT COALESCE(SUM(subtotal), 0) AS amount
+               FROM user_claims WHERE guild_id = $1 AND confirmed = FALSE""",
+            gid,
+        )
     return templates.TemplateResponse(request, "dashboard.html", _ctx(
         request, gid, gname,
         stats=dict(stats), recent=[dict(r) for r in recent],
         untracked=untracked["n"] if untracked else 0,
+        outstanding=float(outstanding["amount"]) if outstanding else 0.0,
     ))
 
 

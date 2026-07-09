@@ -6,8 +6,9 @@
 {% if err %}<div class="alert error">{{ err }}</div>{% endif %}
 
 {% if raffles %}
+<div class="table-wrap">
 <table>
-  <thead><tr><th>Raffle</th><th>Status</th><th>Price / spot</th><th>Spots</th><th>Paid</th><th></th></tr></thead>
+  <thead><tr><th>Raffle</th><th>Status</th><th class="right">Price / spot</th><th class="right">Spots</th><th class="right">Paid</th><th></th></tr></thead>
   <tbody>
     {% for r in raffles %}
     <tr>
@@ -17,14 +18,15 @@
         {% elif r.status == 'complete' %}<span class="pill ok">{{ r.status_label }}</span>
         {% else %}<span class="pill warn">{{ r.status_label }}</span>{% endif %}
       </td>
-      <td>{{ r.price }}</td>
-      <td>{{ r.claimed }}/{{ r.spots }} claimed</td>
-      <td>{{ r.paid }}/{{ r.spots }}</td>
-      <td><a class="btn small" href="/raffles/{{ r.name | urlencode }}">View</a></td>
+      <td class="right">{{ r.price }}</td>
+      <td class="right">{{ r.claimed }}/{{ r.spots }} claimed</td>
+      <td class="right">{{ r.paid }}/{{ r.spots }}</td>
+      <td class="right"><a class="btn small" href="/raffles/{{ r.name | urlencode }}">View</a></td>
     </tr>
     {% endfor %}
   </tbody>
 </table>
+</div>
 {% else %}
 <p class="muted">No raffles yet — create one below.</p>
 {% endif %}

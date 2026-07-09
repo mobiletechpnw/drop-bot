@@ -24,26 +24,32 @@
 </p>
 
 {% if orders %}
+{% set paid_count = orders | selectattr('paid') | list | length %}
+<div class="progress">
+  <div class="bar {{ 'warn' if paid_count < orders|length else '' }}"><span style="width: {{ (100 * paid_count / (orders|length)) | round(0, 'floor') }}%"></span></div>
+  <div class="pct">{{ paid_count }} / {{ orders|length }} paid</div>
+</div>
+<div class="table-wrap">
 <table class="orders">
   <thead>
-    <tr><th>Buyer</th><th>Items</th><th>Total</th><th>Paid</th></tr>
+    <tr><th>Buyer</th><th>Items</th><th class="right">Total</th><th>Paid</th></tr>
   </thead>
   <tbody>
     {% for o in orders %}
     <tr>
-      <td>
+      <td data-label="Buyer">
         <div class="buyer">{{ o.name }}</div>
         <div class="muted small"><code>{{ o.user_id }}</code></div>
       </td>
-      <td>
+      <td data-label="Items">
         <ul class="items">
           {% for it in o['items'] %}
           <li>{{ it.display }} ×{{ it.qty }} — {{ it.subtotal | money }}</li>
           {% endfor %}
         </ul>
       </td>
-      <td>{{ o.total | money }}</td>
-      <td>
+      <td data-label="Total" class="right money">{{ o.total | money }}</td>
+      <td data-label="Paid">
         {% if o.paid %}
           <span class="pill ok">Paid</span>
           <form method="post" action="/live/unconfirm" class="inline">
@@ -62,6 +68,7 @@
     {% endfor %}
   </tbody>
 </table>
+</div>
 {% else %}
 <p class="muted">No claims yet in this drop.</p>
 {% endif %}

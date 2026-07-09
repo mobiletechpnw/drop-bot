@@ -4,29 +4,32 @@
 <h1>Dashboard</h1>
 
 <div class="cards">
-  <div class="card"><div class="num">{{ stats.drops }}</div><div class="lbl">Drops closed</div></div>
   <div class="card"><div class="num">{{ stats.revenue | money }}</div><div class="lbl">Total revenue</div></div>
+  <div class="card {{ 'accent-warn' if outstanding and outstanding > 0 else '' }}"><div class="num">{{ outstanding | money }}</div><div class="lbl">Money owed</div></div>
+  <div class="card"><div class="num">{{ stats.drops }}</div><div class="lbl">Drops closed</div></div>
   <div class="card"><div class="num">{{ stats.items_sold }}</div><div class="lbl">Items sold</div></div>
-  <div class="card"><div class="num">{{ untracked }}</div><div class="lbl">Orders without tracking</div></div>
+  <div class="card {{ 'accent-warn' if untracked else '' }}"><div class="num">{{ untracked }}</div><div class="lbl">Orders without tracking</div></div>
 </div>
 
 <h2>Recent drops</h2>
 {% if recent %}
+<div class="table-wrap">
 <table>
-  <thead><tr><th>Drop</th><th>Closed</th><th>Revenue</th><th>Items</th><th>Buyers</th><th></th></tr></thead>
+  <thead><tr><th>Drop</th><th>Closed</th><th class="right">Revenue</th><th class="right">Items</th><th class="right">Buyers</th><th></th></tr></thead>
   <tbody>
     {% for d in recent %}
     <tr>
       <td>#{{ d.drop_number }}</td>
       <td>{{ d.closed_at.strftime('%b %d, %Y') }}</td>
-      <td>{{ d.total_revenue | money }}</td>
-      <td>{{ d.total_items }}</td>
-      <td>{{ d.unique_buyers }}</td>
-      <td><a class="btn small" href="/drops/{{ d.drop_number }}">View</a></td>
+      <td class="right money">{{ d.total_revenue | money }}</td>
+      <td class="right">{{ d.total_items }}</td>
+      <td class="right">{{ d.unique_buyers }}</td>
+      <td class="right"><a class="btn small" href="/drops/{{ d.drop_number }}">View</a></td>
     </tr>
     {% endfor %}
   </tbody>
 </table>
+</div>
 <p><a href="/drops">See all drops →</a></p>
 {% else %}
 <p class="muted">No drops have closed yet. Once you run a drop in Discord and close it,
