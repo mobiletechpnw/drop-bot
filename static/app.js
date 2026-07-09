@@ -27,6 +27,26 @@
     });
   }
 
+  /* ── Accent picker (Settings › Appearance) ────────────────────────── */
+  var swatches = document.querySelectorAll("[data-accent-pick]");
+  if (swatches.length) {
+    var markAccent = function () {
+      var cur = root.getAttribute("data-accent") || "sunset";
+      swatches.forEach(function (s) {
+        s.classList.toggle("is-active", s.getAttribute("data-accent-pick") === cur);
+      });
+    };
+    markAccent();
+    swatches.forEach(function (s) {
+      s.addEventListener("click", function () {
+        var v = s.getAttribute("data-accent-pick");
+        root.setAttribute("data-accent", v);
+        try { localStorage.setItem("accent", v); } catch (e) {}
+        markAccent();
+      });
+    });
+  }
+
   /* ── Toasts ───────────────────────────────────────────────────────── */
   var host = document.getElementById("toasts");
   function toast(msg, kind) {

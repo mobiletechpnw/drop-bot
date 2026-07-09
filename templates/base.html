@@ -11,6 +11,9 @@
           t = window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
         }
         document.documentElement.setAttribute('data-theme', t);
+        var accents = ['sunset', 'ocean', 'emerald', 'ruby', 'gold', 'grape', 'slate'];
+        var a = localStorage.getItem('accent');
+        document.documentElement.setAttribute('data-accent', accents.indexOf(a) === -1 ? 'sunset' : a);
       } catch (e) {}
     })();
   </script>
