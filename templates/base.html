@@ -20,7 +20,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;550;600;650;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v={{ asset_ver }}">
   {% block head %}{% endblock %}
 </head>
 <body>
@@ -59,6 +59,6 @@
     changes here reach the bot within ~60s.
   </footer>
   <div id="toasts" class="toasts" aria-live="polite"></div>
-  <script src="/static/app.js" defer></script>
+  <script src="/static/app.js?v={{ asset_ver }}" defer></script>
 </body>
 </html>

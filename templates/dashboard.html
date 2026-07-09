@@ -1,7 +1,11 @@
 {% extends "base.html" %}
 {% block title %}Dashboard{% endblock %}
 {% block content %}
-<h1>Dashboard</h1>
+<section class="hero">
+  <div class="hero-eyebrow">{{ guild_name or 'Your store' }}</div>
+  <h1 class="hero-title">Command center</h1>
+  <p class="hero-sub">Every drop, dollar earned, and who still owes you — in one glance.</p>
+</section>
 
 <div class="cards">
   <div class="card"><div class="num">{{ stats.revenue | money }}</div><div class="lbl">Total revenue</div></div>
