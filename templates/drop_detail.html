@@ -89,9 +89,18 @@
 </div>
 {% else %}
 {% if show_unpaid %}
-<p class="muted">🎉 No unpaid orders — everyone's paid up.</p>
+<div class="empty">
+  <div class="ico">🎉</div>
+  <h3>Everyone's paid up</h3>
+  <p>No unpaid orders in this drop. Nice work.</p>
+  <div class="actions"><a class="btn ghost" href="/drops/{{ drop_number }}">View all orders</a></div>
+</div>
 {% else %}
-<p class="muted">No orders recorded for this drop.</p>
+<div class="empty">
+  <div class="ico">📭</div>
+  <h3>No orders recorded</h3>
+  <p>This drop closed without any claims on record.</p>
+</div>
 {% endif %}
 {% endif %}
 <p><a href="/drops">← All drops</a></p>

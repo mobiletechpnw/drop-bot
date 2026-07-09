@@ -32,7 +32,15 @@
 </div>
 <p><a href="/drops">See all drops →</a></p>
 {% else %}
-<p class="muted">No drops have closed yet. Once you run a drop in Discord and close it,
-it will show up here.</p>
+<div class="empty">
+  <div class="ico">📦</div>
+  <h3>No drops closed yet</h3>
+  <p>Run a drop in Discord and close it — its revenue, buyers, and orders
+    will show up here automatically.</p>
+  <div class="actions">
+    <a class="btn" href="/live">Watch a live drop</a>
+    <a class="btn ghost" href="/settings">Set up payment methods</a>
+  </div>
+</div>
 {% endif %}
 {% endblock %}

@@ -24,6 +24,14 @@
 </table>
 </div>
 {% else %}
-<p class="muted">No closed drops yet.</p>
+<div class="empty">
+  <div class="ico">📦</div>
+  <h3>No closed drops yet</h3>
+  <p>Once you close a drop in Discord it lands here with full order and
+    payment detail, plus a one-click Excel export.</p>
+  <div class="actions">
+    <a class="btn" href="/live">Watch a live drop</a>
+  </div>
+</div>
 {% endif %}
 {% endblock %}

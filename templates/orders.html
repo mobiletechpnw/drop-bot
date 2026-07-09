@@ -30,9 +30,19 @@
   </table>
   </div>
   {% else %}
-  <p class="muted">No orders found for “{{ q }}”.</p>
+  <div class="empty">
+    <div class="ico">🔍</div>
+    <h3>No orders found</h3>
+    <p>Nothing matched “{{ q }}”. Try a different spelling, a partial name,
+      or the buyer's Discord user ID.</p>
+  </div>
   {% endif %}
 {% else %}
-<p class="muted">Search past orders by buyer name or Discord user ID.</p>
+<div class="empty">
+  <div class="ico">🔎</div>
+  <h3>Search past orders</h3>
+  <p>Look up any buyer's history across every drop by name or Discord user ID
+    to check what they bought, whether they paid, and their tracking number.</p>
+</div>
 {% endif %}
 {% endblock %}

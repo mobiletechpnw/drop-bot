@@ -1,27 +1,41 @@
 {% extends "base.html" %}
 {% block title %}Live drop{% endblock %}
+{% block head %}
+{% if is_live %}<meta http-equiv="refresh" content="25">{% endif %}
+{% endblock %}
 {% block content %}
 <div class="row-between">
-  <h1>Live drop{% if is_live and drop_number %} · Drop #{{ drop_number }}{% endif %}</h1>
+  <h1>
+    Live drop{% if is_live and drop_number %} · Drop #{{ drop_number }}{% endif %}
+    {% if is_live %}<span class="live-badge"><span class="live-dot"></span> Live</span>{% endif %}
+  </h1>
   <a class="btn ghost" href="/live">↻ Refresh</a>
 </div>
 
 {% if msg %}<div class="alert ok">{{ msg }}</div>{% endif %}
 
 {% if not is_live %}
-<p class="muted">
-  🔌 No drop is live right now. Staging stock, taking claims, and going live
-  still happen in Discord — once a drop is live it appears here so you can mark
-  buyers paid without switching to Discord. Closed drops live under
-  <a href="/drops">Drops</a>.
-</p>
+<div class="empty">
+  <div class="ico">🔌</div>
+  <h3>No drop is live right now</h3>
+  <p>
+    Staging stock, taking claims, and going live still happen in Discord.
+    Once a drop goes live it appears here so you can mark buyers paid without
+    switching apps.
+  </p>
+  <div class="actions">
+    <a class="btn" href="/drops">View closed drops</a>
+    <a class="btn ghost" href="/live">↻ Check again</a>
+  </div>
+</div>
 {% else %}
 <p class="muted">
   Total {{ total | money }} · {{ unpaid_count }} unpaid ·
   Marking paid/unpaid here syncs to the bot in ~15s, same as
-  <code>!confirm</code> in Discord. Refresh to see it land.
+  <code>!confirm</code> in Discord.
   {% if updated_at %}<br>Live data as of {{ updated_at.strftime('%b %d, %Y %H:%M UTC') }}.{% endif %}
 </p>
+<p class="refresh-note"><span class="live-dot"></span>Auto-refreshing every 25s · marks land automatically.</p>
 
 {% if orders %}
 {% set paid_count = orders | selectattr('paid') | list | length %}
@@ -70,7 +84,12 @@
 </table>
 </div>
 {% else %}
-<p class="muted">No claims yet in this drop.</p>
+<div class="empty">
+  <div class="ico">🕓</div>
+  <h3>Waiting on the first claim</h3>
+  <p>No buyers have claimed in this drop yet. Claims appear here within
+    ~15 seconds of landing in Discord.</p>
+</div>
 {% endif %}
 {% endif %}
 {% endblock %}
