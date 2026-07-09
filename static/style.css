@@ -80,10 +80,10 @@ body::before {
   inset: -30vmax;
   z-index: -2;
   background:
-    radial-gradient(38vmax 38vmax at 18% 12%, rgba(139, 92, 246, 0.38), transparent 60%),
-    radial-gradient(34vmax 34vmax at 82% 8%, rgba(233, 53, 193, 0.30), transparent 60%),
-    radial-gradient(40vmax 40vmax at 70% 88%, rgba(255, 138, 61, 0.22), transparent 62%),
-    radial-gradient(36vmax 36vmax at 12% 82%, rgba(56, 189, 248, 0.20), transparent 60%);
+    radial-gradient(38vmax 38vmax at 18% 12%, color-mix(in srgb, var(--g1) 40%, transparent), transparent 60%),
+    radial-gradient(34vmax 34vmax at 82% 8%, color-mix(in srgb, var(--g2) 34%, transparent), transparent 60%),
+    radial-gradient(40vmax 40vmax at 70% 88%, color-mix(in srgb, var(--g3) 26%, transparent), transparent 62%),
+    radial-gradient(36vmax 36vmax at 12% 82%, color-mix(in srgb, var(--g2) 22%, transparent), transparent 60%);
   filter: saturate(130%);
   animation: drift 26s ease-in-out infinite alternate;
 }
@@ -649,6 +649,44 @@ tr.inactive-row { opacity: 0.5; }
 :root[data-theme="light"] .alert.error { color: #be123c; }
 :root[data-theme="light"] .alert.warn { color: #b45309; }
 :root[data-theme="light"] .btn.ghost:hover, :root[data-theme="light"] button.ghost:hover { background: var(--panel-2); }
+
+/* ── Accent presets (chosen in Settings, stored per-browser) ─────────────
+   Placed after the light theme so a picked accent wins in both themes.
+   "sunset" is the default (:root) — no block needed. */
+:root[data-accent="ocean"]   { --g1: #3b82f6; --g2: #06b6d4; --g3: #22d3ee; --accent: #3b82f6; --accent-2: #38bdf8; --accent-soft: rgba(59, 130, 246, 0.16); --accent-line: rgba(59, 130, 246, 0.5); }
+:root[data-accent="emerald"] { --g1: #059669; --g2: #10b981; --g3: #84cc16; --accent: #10b981; --accent-2: #34d399; --accent-soft: rgba(16, 185, 129, 0.16); --accent-line: rgba(16, 185, 129, 0.5); }
+:root[data-accent="ruby"]    { --g1: #fb7185; --g2: #f43f5e; --g3: #fb923c; --accent: #f43f5e; --accent-2: #fb7185; --accent-soft: rgba(244, 63, 94, 0.16); --accent-line: rgba(244, 63, 94, 0.5); }
+:root[data-accent="gold"]    { --g1: #f59e0b; --g2: #f97316; --g3: #fbbf24; --accent: #f59e0b; --accent-2: #fbbf24; --accent-soft: rgba(245, 158, 11, 0.18); --accent-line: rgba(245, 158, 11, 0.5); }
+:root[data-accent="grape"]   { --g1: #7c3aed; --g2: #a855f7; --g3: #6366f1; --accent: #8b5cf6; --accent-2: #a78bfa; --accent-soft: rgba(124, 58, 237, 0.16); --accent-line: rgba(124, 58, 237, 0.5); }
+:root[data-accent="slate"]   { --g1: #475569; --g2: #64748b; --g3: #94a3b8; --accent: #64748b; --accent-2: #94a3b8; --accent-soft: rgba(100, 116, 139, 0.18); --accent-line: rgba(100, 116, 139, 0.5); }
+
+/* ── Accent swatch picker (Settings › Appearance) ────────────────────── */
+.appearance { margin-top: 8px; }
+.swatches { display: flex; flex-wrap: wrap; gap: 12px; margin: 18px 0 8px; }
+.swatch {
+  display: inline-flex; align-items: center; gap: 10px;
+  padding: 8px 16px 8px 8px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  border: 1px solid var(--glass-brd);
+  color: var(--text-dim);
+  font-size: 0.85rem; font-weight: 650;
+  cursor: pointer; box-shadow: none;
+}
+.swatch::after { display: none; }
+.swatch .chip {
+  width: 26px; height: 26px; border-radius: 50%;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.28);
+}
+.swatch:hover { border-color: var(--glass-brd-strong); color: var(--text); transform: translateY(-1px); box-shadow: none; }
+.swatch.is-active { color: var(--text); border-color: var(--accent-line); box-shadow: 0 0 0 1px var(--accent-line), 0 10px 24px -12px rgba(0, 0, 0, 0.5); }
+.swatch[data-accent-pick="sunset"]  .chip { background: linear-gradient(120deg, #8b5cf6, #e935c1, #ff8a3d); }
+.swatch[data-accent-pick="ocean"]   .chip { background: linear-gradient(120deg, #3b82f6, #06b6d4, #22d3ee); }
+.swatch[data-accent-pick="emerald"] .chip { background: linear-gradient(120deg, #059669, #10b981, #84cc16); }
+.swatch[data-accent-pick="ruby"]    .chip { background: linear-gradient(120deg, #fb7185, #f43f5e, #fb923c); }
+.swatch[data-accent-pick="gold"]    .chip { background: linear-gradient(120deg, #f59e0b, #f97316, #fbbf24); }
+.swatch[data-accent-pick="grape"]   .chip { background: linear-gradient(120deg, #7c3aed, #a855f7, #6366f1); }
+.swatch[data-accent-pick="slate"]   .chip { background: linear-gradient(120deg, #475569, #64748b, #94a3b8); }
 
 /* ── Motion preference ───────────────────────────────────────────────── */
 @media (prefers-reduced-motion: reduce) {
