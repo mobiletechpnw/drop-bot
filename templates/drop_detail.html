@@ -6,6 +6,9 @@
   <a class="btn" href="/drops/{{ drop_number }}/export.xlsx">Download Excel</a>
 </div>
 {% if closed_at %}<p class="muted">Closed {{ closed_at.strftime('%b %d, %Y') }} · Total {{ total | money }} · {{ unpaid_count }} unpaid</p>{% endif %}
+{% if msg %}<div class="alert ok">{{ msg }}</div>{% endif %}
+
+<div id="paidRegion">
 {% if all_count %}
 {% set paid_count = all_count - unpaid_count %}
 <div class="progress">
@@ -13,7 +16,6 @@
   <div class="pct">{{ paid_count }} / {{ all_count }} paid</div>
 </div>
 {% endif %}
-{% if msg %}<div class="alert ok">{{ msg }}</div>{% endif %}
 
 <div class="controls">
   <div class="tabs">
@@ -58,7 +60,7 @@
       <td data-label="Paid">
         {% if o.confirmed %}
           <span class="pill ok">Paid</span>
-          <form method="post" action="/drops/{{ drop_number }}/confirm" class="inline">
+          <form method="post" action="/drops/{{ drop_number }}/confirm" class="inline js-ajax" data-toast="Marked unpaid">
             <input type="hidden" name="user_id" value="{{ o.user_id }}">
             <input type="hidden" name="confirmed" value="0">
             <input type="hidden" name="view" value="{{ 'unpaid' if show_unpaid else '' }}">
@@ -66,7 +68,7 @@
           </form>
         {% else %}
           <span class="pill warn">Pending</span>
-          <form method="post" action="/drops/{{ drop_number }}/confirm" class="inline">
+          <form method="post" action="/drops/{{ drop_number }}/confirm" class="inline js-ajax" data-toast="Marked paid">
             <input type="hidden" name="user_id" value="{{ o.user_id }}">
             <input type="hidden" name="confirmed" value="1">
             <input type="hidden" name="view" value="{{ 'unpaid' if show_unpaid else '' }}">
@@ -75,7 +77,7 @@
         {% endif %}
       </td>
       <td data-label="Tracking">
-        <form method="post" action="/drops/{{ drop_number }}/tracking" class="inline">
+        <form method="post" action="/drops/{{ drop_number }}/tracking" class="inline js-ajax" data-toast="Tracking saved">
           <input type="hidden" name="user_id" value="{{ o.user_id }}">
           <input type="hidden" name="view" value="{{ 'unpaid' if show_unpaid else '' }}">
           <input name="tracking" value="{{ o.tracking }}" placeholder="Tracking #" class="track-input">
@@ -103,5 +105,6 @@
 </div>
 {% endif %}
 {% endif %}
+</div>
 <p><a href="/drops">← All drops</a></p>
 {% endblock %}

@@ -1,8 +1,5 @@
 {% extends "base.html" %}
 {% block title %}Live drop{% endblock %}
-{% block head %}
-{% if is_live %}<meta http-equiv="refresh" content="25">{% endif %}
-{% endblock %}
 {% block content %}
 <div class="row-between">
   <h1>
@@ -37,6 +34,7 @@
 </p>
 <p class="refresh-note"><span class="live-dot"></span>Auto-refreshing every 25s · marks land automatically.</p>
 
+<div id="paidRegion" data-live-poll data-poll-url="/live">
 {% if orders %}
 {% set paid_count = orders | selectattr('paid') | list | length %}
 <div class="progress">
@@ -66,13 +64,13 @@
       <td data-label="Paid">
         {% if o.paid %}
           <span class="pill ok">Paid</span>
-          <form method="post" action="/live/unconfirm" class="inline">
+          <form method="post" action="/live/unconfirm" class="inline js-ajax" data-toast="Marked unpaid">
             <input type="hidden" name="user_id" value="{{ o.user_id }}">
             <button class="btn small ghost" type="submit">Undo</button>
           </form>
         {% else %}
           <span class="pill warn">{{ o.confirmed_total | money }} of {{ o.total | money }}</span>
-          <form method="post" action="/live/confirm" class="inline">
+          <form method="post" action="/live/confirm" class="inline js-ajax" data-toast="Marked paid">
             <input type="hidden" name="user_id" value="{{ o.user_id }}">
             <button class="btn small" type="submit">Mark paid</button>
           </form>
@@ -91,5 +89,6 @@
     ~15 seconds of landing in Discord.</p>
 </div>
 {% endif %}
+</div>
 {% endif %}
 {% endblock %}
