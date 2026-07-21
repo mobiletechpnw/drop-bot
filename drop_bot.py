@@ -339,16 +339,23 @@ async def db_save_user_claims(guild_id, drop_number, closed_at, claims_data, sto
 
 async def db_update_user_claim_confirmed(guild_id, user_id):
     """Mark all of a user's claims in the latest drop as confirmed."""
+    await db_set_claim_confirmed(guild_id, user_id, True)
+
+
+async def db_set_claim_confirmed(guild_id, user_id, confirmed):
+    """Set the confirmed flag on all of a user's claims in their latest drop."""
+    if db_pool is None:
+        return
     async with db_pool.acquire() as conn:
         await conn.execute("""
             UPDATE user_claims
-            SET confirmed = TRUE
+            SET confirmed = $3
             WHERE guild_id = $1 AND user_id = $2
             AND drop_number = (
                 SELECT MAX(drop_number) FROM user_claims
                 WHERE guild_id = $1 AND user_id = $2
             )
-        """, guild_id, user_id)
+        """, guild_id, user_id, confirmed)
 
 
 async def db_save_raffle_host(guild_id: int, host_num: int):
@@ -412,6 +419,7 @@ payment_board_message    = {}
 live_claimlist_message   = {}   # guild_id -> Message (live claim list embed)
 pending_payment_messages = {}
 _pending_board_update    = {}   # guild_id -> bool (debounce flag)
+_web_sync_started        = False  # guard so the outbox poller starts only once
 
 # Snapshot of stock prices at drop close for bump/remind to reference after stock resets
 # last_drop_snapshot[guild_id] = {"claims": {...}, "stock": {...}}
@@ -736,6 +744,176 @@ async def update_all_live_boards(guild_id):
         except discord.HTTPException:
             pass
 
+    # Mirror the live drop to the DB so the web dashboard stays in sync
+    await mirror_live_drop(guild_id)
+
+
+# ── WEB DASHBOARD SYNC ────────────────────────────────────────────────────────
+#
+# The web dashboard shares this bot's PostgreSQL database. Two-way sync works
+# through the DB: the bot mirrors the current live drop into live_drops /
+# live_orders (read by the dashboard's Live page), and the dashboard writes
+# paid/unpaid clicks into the pending_actions outbox, which poll_pending_actions
+# below applies back into the bot's in-memory payments and the Discord board.
+
+def _live_orders_snapshot(guild_id):
+    """Per-buyer order rows for the current drop, shaped for the dashboard's
+    Live page. Returns [] while a drop is only being staged."""
+    state = session_state.get(guild_id, "closed")
+    if state == "staging":
+        return []
+    stock_ref  = stock[guild_id]
+    claims_ref = claims[guild_id]
+
+    orders = {}
+    for key, claim_list in claims_ref.items():
+        if key not in stock_ref:
+            continue
+        for c in claim_list:
+            uid = c["user"].id
+            o = orders.setdefault(
+                uid, {"name": c["user"].display_name, "items": [], "total": 0.0}
+            )
+            subtotal = c["qty"] * stock_ref[key]["price"]
+            o["items"].append({
+                "display": stock_ref[key]["display"],
+                "qty": c["qty"],
+                "subtotal": round(subtotal, 2),
+            })
+            o["total"] += subtotal
+
+    result = []
+    for uid, o in orders.items():
+        confirmed_total = sum(
+            p["amount"] for p in payments[guild_id].get(uid, []) if p["confirmed"]
+        )
+        result.append({
+            "user_id": uid,
+            "user_name": o["name"],
+            "items": o["items"],
+            "total": round(o["total"], 2),
+            "confirmed_total": round(confirmed_total, 2),
+            "paid": o["total"] > 0 and confirmed_total >= o["total"] - 0.01,
+        })
+    return result
+
+
+def _owed_for_user(guild_id, uid):
+    """Total this buyer owes in the current drop (0.0 if they have no claims)."""
+    stock_ref  = stock[guild_id]  if stock[guild_id]  else last_drop_snapshot.get(guild_id, {}).get("stock",  {})
+    claims_ref = claims[guild_id] if claims[guild_id] else last_drop_snapshot.get(guild_id, {}).get("claims", {})
+    owed = 0.0
+    for key, claim_list in claims_ref.items():
+        if key not in stock_ref:
+            continue
+        for c in claim_list:
+            if c["user"].id == uid:
+                owed += c["qty"] * stock_ref[key]["price"]
+    return owed
+
+
+async def mirror_live_drop(guild_id):
+    """Write the current drop's buyers into live_drops / live_orders so the web
+    dashboard's Live page reflects Discord. Best-effort: never raises."""
+    if db_pool is None:
+        return
+    try:
+        snapshot = _live_orders_snapshot(guild_id)
+        state = session_state.get(guild_id, "closed")
+        is_live = state == "live" or (state == "closed" and bool(snapshot))
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT COUNT(*) AS cnt FROM drop_history WHERE guild_id = $1",
+                guild_id,
+            )
+            base = row["cnt"] if row else 0
+            drop_number = base + 1 if state == "live" else base
+            await conn.execute("""
+                INSERT INTO live_drops (guild_id, drop_number, is_live, updated_at)
+                VALUES ($1, $2, $3, NOW())
+                ON CONFLICT (guild_id) DO UPDATE
+                SET drop_number = $2, is_live = $3, updated_at = NOW()
+            """, guild_id, drop_number, is_live)
+            await conn.execute(
+                "DELETE FROM live_orders WHERE guild_id = $1", guild_id
+            )
+            for o in snapshot:
+                await conn.execute("""
+                    INSERT INTO live_orders (guild_id, user_id, user_name,
+                        drop_number, items, total, confirmed_total, paid, updated_at)
+                    VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, NOW())
+                """, guild_id, o["user_id"], o["user_name"], drop_number,
+                     json.dumps(o["items"]), o["total"], o["confirmed_total"],
+                     o["paid"])
+    except Exception as e:
+        print(f"⚠️  mirror_live_drop failed for {guild_id}: {e}")
+
+
+async def apply_pending_action(guild_id, user_id, action):
+    """Apply one dashboard paid/unpaid click to in-memory state, the DB, and the
+    Discord payment board."""
+    if action == "confirm":
+        for p in payments[guild_id].get(user_id, []):
+            p["confirmed"] = True
+        confirmed_total = sum(
+            p["amount"] for p in payments[guild_id].get(user_id, []) if p["confirmed"]
+        )
+        owed = _owed_for_user(guild_id, user_id)
+        # Buyer may have been marked paid without ever running !paid — top up
+        # with a confirmed record so the board shows them paid in full.
+        if owed - confirmed_total > 0.01:
+            payments[guild_id][user_id].append({
+                "method": "dashboard",
+                "amount": round(owed - confirmed_total, 2),
+                "time": datetime.datetime.utcnow(),
+                "confirmed": True,
+            })
+        db_confirmed = True
+    elif action == "unconfirm":
+        for p in payments[guild_id].get(user_id, []):
+            p["confirmed"] = False
+        db_confirmed = False
+    else:
+        return
+
+    # Persist to user_claims (best-effort — no rows exist until a drop closes),
+    # then refresh the Discord board and the dashboard mirror regardless.
+    try:
+        await db_set_claim_confirmed(guild_id, user_id, db_confirmed)
+    except Exception as e:
+        print(f"⚠️  db_set_claim_confirmed failed for {guild_id}/{user_id}: {e}")
+    await mirror_live_drop(guild_id)
+    asyncio.create_task(update_all_live_boards(guild_id))
+
+
+async def poll_pending_actions():
+    """Background loop: drain the dashboard's pending_actions outbox every ~15s."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            if db_pool is not None:
+                async with db_pool.acquire() as conn:
+                    rows = await conn.fetch("""
+                        SELECT id, guild_id, user_id, action
+                        FROM pending_actions WHERE applied_at IS NULL ORDER BY id
+                    """)
+                for r in rows:
+                    try:
+                        await apply_pending_action(
+                            r["guild_id"], r["user_id"], r["action"]
+                        )
+                    except Exception as e:
+                        print(f"⚠️  pending_action {r['id']} failed: {e}")
+                    # Mark applied either way so a poison row can't wedge the loop.
+                    async with db_pool.acquire() as conn:
+                        await conn.execute(
+                            "UPDATE pending_actions SET applied_at = NOW() WHERE id = $1",
+                            r["id"],
+                        )
+        except Exception as e:
+            print(f"⚠️  poll_pending_actions loop error: {e}")
+        await asyncio.sleep(15)
+
 
 async def update_stock_embed(guild_id):
     msg = stock_message.get(guild_id)
@@ -883,6 +1061,9 @@ async def close_drop(channel, guild_id):
     final_pb_embed.title = "💳  Final Payment Board"
     board_msg = await channel.send(embed=final_pb_embed)
     payment_board_message[guild_id] = board_msg
+
+    # Mirror the closed drop so the dashboard's Live page can still mark payments
+    await mirror_live_drop(guild_id)
 
     # Remind buyers they can view their order anytime
     await channel.send(
@@ -1067,6 +1248,11 @@ async def on_ready():
             if raffle["status"] in ("open", "closed") and raffle.get("message_id"):
                 view = _build_raffle_view(guild_id, name, raffle)
                 bot.add_view(view)
+    # Start the web-dashboard outbox poller once (on_ready can fire on reconnect)
+    global _web_sync_started
+    if not _web_sync_started:
+        _web_sync_started = True
+        asyncio.create_task(poll_pending_actions())
     print(f"✅  Logged in as {bot.user} ({bot.user.id})")
 
 
@@ -1329,6 +1515,7 @@ async def cmd_drop(ctx, *, arg=""):
     pending_payment_messages.clear()  # clear any stale reaction listeners
     autoclose[guild_id] = True
     manager_session[ctx.author.id] = {"guild_id": guild_id, "channel": drop_ch}
+    await mirror_live_drop(guild_id)  # clear the dashboard's live view for the new session
     await silent(ctx)
     await dm(ctx, f"✅  Drop session started for **{ctx.guild.name}**! Drop will post in **#{drop_ch.name}**.\n\nCommands available now: `!addstock`, `!editstock`, `!removestockitem`, `!preview`, `!countdown`, `!release`, `!claimlist`, `!autoclose`, `!enddrop`\n\n💡  Auto-close is **ON**.")
 
