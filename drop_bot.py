@@ -1121,6 +1121,10 @@ async def on_reaction_add(reaction, user):
 
     del pending_payment_messages[msg_id]
 
+    # Persist confirmed status to DB so the web dashboard reflects it
+    if pending:
+        await db_update_user_claim_confirmed(guild_id, buyer_id)
+
     asyncio.create_task(update_all_live_boards(guild_id))
 
     guild = reaction.message.guild
@@ -1249,7 +1253,6 @@ async def cmd_managers(ctx):
 
 # ── DROP COMMANDS ─────────────────────────────────────────────────────────────
 
-@bot.command(name="drop")
 def get_outstanding_buyers(guild_id):
     """Return list of (name, owed, confirmed, outstanding) for buyers who still owe
     money in the current live drop. Used to warn before starting a new drop."""
@@ -1275,6 +1278,7 @@ def get_outstanding_buyers(guild_id):
     return outstanding
 
 
+@bot.command(name="drop")
 async def cmd_drop(ctx, *, arg=""):
     if not ctx.guild:
         await ctx.author.send("⚠️  `!drop` must be run in a server channel.")
