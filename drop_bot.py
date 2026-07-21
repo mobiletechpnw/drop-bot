@@ -322,6 +322,69 @@ async def db_load_all():
     print(f"✅  Loaded {len(server_admins)} server(s) from database.")
 
 
+async def rehydrate_payment_drops():
+    """Rebuild the most recent closed drop for each guild from user_claims so
+    buyers can still `!paid` and managers can still `!confirm` after a restart.
+
+    Live-drop state (claims/stock/payments) lives only in memory and is lost on
+    restart, which otherwise makes `!paid` report "no claims" while payments are
+    still being collected for a drop that closed before the restart. Runs once,
+    and never touches a guild that already has an active drop in memory."""
+    global _rehydrated
+    if _rehydrated or db_pool is None:
+        return
+    _rehydrated = True
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT uc.guild_id, uc.user_id, uc.user_name, uc.item_display,
+                   uc.qty, uc.price, uc.subtotal, uc.confirmed
+            FROM user_claims uc
+            JOIN (
+                SELECT guild_id, MAX(drop_number) AS mx
+                FROM user_claims GROUP BY guild_id
+            ) m ON uc.guild_id = m.guild_id AND uc.drop_number = m.mx
+        """)
+
+    by_guild = defaultdict(list)
+    for r in rows:
+        by_guild[r["guild_id"]].append(r)
+
+    restored = 0
+    for guild_id, grows in by_guild.items():
+        # Never clobber a drop that's mid-flight in memory.
+        if claims[guild_id] or stock[guild_id] or session_state.get(guild_id) in ("staging", "live"):
+            continue
+        guild = bot.get_guild(guild_id)
+        confirmed_amt = defaultdict(float)
+        for r in grows:
+            key = r["item_display"]
+            stock[guild_id][key] = {"display": r["item_display"], "price": float(r["price"])}
+            member = guild.get_member(r["user_id"]) if guild else None
+            user_obj = member or _StoredUser(r["user_id"], r["user_name"])
+            claims[guild_id][key].append({
+                "user": user_obj, "qty": r["qty"], "time": datetime.datetime.utcnow(),
+            })
+            if r["confirmed"]:
+                confirmed_amt[r["user_id"]] += float(r["subtotal"])
+        # Rebuild confirmed payments so already-paid buyers aren't asked again.
+        for uid, amt in confirmed_amt.items():
+            if amt > 0:
+                payments[guild_id][uid].append({
+                    "method": "confirmed", "amount": round(amt, 2),
+                    "time": datetime.datetime.utcnow(), "confirmed": True,
+                })
+        session_state[guild_id] = "closed"
+        last_drop_snapshot[guild_id] = {
+            "stock": dict(stock[guild_id]),
+            "claims": {k: list(v) for k, v in claims[guild_id].items()},
+        }
+        restored += 1
+
+    if restored:
+        print(f"✅  Rehydrated {restored} closed drop(s) for payment collection.")
+
+
 async def db_set_admin(guild_id, user_id):
     async with db_pool.acquire() as conn:
         await conn.execute("""
@@ -461,6 +524,18 @@ live_claimlist_message   = {}   # guild_id -> Message (live claim list embed)
 pending_payment_messages = {}
 _pending_board_update    = {}   # guild_id -> bool (debounce flag)
 _web_sync_started        = False  # guard so the outbox poller starts only once
+_rehydrated              = False  # guard so payment-drop rehydration runs once
+
+
+class _StoredUser:
+    """Lightweight stand-in for a Discord user when a closed drop is rehydrated
+    from the DB after a restart. Only .id and .display_name are used by the
+    payment-collection code paths (owed math, boards, !paid, !confirm)."""
+    __slots__ = ("id", "display_name")
+
+    def __init__(self, user_id, display_name):
+        self.id = user_id
+        self.display_name = display_name
 
 # Snapshot of stock prices at drop close for bump/remind to reference after stock resets
 # last_drop_snapshot[guild_id] = {"claims": {...}, "stock": {...}}
@@ -1417,6 +1492,7 @@ async def on_message(message):
 async def on_ready():
     await init_db()
     await db_load_all()
+    await rehydrate_payment_drops()
     await bot.tree.sync()
     # Re-register persistent raffle Views so buttons work after restart
     for guild_id, raffles in server_raffles.items():
