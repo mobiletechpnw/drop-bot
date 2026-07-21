@@ -170,6 +170,32 @@ async def init_db():
                 confirmed BOOLEAN DEFAULT FALSE
             )
         """)
+        # Tracks the durable payment-board message so it survives restarts and
+        # can be rebuilt from user_claims for closed drops.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS payment_boards (
+                guild_id    BIGINT PRIMARY KEY,
+                channel_id  BIGINT NOT NULL,
+                message_id  BIGINT NOT NULL,
+                drop_number INT,
+                updated_at  TIMESTAMP NOT NULL DEFAULT NOW()
+            )
+        """)
+        # Write-back outbox shared with the web dashboard. Created here too so
+        # the bot is self-sufficient regardless of which service starts first.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_actions (
+                id         SERIAL PRIMARY KEY,
+                guild_id   BIGINT NOT NULL,
+                user_id    BIGINT NOT NULL,
+                action     TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                applied_at TIMESTAMP
+            )
+        """)
+        await conn.execute(
+            "ALTER TABLE pending_actions ADD COLUMN IF NOT EXISTS drop_number INT"
+        )
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS raffles (
                 guild_id   BIGINT  NOT NULL,
@@ -267,6 +293,20 @@ async def db_load_all():
                     "username": row["username"],
                     "paid":     row["paid"],
                 }
+
+        # Load tracked payment boards so they can be edited after a restart
+        try:
+            board_rows = await conn.fetch(
+                "SELECT guild_id, channel_id, message_id, drop_number FROM payment_boards"
+            )
+            for row in board_rows:
+                payment_board_ref[row["guild_id"]] = {
+                    "channel_id": row["channel_id"],
+                    "message_id": row["message_id"],
+                    "drop_number": row["drop_number"],
+                }
+        except Exception as e:
+            print(f"⚠️  Could not load payment_boards: {e}")
 
         # Load raffle hosts
         host_rows = await conn.fetch("SELECT * FROM raffle_hosts")
@@ -416,6 +456,7 @@ autoclose = defaultdict(lambda: True)
 manager_session = {}
 payments = defaultdict(lambda: defaultdict(list))
 payment_board_message    = {}
+payment_board_ref        = {}   # guild_id -> {channel_id, message_id, drop_number}
 live_claimlist_message   = {}   # guild_id -> Message (live claim list embed)
 pending_payment_messages = {}
 _pending_board_update    = {}   # guild_id -> bool (debounce flag)
@@ -656,11 +697,137 @@ def build_payment_board_embed(guild_id):
     return embed
 
 
+async def _current_drop_number(guild_id):
+    """The drop number the payment board currently represents: the in-progress
+    drop while live, otherwise the most recently closed drop."""
+    if db_pool is None:
+        return None
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) AS cnt FROM drop_history WHERE guild_id = $1", guild_id
+        )
+    base = row["cnt"] if row else 0
+    return base + 1 if session_state.get(guild_id) == "live" else base
+
+
+async def build_payment_board_embed_from_db(guild_id, drop_number):
+    """Rebuild a closed drop's payment board from user_claims (the same table
+    the web dashboard writes), so it stays correct without in-memory state.
+    Returns None if there are no claims to show."""
+    if db_pool is None or drop_number is None:
+        return None
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT user_id, user_name, subtotal, confirmed
+            FROM user_claims WHERE guild_id = $1 AND drop_number = $2
+        """, guild_id, drop_number)
+    if not rows:
+        return None
+
+    owed_by_user = {}
+    name_by_user = {}
+    confirmed_by_user = {}
+    for r in rows:
+        uid = r["user_id"]
+        owed_by_user[uid] = owed_by_user.get(uid, 0.0) + float(r["subtotal"])
+        name_by_user[uid] = r["user_name"]
+        # A buyer is paid only if every one of their line items is confirmed.
+        confirmed_by_user[uid] = confirmed_by_user.get(uid, True) and bool(r["confirmed"])
+
+    embed = discord.Embed(
+        title="💳  Payment Board",
+        color=discord.Color.green(),
+        timestamp=datetime.datetime.utcnow(),
+    )
+    paid_lines, unpaid_lines = [], []
+    total_owed = total_confirmed = 0.0
+    for uid, owed in owed_by_user.items():
+        total_owed += owed
+        name = name_by_user.get(uid, f"User {uid}")
+        if confirmed_by_user.get(uid):
+            total_confirmed += owed
+            paid_lines.append(f"✅  **{name}** — **${owed:.2f}**")
+        else:
+            unpaid_lines.append(f"❌  **{name}** — owes ${owed:.2f}")
+
+    sections = []
+    if paid_lines:
+        sections.append("**Paid in Full**\n" + "\n".join(paid_lines))
+    if unpaid_lines:
+        sections.append("**Outstanding**\n" + "\n".join(unpaid_lines))
+    embed.description = "\n\n".join(sections) if sections else "No claims yet."
+    total_outstanding = max(total_owed - total_confirmed, 0)
+    embed.set_footer(
+        text=f"Confirmed: ${total_confirmed:.2f}  |  Outstanding: ${total_outstanding:.2f}"
+    )
+    return embed
+
+
+async def render_payment_board(guild_id):
+    """Payment-board embed for a guild: built from in-memory state during a
+    live drop, or from the DB (user_claims) once the drop has closed."""
+    if session_state.get(guild_id) == "live":
+        return build_payment_board_embed(guild_id)
+    ref = payment_board_ref.get(guild_id)
+    drop_number = (
+        ref["drop_number"] if ref and ref.get("drop_number") is not None
+        else await _current_drop_number(guild_id)
+    )
+    db_embed = await build_payment_board_embed_from_db(guild_id, drop_number)
+    return db_embed if db_embed is not None else build_payment_board_embed(guild_id)
+
+
+async def db_save_payment_board(guild_id, channel_id, message_id, drop_number):
+    """Remember where a guild's payment board lives so it can be edited later,
+    even after a restart."""
+    payment_board_ref[guild_id] = {
+        "channel_id": channel_id, "message_id": message_id, "drop_number": drop_number,
+    }
+    if db_pool is None:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO payment_boards (guild_id, channel_id, message_id, drop_number, updated_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT (guild_id) DO UPDATE
+            SET channel_id = $2, message_id = $3, drop_number = $4, updated_at = NOW()
+        """, guild_id, channel_id, message_id, drop_number)
+
+
+async def refresh_payment_board_from_db(guild_id, drop_number):
+    """Rebuild a closed drop's payment board from the DB and edit the tracked
+    Discord message. No-op if there's no tracked board or it belongs to a
+    different drop (a manager can (re)establish one with !paymentboard)."""
+    if db_pool is None:
+        return
+    ref = payment_board_ref.get(guild_id)
+    if not ref:
+        return
+    if drop_number is not None and ref.get("drop_number") not in (None, drop_number):
+        return
+    target_drop = ref.get("drop_number") if ref.get("drop_number") is not None else drop_number
+    embed = await build_payment_board_embed_from_db(guild_id, target_drop)
+    if embed is None:
+        return
+    channel = bot.get_channel(ref["channel_id"])
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(ref["channel_id"])
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+    try:
+        msg = await channel.fetch_message(ref["message_id"])
+        await msg.edit(embed=embed)
+        payment_board_message[guild_id] = msg
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return
+
+
 async def update_payment_board(guild_id):
     msg = payment_board_message.get(guild_id)
     if msg:
         try:
-            await msg.edit(embed=build_payment_board_embed(guild_id))
+            await msg.edit(embed=await render_payment_board(guild_id))
         except (discord.NotFound, discord.Forbidden):
             payment_board_message.pop(guild_id, None)
 
@@ -738,7 +905,7 @@ async def update_all_live_boards(guild_id):
     pb_msg = payment_board_message.get(guild_id)
     if pb_msg:
         try:
-            await pb_msg.edit(embed=build_payment_board_embed(guild_id))
+            await pb_msg.edit(embed=await render_payment_board(guild_id))
         except discord.NotFound:
             payment_board_message.pop(guild_id, None)
         except discord.HTTPException:
@@ -849,9 +1016,16 @@ async def mirror_live_drop(guild_id):
         print(f"⚠️  mirror_live_drop failed for {guild_id}: {e}")
 
 
-async def apply_pending_action(guild_id, user_id, action):
-    """Apply one dashboard paid/unpaid click to in-memory state, the DB, and the
-    Discord payment board."""
+async def apply_pending_action(guild_id, user_id, action, drop_number=None):
+    """Apply one dashboard outbox row.
+
+    Live page clicks arrive as confirm/unconfirm (drop_number NULL) and are
+    applied to in-memory payments. Closed-drop (Drops page) clicks arrive as
+    'refresh_board' with a drop_number — the dashboard already updated
+    user_claims, so the bot just rebuilds that drop's board from the DB."""
+    if action == "refresh_board":
+        await refresh_payment_board_from_db(guild_id, drop_number)
+        return
     if action == "confirm":
         for p in payments[guild_id].get(user_id, []):
             p["confirmed"] = True
@@ -894,13 +1068,13 @@ async def poll_pending_actions():
             if db_pool is not None:
                 async with db_pool.acquire() as conn:
                     rows = await conn.fetch("""
-                        SELECT id, guild_id, user_id, action
+                        SELECT id, guild_id, user_id, action, drop_number
                         FROM pending_actions WHERE applied_at IS NULL ORDER BY id
                     """)
                 for r in rows:
                     try:
                         await apply_pending_action(
-                            r["guild_id"], r["user_id"], r["action"]
+                            r["guild_id"], r["user_id"], r["action"], r["drop_number"]
                         )
                     except Exception as e:
                         print(f"⚠️  pending_action {r['id']} failed: {e}")
@@ -1061,6 +1235,8 @@ async def close_drop(channel, guild_id):
     final_pb_embed.title = "💳  Final Payment Board"
     board_msg = await channel.send(embed=final_pb_embed)
     payment_board_message[guild_id] = board_msg
+    # Track the board so dashboard edits (and restarts) can find it later
+    await db_save_payment_board(guild_id, board_msg.channel.id, board_msg.id, drop_number)
 
     # Mirror the closed drop so the dashboard's Live page can still mark payments
     await mirror_live_drop(guild_id)
@@ -3865,12 +4041,14 @@ async def cmd_paymentboard(ctx):
         return
     await silent(ctx)
     drop_channel = get_drop_channel(ctx.guild) or ctx.channel
-    embed = build_payment_board_embed(guild_id)
+    embed = await render_payment_board(guild_id)
+    drop_number = await _current_drop_number(guild_id)
     # If a live board already exists update it, otherwise post a new one
     pb_msg = payment_board_message.get(guild_id)
     if pb_msg:
         try:
             await pb_msg.edit(embed=embed)
+            await db_save_payment_board(guild_id, pb_msg.channel.id, pb_msg.id, drop_number)
             await dm(ctx, "✅  Payment board updated.")
             return
         except (discord.NotFound, discord.HTTPException):
@@ -3878,6 +4056,7 @@ async def cmd_paymentboard(ctx):
     # Post a fresh one
     msg = await drop_channel.send(embed=embed)
     payment_board_message[guild_id] = msg
+    await db_save_payment_board(guild_id, msg.channel.id, msg.id, drop_number)
     await dm(ctx, "✅  Payment board posted.")
 
 

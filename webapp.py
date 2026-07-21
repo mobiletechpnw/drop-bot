@@ -107,6 +107,9 @@ async def ensure_schema(pool):
                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                applied_at TIMESTAMP
            )""",
+        # drop_number lets closed-drop (Drops page) actions tell the bot which
+        # drop's payment board to rebuild; NULL means the current live drop.
+        "ALTER TABLE pending_actions ADD COLUMN IF NOT EXISTS drop_number INT",
         """CREATE TABLE IF NOT EXISTS raffles (
                guild_id   BIGINT  NOT NULL,
                name       TEXT    NOT NULL,
@@ -590,6 +593,16 @@ async def live_drop(request: Request, msg: str = ""):
     ))
 
 
+async def _queue_board_refresh(conn, guild_id: int, drop_number: int):
+    """Tell the bot to rebuild a closed drop's Discord payment board from the
+    DB after a Drops-page paid/unpaid change. user_id 0 is a board-level marker."""
+    await conn.execute(
+        """INSERT INTO pending_actions (guild_id, user_id, action, drop_number)
+           VALUES ($1, 0, 'refresh_board', $2)""",
+        guild_id, drop_number,
+    )
+
+
 async def _queue_live_action(request: Request, user_id: str, action: str):
     gid, _ = _session_guild(request)
     if gid is None:
@@ -741,6 +754,7 @@ async def drop_set_confirmed(
                    WHERE guild_id = $1 AND user_id = $2 AND drop_number = $3""",
                 gid, int(user_id), drop_number, is_confirmed,
             )
+            await _queue_board_refresh(conn, gid, drop_number)
     verb = "Marked+paid." if is_confirmed else "Marked+unpaid."
     return _drop_redirect(drop_number, verb, view)
 
@@ -756,6 +770,7 @@ async def drop_confirm_all(request: Request, drop_number: int):
                WHERE guild_id = $1 AND drop_number = $2 AND confirmed = FALSE""",
             gid, drop_number,
         )
+        await _queue_board_refresh(conn, gid, drop_number)
     # result like "UPDATE <n>"
     try:
         n_rows = int(result.split()[-1])
