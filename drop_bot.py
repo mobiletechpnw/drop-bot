@@ -359,7 +359,15 @@ async def rehydrate_payment_drops():
         confirmed_amt = defaultdict(float)
         for r in grows:
             key = r["item_display"]
-            stock[guild_id][key] = {"display": r["item_display"], "price": float(r["price"])}
+            # qty/limit aren't stored in user_claims; reconstruct qty as the
+            # total claimed so the (closed) drop reads as sold out and
+            # build_stock_embed never hits a missing key.
+            if key not in stock[guild_id]:
+                stock[guild_id][key] = {
+                    "display": r["item_display"], "price": float(r["price"]),
+                    "qty": 0, "limit": None,
+                }
+            stock[guild_id][key]["qty"] += r["qty"]
             member = guild.get_member(r["user_id"]) if guild else None
             user_obj = member or _StoredUser(r["user_id"], r["user_name"])
             claims[guild_id][key].append({
@@ -525,6 +533,21 @@ pending_payment_messages = {}
 _pending_board_update    = {}   # guild_id -> bool (debounce flag)
 _web_sync_started        = False  # guard so the outbox poller starts only once
 _rehydrated              = False  # guard so payment-drop rehydration runs once
+
+# Strong references to fire-and-forget background tasks. asyncio keeps only a
+# weak reference to a task, so an un-referenced task can be garbage-collected
+# mid-await — which previously left the board-update debounce flag stuck True
+# and froze the live boards (e.g. stock stuck showing "1 left" after selling out).
+_bg_tasks = set()
+
+
+def spawn(coro):
+    """Schedule a background coroutine and keep a strong reference until it's
+    done, so the event loop can't garbage-collect it mid-flight."""
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
 
 
 class _StoredUser:
@@ -953,8 +976,12 @@ async def update_all_live_boards(guild_id):
     if _pending_board_update.get(guild_id):
         return
     _pending_board_update[guild_id] = True
-    await asyncio.sleep(2)  # debounce — wait 2s then flush
-    _pending_board_update[guild_id] = False
+    try:
+        await asyncio.sleep(2)  # debounce — wait 2s then flush
+    finally:
+        # Always clear the flag — even if this task is cancelled or GC'd during
+        # the sleep — so board updates can never get permanently wedged.
+        _pending_board_update[guild_id] = False
 
     # Update stock embed
     msg = stock_message.get(guild_id)
@@ -1054,6 +1081,98 @@ def _owed_for_user(guild_id, uid):
     return owed
 
 
+async def db_get_drop_numbers_for_user(guild_id, user_id):
+    """Distinct drop numbers a user has saved claims in, newest first."""
+    if db_pool is None:
+        return []
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT DISTINCT drop_number FROM user_claims
+               WHERE guild_id = $1 AND user_id = $2 ORDER BY drop_number DESC""",
+            guild_id, user_id,
+        )
+    return [r["drop_number"] for r in rows]
+
+
+async def db_confirm_drop_for_user(guild_id, user_id, drop_number):
+    """Mark one specific drop's claims confirmed for a user. Returns the drop
+    total (sum of subtotals), or None if the user has no claims in that drop."""
+    if db_pool is None:
+        return None
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT subtotal FROM user_claims
+               WHERE guild_id = $1 AND user_id = $2 AND drop_number = $3""",
+            guild_id, user_id, drop_number,
+        )
+        if not rows:
+            return None
+        await conn.execute(
+            """UPDATE user_claims SET confirmed = TRUE
+               WHERE guild_id = $1 AND user_id = $2 AND drop_number = $3""",
+            guild_id, user_id, drop_number,
+        )
+    return sum(float(r["subtotal"]) for r in rows)
+
+
+async def confirm_drop_payment(guild_id, buyer_id, drop_number, guild):
+    """Confirm a buyer's payment for one specific drop (by number).
+
+    Marks that drop's claims confirmed in the DB, syncs the matching in-memory
+    payments, refreshes that drop's payment board, and DMs the buyer the normal
+    confirmation. Returns a feedback string for the manager/creator."""
+    def _name():
+        m = guild.get_member(buyer_id) if guild else None
+        return m.display_name if m else str(buyer_id)
+
+    current_num = await _current_drop_number(guild_id)
+    is_current = (drop_number == current_num)
+    db_total = await db_confirm_drop_for_user(guild_id, buyer_id, drop_number)
+
+    if is_current:
+        owed = _owed_for_user(guild_id, buyer_id)
+        if db_total is None and owed <= 0.01 and not payments[guild_id].get(buyer_id):
+            drops = await db_get_drop_numbers_for_user(guild_id, buyer_id)
+            hint = f" They have claims in: {', '.join('#' + str(d) for d in drops)}." if drops else ""
+            return f"⚠️  **{_name()}** has no claims in Drop #{drop_number}.{hint}"
+        # Confirm reported payments and top up to cover what's owed.
+        for p in payments[guild_id].get(buyer_id, []):
+            p["confirmed"] = True
+        confirmed_total = sum(
+            p["amount"] for p in payments[guild_id].get(buyer_id, []) if p["confirmed"]
+        )
+        if owed - confirmed_total > 0.01:
+            payments[guild_id][buyer_id].append({
+                "method": "confirmed", "amount": round(owed - confirmed_total, 2),
+                "time": datetime.datetime.utcnow(), "confirmed": True,
+            })
+        total = db_total if db_total is not None else owed
+        spawn(update_all_live_boards(guild_id))
+    else:
+        if db_total is None:
+            drops = await db_get_drop_numbers_for_user(guild_id, buyer_id)
+            hint = f" They have claims in: {', '.join('#' + str(d) for d in drops)}." if drops else ""
+            return f"⚠️  **{_name()}** has no claims in Drop #{drop_number}.{hint}"
+        total = db_total
+        # Best-effort: also confirm previous-drop payments held in memory.
+        archived_pmts = archived_payments.get(guild_id, {}).get("payments", {})
+        if isinstance(archived_pmts, dict) and buyer_id in archived_pmts:
+            for p in archived_pmts[buyer_id]:
+                p["confirmed"] = True
+        await refresh_payment_board_from_db(guild_id, drop_number)
+
+    member = guild.get_member(buyer_id) if guild else None
+    if member:
+        try:
+            await member.send(
+                f"✅  Your payment for **Drop #{drop_number}** (**${total:.2f}**) has been "
+                f"confirmed! Thanks so much — enjoy your order! 🎉"
+            )
+        except discord.Forbidden:
+            pass
+    return f"✅  Confirmed **Drop #{drop_number}** (**${total:.2f}**) for **{_name()}**."
+
+
 async def mirror_live_drop(guild_id):
     """Write the current drop's buyers into live_drops / live_orders so the web
     dashboard's Live page reflects Discord. Best-effort: never raises."""
@@ -1132,7 +1251,7 @@ async def apply_pending_action(guild_id, user_id, action, drop_number=None):
     except Exception as e:
         print(f"⚠️  db_set_claim_confirmed failed for {guild_id}/{user_id}: {e}")
     await mirror_live_drop(guild_id)
-    asyncio.create_task(update_all_live_boards(guild_id))
+    spawn(update_all_live_boards(guild_id))
 
 
 async def poll_pending_actions():
@@ -1349,7 +1468,7 @@ async def close_drop(channel, guild_id):
     # ── Schedule 5-hour unpaid reminder (once per buyer) ──────────────────────
     for user, items in claimer_totals.items():
         total = sum(subtotal for _, _, subtotal in items)
-        asyncio.create_task(
+        spawn(
             schedule_unpaid_reminder(guild_id, user, total, payment_info)
         )
 
@@ -1504,7 +1623,7 @@ async def on_ready():
     global _web_sync_started
     if not _web_sync_started:
         _web_sync_started = True
-        asyncio.create_task(poll_pending_actions())
+        spawn(poll_pending_actions())
     print(f"✅  Logged in as {bot.user} ({bot.user.id})")
 
 
@@ -1527,9 +1646,18 @@ async def on_reaction_add(reaction, user):
 
     user_pmts = payments[guild_id][buyer_id]
     pending   = [p for p in user_pmts if not p["confirmed"]]
-    for p in pending:
+
+    # Also confirm payments reported against the previous (archived) drop, so
+    # reacting ✅ on a previous-drop payment ping isn't a silent no-op.
+    archived = archived_payments.get(guild_id, {})
+    archived_pmts = archived.get("payments", {})
+    archived_pending = []
+    if isinstance(archived_pmts, dict) and buyer_id in archived_pmts:
+        archived_pending = [p for p in archived_pmts[buyer_id] if not p["confirmed"]]
+
+    for p in pending + archived_pending:
         p["confirmed"] = True
-    total_confirmed = sum(p["amount"] for p in pending)
+    total_confirmed = sum(p["amount"] for p in pending + archived_pending)
 
     # Also confirm raffle spots stored in this ping message
     raffle_spots = data.get("raffle_spots", [])
@@ -1554,16 +1682,16 @@ async def on_reaction_add(reaction, user):
             except (discord.NotFound, discord.HTTPException):
                 pass
 
-    if not pending and not confirmed_raffle_spots:
+    if not pending and not archived_pending and not confirmed_raffle_spots:
         return
 
     del pending_payment_messages[msg_id]
 
     # Persist confirmed status to DB so the web dashboard reflects it
-    if pending:
+    if pending or archived_pending:
         await db_update_user_claim_confirmed(guild_id, buyer_id)
 
-    asyncio.create_task(update_all_live_boards(guild_id))
+    spawn(update_all_live_boards(guild_id))
 
     guild = reaction.message.guild
     buyer = guild.get_member(buyer_id)
@@ -1862,7 +1990,7 @@ async def cmd_editstock(ctx, *, args=""):
     stock[guild_id][key]["qty"] = qty
     stock[guild_id][key]["price"] = price
     if session_state[guild_id] == "live":
-        asyncio.create_task(update_all_live_boards(guild_id))
+        spawn(update_all_live_boards(guild_id))
     await dm(ctx, f"✅  **{stock[guild_id][key]['display']}** updated — {qty} @ ${price:.2f} each.")
 
 
@@ -1963,7 +2091,7 @@ async def cmd_countdown(ctx, minutes: str = ""):
         except (discord.Forbidden, discord.HTTPException):
             pass
 
-    asyncio.create_task(auto_release())
+    spawn(auto_release())
 
 
 @bot.command(name="autoclose")
@@ -2089,7 +2217,7 @@ async def cmd_unpaid(ctx):
 
 
 @bot.command(name="confirm")
-async def cmd_confirm(ctx):
+async def cmd_confirm(ctx, *args):
     if not ctx.guild:
         await ctx.author.send("⚠️  Please run `!confirm` in your server channel.")
         return
@@ -2098,9 +2226,17 @@ async def cmd_confirm(ctx):
         return
     await silent(ctx)
     if not ctx.message.mentions:
-        await dm(ctx, "Usage: `!confirm @user`")
+        await dm(ctx, "Usage: `!confirm @user [drop #]`")
         return
     user = ctx.message.mentions[0]
+
+    # Optional trailing drop number: confirm only that drop's payment.
+    drop_number = next((int(a) for a in args if a.isdigit()), None)
+    if drop_number is not None:
+        feedback = await confirm_drop_payment(guild_id, user.id, drop_number, ctx.guild)
+        await dm(ctx, feedback)
+        return
+
     # Check live payments first, then archived
     user_pmts = payments[guild_id][user.id]
     pending = [p for p in user_pmts if not p["confirmed"]]
@@ -2120,7 +2256,7 @@ async def cmd_confirm(ctx):
         p["confirmed"] = True
 
     total_confirmed = sum(p["amount"] for p in pending)
-    asyncio.create_task(update_all_live_boards(guild_id))
+    spawn(update_all_live_boards(guild_id))
 
     # Update confirmed status in DB
     await db_update_user_claim_confirmed(guild_id, user.id)
@@ -2181,6 +2317,77 @@ async def cmd_paid(ctx, *, args=""):
         await ctx.author.send("⚠️  You don't have any claims to pay for.")
         await silent(ctx)
         return
+
+    # ── Parse method + amount up front so every drop-routing path below has them ──
+    def _owed_example():
+        s_ref = stock[guild_id] if stock[guild_id] else last_drop_snapshot.get(guild_id, {}).get("stock", {})
+        c_ref = claims[guild_id] if claims[guild_id] else last_drop_snapshot.get(guild_id, {}).get("claims", {})
+        owed = 0.0
+        for k, cl in c_ref.items():
+            if k not in s_ref:
+                continue
+            for cc in cl:
+                if cc["user"].id == ctx.author.id:
+                    owed += cc["qty"] * s_ref[k]["price"]
+        if owed <= 0:
+            return "125"
+        return f"{owed:.0f}" if owed == int(owed) else f"{owed:.2f}"
+
+    drop_ch = get_drop_channel(ctx.guild) or ctx.channel
+    parts = args.split()
+    if len(parts) < 2:
+        await silent(ctx)
+        example = _owed_example()
+        try:
+            await drop_ch.send(
+                f"{ctx.author.mention} — to report a payment, include the method **and** the amount:\n"
+                f"```\n!paid venmo {example}\n```\n"
+                f"Replace `venmo` with the method you actually used "
+                f"(venmo, zelle, cashapp, applepay).",
+                delete_after=30,
+                allowed_mentions=discord.AllowedMentions(users=True)
+            )
+        except discord.HTTPException:
+            pass
+        return
+
+    method = parts[0].lower()
+    valid_methods = ["venmo", "zelle", "cashapp", "applepay", "apple"]
+    if method not in valid_methods:
+        await silent(ctx)
+        example = _owed_example()
+        try:
+            await drop_ch.send(
+                f"{ctx.author.mention} — that payment method isn't recognized. "
+                f"Use one of: **venmo, zelle, cashapp, applepay**\n"
+                f"```\n!paid venmo {example}\n```",
+                delete_after=30,
+                allowed_mentions=discord.AllowedMentions(users=True)
+            )
+        except discord.HTTPException:
+            pass
+        return
+    if method == "apple":
+        method = "applepay"
+
+    try:
+        amount = parse_price(parts[1])
+    except ValueError:
+        await silent(ctx)
+        example = _owed_example()
+        try:
+            await drop_ch.send(
+                f"{ctx.author.mention} — I couldn't read the amount `{parts[1]}`. "
+                f"Please use a number:\n"
+                f"```\n!paid {method} {example}\n```",
+                delete_after=30,
+                allowed_mentions=discord.AllowedMentions(users=True)
+            )
+        except discord.HTTPException:
+            pass
+        return
+
+    await silent(ctx)
 
     # Default using_archive to False — set correctly in the drop routing below
     using_archive = False
@@ -2291,79 +2498,6 @@ async def cmd_paid(ctx, *, args=""):
         payments_ref = payments[guild_id]
         using_archive = False
 
-    # Helper — figure out what this user owes, for a helpful example amount
-    def _owed_example():
-        s_ref = stock[guild_id] if stock[guild_id] else last_drop_snapshot.get(guild_id, {}).get("stock", {})
-        c_ref = claims[guild_id] if claims[guild_id] else last_drop_snapshot.get(guild_id, {}).get("claims", {})
-        owed = 0.0
-        for k, cl in c_ref.items():
-            if k not in s_ref:
-                continue
-            for cc in cl:
-                if cc["user"].id == ctx.author.id:
-                    owed += cc["qty"] * s_ref[k]["price"]
-        if owed <= 0:
-            return "125"
-        return f"{owed:.0f}" if owed == int(owed) else f"{owed:.2f}"
-
-    parts = args.split()
-    if len(parts) < 2:
-        await silent(ctx)
-        example = _owed_example()
-        drop_ch = get_drop_channel(ctx.guild) or ctx.channel
-        try:
-            await drop_ch.send(
-                f"{ctx.author.mention} — to report a payment, include the method **and** the amount:\n"
-                f"```\n!paid venmo {example}\n```\n"
-                f"Replace `venmo` with the method you actually used "
-                f"(venmo, zelle, cashapp, applepay).",
-                delete_after=30,
-                allowed_mentions=discord.AllowedMentions(users=True)
-            )
-        except discord.HTTPException:
-            pass
-        return
-
-    method = parts[0].lower()
-    valid_methods = ["venmo", "zelle", "cashapp", "applepay", "apple"]
-    if method not in valid_methods:
-        await silent(ctx)
-        example = _owed_example()
-        drop_ch = get_drop_channel(ctx.guild) or ctx.channel
-        try:
-            await drop_ch.send(
-                f"{ctx.author.mention} — that payment method isn't recognized. "
-                f"Use one of: **venmo, zelle, cashapp, applepay**\n"
-                f"```\n!paid venmo {example}\n```",
-                delete_after=30,
-                allowed_mentions=discord.AllowedMentions(users=True)
-            )
-        except discord.HTTPException:
-            pass
-        return
-    if method == "apple":
-        method = "applepay"
-
-    try:
-        amount = parse_price(parts[1])
-    except ValueError:
-        await silent(ctx)
-        example = _owed_example()
-        drop_ch = get_drop_channel(ctx.guild) or ctx.channel
-        try:
-            await drop_ch.send(
-                f"{ctx.author.mention} — I couldn't read the amount `{parts[1]}`. "
-                f"Please use a number:\n"
-                f"```\n!paid {method} {example}\n```",
-                delete_after=30,
-                allowed_mentions=discord.AllowedMentions(users=True)
-            )
-        except discord.HTTPException:
-            pass
-        return
-
-    await silent(ctx)
-
     # Log to correct payments bucket (live or archived)
     if using_archive:
         if guild_id not in archived_payments:
@@ -2415,7 +2549,7 @@ async def cmd_paid(ctx, *, args=""):
         spots_label = ", ".join(f"**{r}** Spot #{n}" for r, n in raffle_spots)
         confirm_hint = (
             f"React \u2705 to confirm payment & raffle spot(s): {spots_label}\n"
-            f"Or use `/raffle confirm {name}` to confirm raffle only."
+            f"Or use `/raffle confirm {raffle_spots[0][0]}` to confirm raffle only."
         )
     else:
         confirm_hint = f"React \u2705 to confirm or use `!confirm @{ctx.author.display_name}`."
@@ -2528,7 +2662,7 @@ async def cmd_claim(ctx, *, args=""):
     new_remaining = remaining - qty
     total_cost = qty * info["price"]
     await ctx.send(f"✅  **{ctx.author.display_name}** claimed **{qty}x {info['display']}** — ${total_cost:.2f}  •  {new_remaining} left")
-    asyncio.create_task(update_all_live_boards(guild_id))
+    spawn(update_all_live_boards(guild_id))
     if autoclose[guild_id] and all_sold_out(guild_id):
         drop_ch = get_drop_channel(ctx.guild) or ctx.channel
         await drop_ch.send("🎉  **Everything is claimed!** Closing the drop...")
@@ -2580,7 +2714,7 @@ async def cmd_unclaim(ctx, *, args=""):
         freed = qty
         existing["qty"] -= qty
         await ctx.send(f"↩️  **{ctx.author.display_name}** removed **{qty}x {stock[guild_id][key]['display']}** from their claim. ({existing['qty']} still claimed)")
-    asyncio.create_task(update_all_live_boards(guild_id))
+    spawn(update_all_live_boards(guild_id))
     await notify_waitlist(guild_id, key, freed)
 
 
@@ -2842,6 +2976,7 @@ async def cmd_creator(ctx, subcommand: str = "", *args):
             "**Creator Commands (DM only):**\n"
             "`!creator servers` — List all servers the bot is in\n"
             "`!creator info <guild_id>` — See a server's settings, admin, and managers\n"
+            "`!creator confirm <guild_id> <user_id> [drop #]` — Confirm a user's payment, optionally for one drop (buyer is notified)\n"
             "`!creator setpayment <guild_id>` — Update payment info for a server\n"
             "`!creator setdropchannel <guild_id> <channel_id>` — Update drop channel for a server\n"
             "`!creator resetadmin <guild_id> <user_id>` — Reassign the admin for a server\n"
@@ -3019,6 +3154,79 @@ async def cmd_creator(ctx, subcommand: str = "", *args):
         embed.set_footer(text="VaultDrop")
         await drop_channel.send(embed=embed)
         await ctx.author.send(f"✅  Announcement posted in **#{drop_channel.name}** on **{guild.name}**.")
+        return
+
+    # ── !creator confirm <guild_id> <user_id> ────────────────────────────────
+    if sub == "confirm":
+        if len(args) < 2:
+            await ctx.author.send(
+                "Usage: `!creator confirm <guild_id> <user_id> [drop #]`  "
+                "(you can @mention the user instead of the ID)"
+            )
+            return
+        try:
+            guild_id = int(args[0])
+        except ValueError:
+            await ctx.author.send("⚠️  Invalid guild ID.")
+            return
+        # Accept either a raw user ID or an @mention for the buyer
+        if ctx.message.mentions:
+            buyer_id = ctx.message.mentions[0].id
+            # Optional trailing drop number (a bare digit after the guild id)
+            drop_number = next((int(a) for a in args[1:] if a.isdigit()), None)
+        else:
+            try:
+                buyer_id = int(args[1])
+            except ValueError:
+                await ctx.author.send("⚠️  Invalid user ID.")
+                return
+            drop_number = int(args[2]) if len(args) > 2 and args[2].isdigit() else None
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            await ctx.author.send(f"⚠️  Bot is not in a server with ID `{guild_id}`.")
+            return
+
+        # If a drop number is given, confirm only that drop's payment.
+        if drop_number is not None:
+            feedback = await confirm_drop_payment(guild_id, buyer_id, drop_number, guild)
+            await ctx.author.send(feedback)
+            return
+
+        # Same logic as !confirm: confirm pending reported payments from the
+        # current drop and the previous (archived) drop.
+        pending = [p for p in payments[guild_id].get(buyer_id, []) if not p["confirmed"]]
+        archived = archived_payments.get(guild_id, {})
+        archived_pmts = archived.get("payments", {})
+        if isinstance(archived_pmts, dict) and buyer_id in archived_pmts:
+            pending += [p for p in archived_pmts[buyer_id] if not p["confirmed"]]
+
+        if not pending:
+            await ctx.author.send(
+                f"⚠️  No pending payments found for `{buyer_id}` in **{guild.name}**."
+            )
+            return
+
+        for p in pending:
+            p["confirmed"] = True
+        total_confirmed = sum(p["amount"] for p in pending)
+
+        spawn(update_all_live_boards(guild_id))
+        await db_update_user_claim_confirmed(guild_id, buyer_id)
+
+        # Notify the buyer from the bot, exactly like a manager confirm.
+        member = guild.get_member(buyer_id)
+        buyer_name = member.display_name if member else str(buyer_id)
+        if member:
+            try:
+                await member.send(
+                    f"✅  Your payment of **${total_confirmed:.2f}** has been confirmed! "
+                    f"Thanks so much — enjoy your order! 🎉"
+                )
+            except discord.Forbidden:
+                pass
+        await ctx.author.send(
+            f"✅  Confirmed **${total_confirmed:.2f}** from **{buyer_name}** in **{guild.name}**."
+        )
         return
 
     await ctx.author.send(f"⚠️  Unknown subcommand `{subcommand}`. Type `!creator` for a list of commands.")
