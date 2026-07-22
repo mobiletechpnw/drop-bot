@@ -1527,9 +1527,18 @@ async def on_reaction_add(reaction, user):
 
     user_pmts = payments[guild_id][buyer_id]
     pending   = [p for p in user_pmts if not p["confirmed"]]
-    for p in pending:
+
+    # Also confirm payments reported against the previous (archived) drop, so
+    # reacting ✅ on a previous-drop payment ping isn't a silent no-op.
+    archived = archived_payments.get(guild_id, {})
+    archived_pmts = archived.get("payments", {})
+    archived_pending = []
+    if isinstance(archived_pmts, dict) and buyer_id in archived_pmts:
+        archived_pending = [p for p in archived_pmts[buyer_id] if not p["confirmed"]]
+
+    for p in pending + archived_pending:
         p["confirmed"] = True
-    total_confirmed = sum(p["amount"] for p in pending)
+    total_confirmed = sum(p["amount"] for p in pending + archived_pending)
 
     # Also confirm raffle spots stored in this ping message
     raffle_spots = data.get("raffle_spots", [])
@@ -1554,13 +1563,13 @@ async def on_reaction_add(reaction, user):
             except (discord.NotFound, discord.HTTPException):
                 pass
 
-    if not pending and not confirmed_raffle_spots:
+    if not pending and not archived_pending and not confirmed_raffle_spots:
         return
 
     del pending_payment_messages[msg_id]
 
     # Persist confirmed status to DB so the web dashboard reflects it
-    if pending:
+    if pending or archived_pending:
         await db_update_user_claim_confirmed(guild_id, buyer_id)
 
     asyncio.create_task(update_all_live_boards(guild_id))
@@ -2182,6 +2191,77 @@ async def cmd_paid(ctx, *, args=""):
         await silent(ctx)
         return
 
+    # ── Parse method + amount up front so every drop-routing path below has them ──
+    def _owed_example():
+        s_ref = stock[guild_id] if stock[guild_id] else last_drop_snapshot.get(guild_id, {}).get("stock", {})
+        c_ref = claims[guild_id] if claims[guild_id] else last_drop_snapshot.get(guild_id, {}).get("claims", {})
+        owed = 0.0
+        for k, cl in c_ref.items():
+            if k not in s_ref:
+                continue
+            for cc in cl:
+                if cc["user"].id == ctx.author.id:
+                    owed += cc["qty"] * s_ref[k]["price"]
+        if owed <= 0:
+            return "125"
+        return f"{owed:.0f}" if owed == int(owed) else f"{owed:.2f}"
+
+    drop_ch = get_drop_channel(ctx.guild) or ctx.channel
+    parts = args.split()
+    if len(parts) < 2:
+        await silent(ctx)
+        example = _owed_example()
+        try:
+            await drop_ch.send(
+                f"{ctx.author.mention} — to report a payment, include the method **and** the amount:\n"
+                f"```\n!paid venmo {example}\n```\n"
+                f"Replace `venmo` with the method you actually used "
+                f"(venmo, zelle, cashapp, applepay).",
+                delete_after=30,
+                allowed_mentions=discord.AllowedMentions(users=True)
+            )
+        except discord.HTTPException:
+            pass
+        return
+
+    method = parts[0].lower()
+    valid_methods = ["venmo", "zelle", "cashapp", "applepay", "apple"]
+    if method not in valid_methods:
+        await silent(ctx)
+        example = _owed_example()
+        try:
+            await drop_ch.send(
+                f"{ctx.author.mention} — that payment method isn't recognized. "
+                f"Use one of: **venmo, zelle, cashapp, applepay**\n"
+                f"```\n!paid venmo {example}\n```",
+                delete_after=30,
+                allowed_mentions=discord.AllowedMentions(users=True)
+            )
+        except discord.HTTPException:
+            pass
+        return
+    if method == "apple":
+        method = "applepay"
+
+    try:
+        amount = parse_price(parts[1])
+    except ValueError:
+        await silent(ctx)
+        example = _owed_example()
+        try:
+            await drop_ch.send(
+                f"{ctx.author.mention} — I couldn't read the amount `{parts[1]}`. "
+                f"Please use a number:\n"
+                f"```\n!paid {method} {example}\n```",
+                delete_after=30,
+                allowed_mentions=discord.AllowedMentions(users=True)
+            )
+        except discord.HTTPException:
+            pass
+        return
+
+    await silent(ctx)
+
     # Default using_archive to False — set correctly in the drop routing below
     using_archive = False
 
@@ -2291,79 +2371,6 @@ async def cmd_paid(ctx, *, args=""):
         payments_ref = payments[guild_id]
         using_archive = False
 
-    # Helper — figure out what this user owes, for a helpful example amount
-    def _owed_example():
-        s_ref = stock[guild_id] if stock[guild_id] else last_drop_snapshot.get(guild_id, {}).get("stock", {})
-        c_ref = claims[guild_id] if claims[guild_id] else last_drop_snapshot.get(guild_id, {}).get("claims", {})
-        owed = 0.0
-        for k, cl in c_ref.items():
-            if k not in s_ref:
-                continue
-            for cc in cl:
-                if cc["user"].id == ctx.author.id:
-                    owed += cc["qty"] * s_ref[k]["price"]
-        if owed <= 0:
-            return "125"
-        return f"{owed:.0f}" if owed == int(owed) else f"{owed:.2f}"
-
-    parts = args.split()
-    if len(parts) < 2:
-        await silent(ctx)
-        example = _owed_example()
-        drop_ch = get_drop_channel(ctx.guild) or ctx.channel
-        try:
-            await drop_ch.send(
-                f"{ctx.author.mention} — to report a payment, include the method **and** the amount:\n"
-                f"```\n!paid venmo {example}\n```\n"
-                f"Replace `venmo` with the method you actually used "
-                f"(venmo, zelle, cashapp, applepay).",
-                delete_after=30,
-                allowed_mentions=discord.AllowedMentions(users=True)
-            )
-        except discord.HTTPException:
-            pass
-        return
-
-    method = parts[0].lower()
-    valid_methods = ["venmo", "zelle", "cashapp", "applepay", "apple"]
-    if method not in valid_methods:
-        await silent(ctx)
-        example = _owed_example()
-        drop_ch = get_drop_channel(ctx.guild) or ctx.channel
-        try:
-            await drop_ch.send(
-                f"{ctx.author.mention} — that payment method isn't recognized. "
-                f"Use one of: **venmo, zelle, cashapp, applepay**\n"
-                f"```\n!paid venmo {example}\n```",
-                delete_after=30,
-                allowed_mentions=discord.AllowedMentions(users=True)
-            )
-        except discord.HTTPException:
-            pass
-        return
-    if method == "apple":
-        method = "applepay"
-
-    try:
-        amount = parse_price(parts[1])
-    except ValueError:
-        await silent(ctx)
-        example = _owed_example()
-        drop_ch = get_drop_channel(ctx.guild) or ctx.channel
-        try:
-            await drop_ch.send(
-                f"{ctx.author.mention} — I couldn't read the amount `{parts[1]}`. "
-                f"Please use a number:\n"
-                f"```\n!paid {method} {example}\n```",
-                delete_after=30,
-                allowed_mentions=discord.AllowedMentions(users=True)
-            )
-        except discord.HTTPException:
-            pass
-        return
-
-    await silent(ctx)
-
     # Log to correct payments bucket (live or archived)
     if using_archive:
         if guild_id not in archived_payments:
@@ -2415,7 +2422,7 @@ async def cmd_paid(ctx, *, args=""):
         spots_label = ", ".join(f"**{r}** Spot #{n}" for r, n in raffle_spots)
         confirm_hint = (
             f"React \u2705 to confirm payment & raffle spot(s): {spots_label}\n"
-            f"Or use `/raffle confirm {name}` to confirm raffle only."
+            f"Or use `/raffle confirm {raffle_spots[0][0]}` to confirm raffle only."
         )
     else:
         confirm_hint = f"React \u2705 to confirm or use `!confirm @{ctx.author.display_name}`."
