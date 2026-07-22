@@ -186,6 +186,11 @@ async def init_db():
                 updated_at  TIMESTAMP NOT NULL DEFAULT NOW()
             )
         """)
+        # The final claim list posted next to the payment board is tracked here
+        # too, so it can be rebuilt/edited in lock-step and survive restarts.
+        await conn.execute(
+            "ALTER TABLE payment_boards ADD COLUMN IF NOT EXISTS claim_message_id BIGINT"
+        )
         # Write-back outbox shared with the web dashboard. Created here too so
         # the bot is self-sufficient regardless of which service starts first.
         await conn.execute("""
@@ -302,13 +307,14 @@ async def db_load_all():
         # Load tracked payment boards so they can be edited after a restart
         try:
             board_rows = await conn.fetch(
-                "SELECT guild_id, channel_id, message_id, drop_number FROM payment_boards"
+                "SELECT guild_id, channel_id, message_id, drop_number, claim_message_id FROM payment_boards"
             )
             for row in board_rows:
                 payment_board_ref[row["guild_id"]] = {
                     "channel_id": row["channel_id"],
                     "message_id": row["message_id"],
                     "drop_number": row["drop_number"],
+                    "claim_message_id": row["claim_message_id"],
                 }
         except Exception as e:
             print(f"⚠️  Could not load payment_boards: {e}")
@@ -905,6 +911,65 @@ async def build_payment_board_embed_from_db(guild_id, drop_number):
     return embed
 
 
+async def build_claimlist_embed_from_db(guild_id, drop_number):
+    """Rebuild a closed drop's final claim list from user_claims (the same table
+    the payment board rebuilds from), so the two boards always agree without
+    relying on in-memory state. Returns None if there are no claims to show."""
+    if db_pool is None or drop_number is None:
+        return None
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT user_id, user_name, item_display, qty, subtotal, confirmed
+            FROM user_claims WHERE guild_id = $1 AND drop_number = $2
+            ORDER BY user_name
+        """, guild_id, drop_number)
+    if not rows:
+        return None
+
+    orders = {}
+    for r in rows:
+        uid = r["user_id"]
+        o = orders.setdefault(
+            uid, {"name": r["user_name"], "items": [], "total": 0.0, "confirmed": True}
+        )
+        o["items"].append(
+            f"• {r['item_display']}  x{r['qty']}  — ${float(r['subtotal']):.2f}"
+        )
+        o["total"] += float(r["subtotal"])
+        # Paid only if every one of the buyer's line items is confirmed —
+        # the same rule the payment board uses, so the two never disagree.
+        o["confirmed"] = o["confirmed"] and bool(r["confirmed"])
+
+    embed = discord.Embed(
+        title=f"🔴  Drop #{drop_number} CLOSED — Final Claim List",
+        color=discord.Color.red(),
+        timestamp=datetime.datetime.utcnow(),
+    )
+    for uid, o in orders.items():
+        paid_status = "✅  Paid" if o["confirmed"] else "❌  Unpaid"
+        field_value = "\n".join(o["items"]) + f"\n**Total: ${o['total']:.2f}** -- {paid_status}"
+        if len(field_value) > 1024:
+            field_value = field_value[:1020] + "..."
+        embed.add_field(name=o["name"], value=field_value, inline=False)
+    embed.set_footer(text="Final claim list — stays in sync with the payment board")
+    return embed
+
+
+async def render_claimlist(guild_id):
+    """Claim-list embed for a guild: built from in-memory state during a live
+    drop, or from the DB (user_claims) once the drop has closed — mirrors
+    render_payment_board so the claim list and payment board always agree."""
+    if session_state.get(guild_id) == "live":
+        return build_live_claimlist_embed(guild_id)
+    ref = payment_board_ref.get(guild_id)
+    drop_number = (
+        ref["drop_number"] if ref and ref.get("drop_number") is not None
+        else await _current_drop_number(guild_id)
+    )
+    db_embed = await build_claimlist_embed_from_db(guild_id, drop_number)
+    return db_embed if db_embed is not None else build_live_claimlist_embed(guild_id)
+
+
 async def render_payment_board(guild_id):
     """Payment-board embed for a guild: built from in-memory state during a
     live drop, or from the DB (user_claims) once the drop has closed."""
@@ -919,27 +984,37 @@ async def render_payment_board(guild_id):
     return db_embed if db_embed is not None else build_payment_board_embed(guild_id)
 
 
-async def db_save_payment_board(guild_id, channel_id, message_id, drop_number):
-    """Remember where a guild's payment board lives so it can be edited later,
-    even after a restart."""
+async def db_save_payment_board(guild_id, channel_id, message_id, drop_number,
+                                claim_message_id=None):
+    """Remember where a guild's payment board (and its paired final claim list)
+    live so they can be edited later, even after a restart. A None
+    claim_message_id preserves whatever is already stored, so callers that only
+    (re)establish the payment board don't wipe the tracked claim list."""
+    ref = payment_board_ref.get(guild_id, {})
     payment_board_ref[guild_id] = {
         "channel_id": channel_id, "message_id": message_id, "drop_number": drop_number,
+        "claim_message_id": claim_message_id if claim_message_id is not None
+        else ref.get("claim_message_id"),
     }
     if db_pool is None:
         return
     async with db_pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO payment_boards (guild_id, channel_id, message_id, drop_number, updated_at)
-            VALUES ($1, $2, $3, $4, NOW())
+            INSERT INTO payment_boards
+                (guild_id, channel_id, message_id, drop_number, claim_message_id, updated_at)
+            VALUES ($1, $2, $3, $4, $5, NOW())
             ON CONFLICT (guild_id) DO UPDATE
-            SET channel_id = $2, message_id = $3, drop_number = $4, updated_at = NOW()
-        """, guild_id, channel_id, message_id, drop_number)
+            SET channel_id = $2, message_id = $3, drop_number = $4,
+                claim_message_id = COALESCE($5, payment_boards.claim_message_id),
+                updated_at = NOW()
+        """, guild_id, channel_id, message_id, drop_number, claim_message_id)
 
 
 async def refresh_payment_board_from_db(guild_id, drop_number):
-    """Rebuild a closed drop's payment board from the DB and edit the tracked
-    Discord message. No-op if there's no tracked board or it belongs to a
-    different drop (a manager can (re)establish one with !paymentboard)."""
+    """Rebuild a closed drop's payment board AND its paired final claim list from
+    the DB and edit the tracked Discord messages, so the two stay in sync. No-op
+    if there's no tracked board or it belongs to a different drop (a manager can
+    (re)establish one with !paymentboard)."""
     if db_pool is None:
         return
     ref = payment_board_ref.get(guild_id)
@@ -962,7 +1037,19 @@ async def refresh_payment_board_from_db(guild_id, drop_number):
         await msg.edit(embed=embed)
         payment_board_message[guild_id] = msg
     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-        return
+        pass
+
+    # Keep the paired final claim list in lock-step with the payment board.
+    claim_id = ref.get("claim_message_id")
+    if claim_id:
+        cl_embed = await build_claimlist_embed_from_db(guild_id, target_drop)
+        if cl_embed is not None:
+            try:
+                cl_msg = await channel.fetch_message(claim_id)
+                await cl_msg.edit(embed=cl_embed)
+                live_claimlist_message[guild_id] = cl_msg
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
 
 
 async def update_payment_board(guild_id):
@@ -1037,11 +1124,12 @@ async def update_all_live_boards(guild_id):
         except discord.HTTPException:
             pass
 
-    # Update live claim list
+    # Update live claim list (renders the closed/final version once a drop ends,
+    # so it stays in sync with the payment board rather than freezing at close)
     cl_msg = live_claimlist_message.get(guild_id)
     if cl_msg:
         try:
-            await cl_msg.edit(embed=build_live_claimlist_embed(guild_id))
+            await cl_msg.edit(embed=await render_claimlist(guild_id))
         except discord.NotFound:
             live_claimlist_message.pop(guild_id, None)
         except discord.HTTPException:
@@ -1464,19 +1552,25 @@ async def close_drop(channel, guild_id):
         except (discord.NotFound, discord.HTTPException):
             pass
 
-    # Post fresh final claim list with paid/unpaid status
+    # Post fresh final claim list with paid/unpaid status. Track it as the live
+    # claim list message so later payments keep it in sync (instead of leaving a
+    # frozen copy above the still-updating payment board).
     final_cl_embed = build_live_claimlist_embed(guild_id)
     final_cl_embed.title = f"🔴  Drop #{drop_number} CLOSED — Final Claim List"
     final_cl_embed.color = discord.Color.red()
-    await channel.send(embed=final_cl_embed)
+    final_cl_msg = await channel.send(embed=final_cl_embed)
+    live_claimlist_message[guild_id] = final_cl_msg
 
     # Always post a fresh payment board on close
     final_pb_embed = build_payment_board_embed(guild_id)
     final_pb_embed.title = "💳  Final Payment Board"
     board_msg = await channel.send(embed=final_pb_embed)
     payment_board_message[guild_id] = board_msg
-    # Track the board so dashboard edits (and restarts) can find it later
-    await db_save_payment_board(guild_id, board_msg.channel.id, board_msg.id, drop_number)
+    # Track both boards so dashboard edits (and restarts) can find them and keep
+    # the claim list and payment board in sync.
+    await db_save_payment_board(
+        guild_id, board_msg.channel.id, board_msg.id, drop_number, final_cl_msg.id
+    )
 
     # Mirror the closed drop so the dashboard's Live page can still mark payments
     await mirror_live_drop(guild_id)
