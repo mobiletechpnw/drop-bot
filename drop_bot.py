@@ -383,6 +383,9 @@ async def rehydrate_payment_drops():
                     "time": datetime.datetime.utcnow(), "confirmed": True,
                 })
         session_state[guild_id] = "closed"
+        # This rehydrated drop is the most recently closed one, so its number is
+        # the current drop count — keep labels numbered after a restart too.
+        current_drop_number[guild_id] = await db_get_drop_count(guild_id)
         last_drop_snapshot[guild_id] = {
             "stock": dict(stock[guild_id]),
             "claims": {k: list(v) for k, v in claims[guild_id].items()},
@@ -528,6 +531,7 @@ manager_session = {}
 payments = defaultdict(lambda: defaultdict(list))
 payment_board_message    = {}
 payment_board_ref        = {}   # guild_id -> {channel_id, message_id, drop_number}
+current_drop_number      = {}   # guild_id -> int (number shown in live/closed drop labels)
 live_claimlist_message   = {}   # guild_id -> Message (live claim list embed)
 pending_payment_messages = {}
 _pending_board_update    = {}   # guild_id -> bool (debounce flag)
@@ -665,7 +669,9 @@ def get_user_total_owed(guild_id, user_id):
 
 
 def build_stock_embed(guild_id):
-    embed = discord.Embed(title="🛒  Drop Stock", color=discord.Color.gold(), timestamp=datetime.datetime.utcnow())
+    dn = current_drop_number.get(guild_id)
+    title = f"🛒  Drop #{dn} Stock" if dn else "🛒  Drop Stock"
+    embed = discord.Embed(title=title, color=discord.Color.gold(), timestamp=datetime.datetime.utcnow())
     for key, info in stock[guild_id].items():
         claimed = sum(c["qty"] for c in claims[guild_id][key])
         qty_left = info["qty"] - claimed
@@ -793,6 +799,17 @@ def build_payment_board_embed(guild_id):
         text=f"Confirmed: ${total_confirmed:.2f}  |  Outstanding: ${total_outstanding:.2f}"
     )
     return embed
+
+
+async def db_get_drop_count(guild_id):
+    """Number of drops already closed for this guild (rows in drop_history)."""
+    if db_pool is None:
+        return 0
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(*) AS cnt FROM drop_history WHERE guild_id = $1", guild_id
+        )
+    return row["cnt"] if row else 0
 
 
 async def _current_drop_number(guild_id):
@@ -1392,6 +1409,8 @@ async def close_drop(channel, guild_id):
             "SELECT COUNT(*) as cnt FROM drop_history WHERE guild_id = $1", guild_id
         )
         drop_number = row["cnt"] if row else 1
+    # drop_history now includes this drop, so this is its final number.
+    current_drop_number[guild_id] = drop_number
 
     # Save per-user claim records
     confirmed_users = {
@@ -1420,7 +1439,7 @@ async def close_drop(channel, guild_id):
 
     # Post fresh final claim list with paid/unpaid status
     final_cl_embed = build_live_claimlist_embed(guild_id)
-    final_cl_embed.title = "🔴  Drop CLOSED — Final Claim List"
+    final_cl_embed.title = f"🔴  Drop #{drop_number} CLOSED — Final Claim List"
     final_cl_embed.color = discord.Color.red()
     await channel.send(embed=final_cl_embed)
 
@@ -1455,7 +1474,7 @@ async def close_drop(channel, guild_id):
         lines = "\n".join(f"• **{display}**  ×{qty}  — ${subtotal:.2f}" for display, qty, subtotal in items)
         try:
             await user.send(
-                f"🧾  **Drop closed! Here's your order summary:**\n{lines}\n"
+                f"🧾  **Drop #{drop_number} closed! Here's your order summary:**\n{lines}\n"
                 f"**Total owed: ${total:.2f}**\n\n"
                 f"**Send payment using one of these methods:**\n{payment_info}\n\n"
                 f"Once you've sent payment, go back to the server and type:\n"
@@ -1883,6 +1902,9 @@ async def cmd_drop(ctx, *, arg=""):
         }
 
     session_state[guild_id] = "staging"
+    # The upcoming drop's number = drops closed so far + 1. Shown to buyers so
+    # they know which drop their order came from (preview, live boards, close).
+    current_drop_number[guild_id] = await db_get_drop_count(guild_id) + 1
     stock[guild_id] = {}
     claims[guild_id] = defaultdict(list)
     waitlist[guild_id] = defaultdict(list)
@@ -2077,13 +2099,16 @@ async def cmd_countdown(ctx, minutes: str = ""):
 
         # Fire the release — post all three live boards
         session_state[guild_id] = "live"
+        # Confirm the drop number now that we're going live.
+        current_drop_number[guild_id] = await db_get_drop_count(guild_id) + 1
+        dn = current_drop_number[guild_id]
         stock_msg = await drop_channel.send(embed=build_stock_embed(guild_id))
         stock_message[guild_id] = stock_msg
         cl_msg = await drop_channel.send(embed=build_live_claimlist_embed(guild_id))
         live_claimlist_message[guild_id] = cl_msg
         pb_msg = await drop_channel.send(embed=build_payment_board_embed(guild_id))
         payment_board_message[guild_id] = pb_msg
-        await drop_channel.send("🟢  **Drop is LIVE!**  First come, first served!")
+        await drop_channel.send(f"🟢  **Drop #{dn} is LIVE!**  First come, first served!")
         await drop_channel.send(embed=build_howto_embed())
         try:
             await stock_msg.pin()
@@ -2130,6 +2155,9 @@ async def cmd_release(ctx):
         await dm(ctx, "⚠️  No stock loaded.")
         return
     session_state[guild_id] = "live"
+    # Confirm the drop number now that we're going live.
+    current_drop_number[guild_id] = await db_get_drop_count(guild_id) + 1
+    dn = current_drop_number[guild_id]
     # Post all three live boards together
     stock_msg = await drop_channel.send(embed=build_stock_embed(guild_id))
     stock_message[guild_id] = stock_msg
@@ -2137,7 +2165,7 @@ async def cmd_release(ctx):
     live_claimlist_message[guild_id] = cl_msg
     pb_msg = await drop_channel.send(embed=build_payment_board_embed(guild_id))
     payment_board_message[guild_id] = pb_msg
-    await drop_channel.send("🟢  **Drop is LIVE!**  First come, first served!")
+    await drop_channel.send(f"🟢  **Drop #{dn} is LIVE!**  First come, first served!")
     await drop_channel.send(embed=build_howto_embed())
     try:
         await stock_msg.pin()
