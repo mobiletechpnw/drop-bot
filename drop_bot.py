@@ -2849,6 +2849,7 @@ async def cmd_creator(ctx, subcommand: str = "", *args):
             "**Creator Commands (DM only):**\n"
             "`!creator servers` — List all servers the bot is in\n"
             "`!creator info <guild_id>` — See a server's settings, admin, and managers\n"
+            "`!creator confirm <guild_id> <user_id>` — Confirm a user's payment (buyer is notified by the bot)\n"
             "`!creator setpayment <guild_id>` — Update payment info for a server\n"
             "`!creator setdropchannel <guild_id> <channel_id>` — Update drop channel for a server\n"
             "`!creator resetadmin <guild_id> <user_id>` — Reassign the admin for a server\n"
@@ -3026,6 +3027,70 @@ async def cmd_creator(ctx, subcommand: str = "", *args):
         embed.set_footer(text="VaultDrop")
         await drop_channel.send(embed=embed)
         await ctx.author.send(f"✅  Announcement posted in **#{drop_channel.name}** on **{guild.name}**.")
+        return
+
+    # ── !creator confirm <guild_id> <user_id> ────────────────────────────────
+    if sub == "confirm":
+        if len(args) < 2:
+            await ctx.author.send(
+                "Usage: `!creator confirm <guild_id> <user_id>`  "
+                "(you can @mention the user instead of the ID)"
+            )
+            return
+        try:
+            guild_id = int(args[0])
+        except ValueError:
+            await ctx.author.send("⚠️  Invalid guild ID.")
+            return
+        # Accept either a raw user ID or an @mention for the buyer
+        if ctx.message.mentions:
+            buyer_id = ctx.message.mentions[0].id
+        else:
+            try:
+                buyer_id = int(args[1])
+            except ValueError:
+                await ctx.author.send("⚠️  Invalid user ID.")
+                return
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            await ctx.author.send(f"⚠️  Bot is not in a server with ID `{guild_id}`.")
+            return
+
+        # Same logic as !confirm: confirm pending reported payments from the
+        # current drop and the previous (archived) drop.
+        pending = [p for p in payments[guild_id].get(buyer_id, []) if not p["confirmed"]]
+        archived = archived_payments.get(guild_id, {})
+        archived_pmts = archived.get("payments", {})
+        if isinstance(archived_pmts, dict) and buyer_id in archived_pmts:
+            pending += [p for p in archived_pmts[buyer_id] if not p["confirmed"]]
+
+        if not pending:
+            await ctx.author.send(
+                f"⚠️  No pending payments found for `{buyer_id}` in **{guild.name}**."
+            )
+            return
+
+        for p in pending:
+            p["confirmed"] = True
+        total_confirmed = sum(p["amount"] for p in pending)
+
+        asyncio.create_task(update_all_live_boards(guild_id))
+        await db_update_user_claim_confirmed(guild_id, buyer_id)
+
+        # Notify the buyer from the bot, exactly like a manager confirm.
+        member = guild.get_member(buyer_id)
+        buyer_name = member.display_name if member else str(buyer_id)
+        if member:
+            try:
+                await member.send(
+                    f"✅  Your payment of **${total_confirmed:.2f}** has been confirmed! "
+                    f"Thanks so much — enjoy your order! 🎉"
+                )
+            except discord.Forbidden:
+                pass
+        await ctx.author.send(
+            f"✅  Confirmed **${total_confirmed:.2f}** from **{buyer_name}** in **{guild.name}**."
+        )
         return
 
     await ctx.author.send(f"⚠️  Unknown subcommand `{subcommand}`. Type `!creator` for a list of commands.")
