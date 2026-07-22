@@ -167,9 +167,14 @@ async def init_db():
                 qty INT NOT NULL,
                 price NUMERIC NOT NULL,
                 subtotal NUMERIC NOT NULL,
-                confirmed BOOLEAN DEFAULT FALSE
+                confirmed BOOLEAN DEFAULT FALSE,
+                tracking TEXT
             )
         """)
+        # Backfill the tracking column on databases created before it existed.
+        await conn.execute(
+            "ALTER TABLE user_claims ADD COLUMN IF NOT EXISTS tracking TEXT"
+        )
         # Tracks the durable payment-board message so it survives restarts and
         # can be rebuilt from user_claims for closed drops.
         await conn.execute("""
@@ -573,9 +578,6 @@ server_raffles        = defaultdict(dict)   # guild_id -> {name -> raffle_dict}
 server_raffle_channel = {}                  # guild_id -> channel_id
 raffle_hosts          = defaultdict(dict)   # guild_id -> {1: {...}, 2: {...}}
 
-# Tracking numbers — guild_id -> user_id -> tracking number string
-tracking_numbers = defaultdict(dict)
-
 # Archived payments from previous drop — preserved when new drop starts
 # so buyers can still !paid and managers can still !confirm after a new drop begins
 # archived_payments[guild_id] = defaultdict(list) of previous drop payments
@@ -799,6 +801,31 @@ def build_payment_board_embed(guild_id):
         text=f"Confirmed: ${total_confirmed:.2f}  |  Outstanding: ${total_outstanding:.2f}"
     )
     return embed
+
+
+async def db_set_user_claim_tracking(guild_id, user_id, tracking):
+    """Attach a tracking number to a buyer's most recent drop.
+
+    Tracking is stored per drop in user_claims so it becomes a permanent
+    part of the buyer's order history (and survives restarts). Returns the
+    drop_number the tracking was attached to, or None if the buyer has no
+    saved claims yet."""
+    if db_pool is None:
+        return None
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT MAX(drop_number) AS dn FROM user_claims
+            WHERE guild_id = $1 AND user_id = $2
+        """, guild_id, user_id)
+        if not row or row["dn"] is None:
+            return None
+        dn = row["dn"]
+        await conn.execute("""
+            UPDATE user_claims
+            SET tracking = $3
+            WHERE guild_id = $1 AND user_id = $2 AND drop_number = $4
+        """, guild_id, user_id, tracking, dn)
+        return dn
 
 
 async def db_get_drop_count(guild_id):
@@ -3349,7 +3376,7 @@ async def cmd_myhistory(ctx):
 
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("""
-            SELECT drop_number, closed_at, item_display, qty, price, subtotal, confirmed
+            SELECT drop_number, closed_at, item_display, qty, price, subtotal, confirmed, tracking
             FROM user_claims
             WHERE guild_id = $1 AND user_id = $2
             ORDER BY closed_at DESC, drop_number DESC
@@ -3370,6 +3397,7 @@ async def cmd_myhistory(ctx):
                 "items": [],
                 "total": 0.0,
                 "confirmed": row["confirmed"],
+                "tracking": row["tracking"],
             }
         drops[dn]["items"].append({
             "display": row["item_display"],
@@ -3380,6 +3408,9 @@ async def cmd_myhistory(ctx):
         # confirmed = True if any item in drop is confirmed
         if row["confirmed"]:
             drops[dn]["confirmed"] = True
+        # tracking is per drop; keep the first non-empty value seen
+        if row["tracking"] and not drops[dn].get("tracking"):
+            drops[dn]["tracking"] = row["tracking"]
 
     embed = discord.Embed(
         title=f"📋  {ctx.author.display_name}'s Claim History",
@@ -3396,6 +3427,8 @@ async def cmd_myhistory(ctx):
             item_lines.append(f"- {item['display']}  x{item['qty']}  - ${item['subtotal']:.2f}")
         lines_str = "\n".join(item_lines)
         field_value = f"{lines_str}\n**Total: ${drop['total']:.2f}**\n{status}"
+        if drop.get("tracking"):
+            field_value += f"\n📦  Shipped — Tracking: `{drop['tracking']}`"
         if len(field_value) > 1024:
             field_value = field_value[:1020] + "..."
         embed.add_field(
@@ -4578,15 +4611,29 @@ async def cmd_addtracking(ctx, *, args=""):
     # Strip the mention from args to get tracking number
     tracking = args.replace(f"<@{user.id}>", "").replace(f"<@!{user.id}>", "").strip()
     if not tracking:
-        await dm(ctx, "Usage: `!addtracking @user <tracking number>`\\nExample: `!addtracking @SpacemanG 1Z999AA10123456784`")
+        await dm(ctx, "Usage: `!addtracking @user <tracking number>`\nExample: `!addtracking @SpacemanG 1Z999AA10123456784`")
         return
-    tracking_numbers[guild_id][user.id] = tracking
-    await dm(ctx, f"✅  Tracking number **{tracking}** saved for **{user.display_name}**.")
+    # Persist the tracking number to the buyer's most recent drop in the DB so
+    # it becomes a permanent part of their order history (survives restarts).
+    drop_no = await db_set_user_claim_tracking(guild_id, user.id, tracking)
+    if drop_no is None:
+        await dm(
+            ctx,
+            f"⚠️  **{user.display_name}** has no saved orders yet, so there's nothing to "
+            f"attach tracking to. Orders are saved once a drop closes (`!enddrop`)."
+        )
+        return
+    await dm(
+        ctx,
+        f"✅  Tracking number **{tracking}** saved for **{user.display_name}** "
+        f"on **Drop #{drop_no}**."
+    )
     # DM the buyer their tracking number
     try:
         await user.send(
-            f"📦  Your order has shipped! Here is your tracking number:\\n"
-            f"**{tracking}**\\n\\n"
+            f"📦  Your order from **Drop #{drop_no}** has shipped! "
+            f"Here is your tracking number:\n"
+            f"**{tracking}**\n\n"
             f"You can use `!myhistory` to view your full order history."
         )
     except discord.Forbidden:
@@ -4607,6 +4654,18 @@ async def cmd_export(ctx):
     stock_ref  = stock[guild_id]  if stock[guild_id]  else last_drop_snapshot.get(guild_id, {}).get("stock",  {})
     claims_ref = claims[guild_id] if claims[guild_id] else last_drop_snapshot.get(guild_id, {}).get("claims", {})
     archived   = archived_payments.get(guild_id, {})
+
+    # Most recent tracking number per buyer, pulled from persistent history.
+    tracking_map = {}
+    if db_pool is not None:
+        async with db_pool.acquire() as conn:
+            trows = await conn.fetch("""
+                SELECT DISTINCT ON (user_id) user_id, tracking
+                FROM user_claims
+                WHERE guild_id = $1 AND tracking IS NOT NULL AND tracking <> ''
+                ORDER BY user_id, drop_number DESC
+            """, guild_id)
+        tracking_map = {r["user_id"]: r["tracking"] for r in trows}
 
     # ── Styles ────────────────────────────────────────────────────────────────
     wb = openpyxl.Workbook()
@@ -4688,7 +4747,7 @@ async def cmd_export(ctx):
     for uid, udata in user_totals.items():
         confirmed = sum(p["amount"] for p in payments[guild_id].get(uid, []) if p["confirmed"])
         outstanding = max(udata["owed"] - confirmed, 0)
-        tracking = tracking_numbers.get(guild_id, {}).get(uid, "")
+        tracking = tracking_map.get(uid, "")
         if outstanding <= 0.01 and confirmed > 0:
             status = "✅ Paid"
             fill = PAID_FILL
@@ -4742,7 +4801,7 @@ async def cmd_export(ctx):
             f"{p['method'].title()} ${p['amount']:.2f}"
             for p in uid_pmts if p["confirmed"]
         ) or "None"
-        tracking = tracking_numbers.get(guild_id, {}).get(uid, "")
+        tracking = tracking_map.get(uid, "")
         if outstanding <= 0.01 and confirmed > 0:
             status = "✅ Paid"
             fill = PAID_FILL
