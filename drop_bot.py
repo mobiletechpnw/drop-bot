@@ -94,12 +94,16 @@ import datetime
 import asyncio
 import io
 import json
+import logging
 import os
 import random
 import asyncpg
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
+log = logging.getLogger("dropbot")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -186,6 +190,11 @@ async def init_db():
                 updated_at  TIMESTAMP NOT NULL DEFAULT NOW()
             )
         """)
+        # The final claim list posted next to the payment board is tracked here
+        # too, so it can be rebuilt/edited in lock-step and survive restarts.
+        await conn.execute(
+            "ALTER TABLE payment_boards ADD COLUMN IF NOT EXISTS claim_message_id BIGINT"
+        )
         # Write-back outbox shared with the web dashboard. Created here too so
         # the bot is self-sufficient regardless of which service starts first.
         await conn.execute("""
@@ -244,7 +253,7 @@ async def init_db():
             ALTER TABLE server_settings
             ADD COLUMN IF NOT EXISTS raffle_channel_id BIGINT
         """)
-    print("✅  Database ready.")
+    log.info("Database ready.")
 
 
 async def db_load_all():
@@ -302,16 +311,17 @@ async def db_load_all():
         # Load tracked payment boards so they can be edited after a restart
         try:
             board_rows = await conn.fetch(
-                "SELECT guild_id, channel_id, message_id, drop_number FROM payment_boards"
+                "SELECT guild_id, channel_id, message_id, drop_number, claim_message_id FROM payment_boards"
             )
             for row in board_rows:
                 payment_board_ref[row["guild_id"]] = {
                     "channel_id": row["channel_id"],
                     "message_id": row["message_id"],
                     "drop_number": row["drop_number"],
+                    "claim_message_id": row["claim_message_id"],
                 }
         except Exception as e:
-            print(f"⚠️  Could not load payment_boards: {e}")
+            log.warning(f"Could not load payment_boards: {e}")
 
         # Load raffle hosts
         host_rows = await conn.fetch("SELECT * FROM raffle_hosts")
@@ -324,7 +334,7 @@ async def db_load_all():
                 "applepay": row["applepay"],
             }
 
-    print(f"✅  Loaded {len(server_admins)} server(s) from database.")
+    log.info(f"Loaded {len(server_admins)} server(s) from database.")
 
 
 async def rehydrate_payment_drops():
@@ -398,7 +408,7 @@ async def rehydrate_payment_drops():
         restored += 1
 
     if restored:
-        print(f"✅  Rehydrated {restored} closed drop(s) for payment collection.")
+        log.info(f"Rehydrated {restored} closed drop(s) for payment collection.")
 
 
 async def db_set_admin(guild_id, user_id):
@@ -670,6 +680,48 @@ def get_user_total_owed(guild_id, user_id):
     )
 
 
+# Discord caps an embed at 25 fields and 6000 characters. The claim-list boards
+# add one field per buyer, so a big drop could exceed either limit and make the
+# message edit fail — silently freezing the board. These helpers keep every board
+# safely under the limits and summarize any overflow instead of failing.
+_EMBED_CHAR_BUDGET = 5500       # headroom under Discord's 6000-char embed limit
+_EMBED_DESC_LIMIT  = 4000       # headroom under Discord's 4096-char description limit
+
+
+def _fill_buyer_fields(embed, entries, overflow_noun="buyers"):
+    """Add (name, value) buyer rows to `embed` as fields, stopping before
+    Discord's 25-field / 6000-char limits. Rows that don't fit are collapsed into
+    a single trailing summary field so the edit never fails. Returns the embed."""
+    used = len(embed.title or "") + len(embed.description or "")
+    if embed.footer and embed.footer.text:
+        used += len(embed.footer.text)
+    total = len(entries)
+    for i, (name, value) in enumerate(entries):
+        name, value = str(name)[:256], str(value)[:1024]
+        cost = len(name) + len(value)
+        # Reserve the 25th slot for an overflow summary unless this is the last
+        # row, in which case it can take the slot itself.
+        room_for_field = len(embed.fields) < (25 if i == total - 1 else 24)
+        if room_for_field and used + cost <= _EMBED_CHAR_BUDGET:
+            embed.add_field(name=name, value=value, inline=False)
+            used += cost
+        else:
+            embed.add_field(
+                name=f"➕  {total - i} more {overflow_noun}",
+                value="Full detail in `!export` or the web dashboard.",
+                inline=False,
+            )
+            break
+    return embed
+
+
+def _cap_description(text):
+    """Trim an embed description to stay under Discord's limit, noting the trim."""
+    if len(text) <= _EMBED_DESC_LIMIT:
+        return text
+    return text[:_EMBED_DESC_LIMIT].rstrip() + "\n…(list trimmed — see `!export` or the dashboard)"
+
+
 def build_stock_embed(guild_id):
     dn = current_drop_number.get(guild_id)
     title = f"🛒  Drop #{dn} Stock" if dn else "🛒  Drop Stock"
@@ -709,18 +761,13 @@ def build_claimlist_embed(guild_id, title="📋  Claim List"):
         embed.description = "No claims yet."
         return embed
 
+    entries = []
     for uid, order in user_orders.items():
         lines = "\n".join(order["items"])
-        field_value = f"{lines}\n**Total: ${order['total']:.2f}**"
-        if len(field_value) > 1024:
-            field_value = field_value[:1020] + "..."
-        embed.add_field(
-            name=f"{order['user'].display_name}",
-            value=field_value,
-            inline=False
+        entries.append(
+            (order["user"].display_name, f"{lines}\n**Total: ${order['total']:.2f}**")
         )
-
-    return embed
+    return _fill_buyer_fields(embed, entries)
 
 
 def build_howto_embed():
@@ -789,7 +836,7 @@ def build_payment_board_embed(guild_id):
     if unpaid_lines:
         sections.append("**Outstanding**\n" + "\n".join(unpaid_lines))
 
-    embed.description = "\n\n".join(sections) if sections else "No payments confirmed yet."
+    embed.description = _cap_description("\n\n".join(sections)) if sections else "No payments confirmed yet."
 
     total_confirmed   = sum(
         sum(p["amount"] for p in payments[guild_id].get(uid, []) if p["confirmed"])
@@ -897,12 +944,71 @@ async def build_payment_board_embed_from_db(guild_id, drop_number):
         sections.append("**Paid in Full**\n" + "\n".join(paid_lines))
     if unpaid_lines:
         sections.append("**Outstanding**\n" + "\n".join(unpaid_lines))
-    embed.description = "\n\n".join(sections) if sections else "No claims yet."
+    embed.description = _cap_description("\n\n".join(sections)) if sections else "No claims yet."
     total_outstanding = max(total_owed - total_confirmed, 0)
     embed.set_footer(
         text=f"Confirmed: ${total_confirmed:.2f}  |  Outstanding: ${total_outstanding:.2f}"
     )
     return embed
+
+
+async def build_claimlist_embed_from_db(guild_id, drop_number):
+    """Rebuild a closed drop's final claim list from user_claims (the same table
+    the payment board rebuilds from), so the two boards always agree without
+    relying on in-memory state. Returns None if there are no claims to show."""
+    if db_pool is None or drop_number is None:
+        return None
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT user_id, user_name, item_display, qty, subtotal, confirmed
+            FROM user_claims WHERE guild_id = $1 AND drop_number = $2
+            ORDER BY user_name
+        """, guild_id, drop_number)
+    if not rows:
+        return None
+
+    orders = {}
+    for r in rows:
+        uid = r["user_id"]
+        o = orders.setdefault(
+            uid, {"name": r["user_name"], "items": [], "total": 0.0, "confirmed": True}
+        )
+        o["items"].append(
+            f"• {r['item_display']}  x{r['qty']}  — ${float(r['subtotal']):.2f}"
+        )
+        o["total"] += float(r["subtotal"])
+        # Paid only if every one of the buyer's line items is confirmed —
+        # the same rule the payment board uses, so the two never disagree.
+        o["confirmed"] = o["confirmed"] and bool(r["confirmed"])
+
+    embed = discord.Embed(
+        title=f"🔴  Drop #{drop_number} CLOSED — Final Claim List",
+        color=discord.Color.red(),
+        timestamp=datetime.datetime.utcnow(),
+    )
+    embed.set_footer(text="Final claim list — stays in sync with the payment board")
+    entries = []
+    for uid, o in orders.items():
+        paid_status = "✅  Paid" if o["confirmed"] else "❌  Unpaid"
+        entries.append(
+            (o["name"], "\n".join(o["items"]) + f"\n**Total: ${o['total']:.2f}** -- {paid_status}")
+        )
+    return _fill_buyer_fields(embed, entries)
+
+
+async def render_claimlist(guild_id):
+    """Claim-list embed for a guild: built from in-memory state during a live
+    drop, or from the DB (user_claims) once the drop has closed — mirrors
+    render_payment_board so the claim list and payment board always agree."""
+    if session_state.get(guild_id) == "live":
+        return build_live_claimlist_embed(guild_id)
+    ref = payment_board_ref.get(guild_id)
+    drop_number = (
+        ref["drop_number"] if ref and ref.get("drop_number") is not None
+        else await _current_drop_number(guild_id)
+    )
+    db_embed = await build_claimlist_embed_from_db(guild_id, drop_number)
+    return db_embed if db_embed is not None else build_live_claimlist_embed(guild_id)
 
 
 async def render_payment_board(guild_id):
@@ -919,27 +1025,37 @@ async def render_payment_board(guild_id):
     return db_embed if db_embed is not None else build_payment_board_embed(guild_id)
 
 
-async def db_save_payment_board(guild_id, channel_id, message_id, drop_number):
-    """Remember where a guild's payment board lives so it can be edited later,
-    even after a restart."""
+async def db_save_payment_board(guild_id, channel_id, message_id, drop_number,
+                                claim_message_id=None):
+    """Remember where a guild's payment board (and its paired final claim list)
+    live so they can be edited later, even after a restart. A None
+    claim_message_id preserves whatever is already stored, so callers that only
+    (re)establish the payment board don't wipe the tracked claim list."""
+    ref = payment_board_ref.get(guild_id, {})
     payment_board_ref[guild_id] = {
         "channel_id": channel_id, "message_id": message_id, "drop_number": drop_number,
+        "claim_message_id": claim_message_id if claim_message_id is not None
+        else ref.get("claim_message_id"),
     }
     if db_pool is None:
         return
     async with db_pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO payment_boards (guild_id, channel_id, message_id, drop_number, updated_at)
-            VALUES ($1, $2, $3, $4, NOW())
+            INSERT INTO payment_boards
+                (guild_id, channel_id, message_id, drop_number, claim_message_id, updated_at)
+            VALUES ($1, $2, $3, $4, $5, NOW())
             ON CONFLICT (guild_id) DO UPDATE
-            SET channel_id = $2, message_id = $3, drop_number = $4, updated_at = NOW()
-        """, guild_id, channel_id, message_id, drop_number)
+            SET channel_id = $2, message_id = $3, drop_number = $4,
+                claim_message_id = COALESCE($5, payment_boards.claim_message_id),
+                updated_at = NOW()
+        """, guild_id, channel_id, message_id, drop_number, claim_message_id)
 
 
 async def refresh_payment_board_from_db(guild_id, drop_number):
-    """Rebuild a closed drop's payment board from the DB and edit the tracked
-    Discord message. No-op if there's no tracked board or it belongs to a
-    different drop (a manager can (re)establish one with !paymentboard)."""
+    """Rebuild a closed drop's payment board AND its paired final claim list from
+    the DB and edit the tracked Discord messages, so the two stay in sync. No-op
+    if there's no tracked board or it belongs to a different drop (a manager can
+    (re)establish one with !paymentboard)."""
     if db_pool is None:
         return
     ref = payment_board_ref.get(guild_id)
@@ -962,7 +1078,19 @@ async def refresh_payment_board_from_db(guild_id, drop_number):
         await msg.edit(embed=embed)
         payment_board_message[guild_id] = msg
     except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-        return
+        pass
+
+    # Keep the paired final claim list in lock-step with the payment board.
+    claim_id = ref.get("claim_message_id")
+    if claim_id:
+        cl_embed = await build_claimlist_embed_from_db(guild_id, target_drop)
+        if cl_embed is not None:
+            try:
+                cl_msg = await channel.fetch_message(claim_id)
+                await cl_msg.edit(embed=cl_embed)
+                live_claimlist_message[guild_id] = cl_msg
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
 
 
 async def update_payment_board(guild_id):
@@ -999,19 +1127,16 @@ def build_live_claimlist_embed(guild_id):
     if not user_orders:
         embed.description = "No claims yet."
         return embed
+    embed.set_footer(text="Updates live as claims and payments come in")
+    entries = []
     for uid, order in user_orders.items():
         confirmed_total = sum(p["amount"] for p in payments[guild_id][uid] if p["confirmed"])
         paid_status = "✅  Paid" if confirmed_total >= order["total"] - 0.01 else f"⏳  ${confirmed_total:.2f} of ${order['total']:.2f} paid"
         lines_str = "\n".join(order["items"])
-        field_value = lines_str + f"\n**Total: ${order['total']:.2f}** -- {paid_status}"
-        if len(field_value) > 1024:
-            field_value = field_value[:1020] + "..."
-        embed.add_field(
-            name=order["user"].display_name,
-            value=field_value,
-            inline=False
+        entries.append(
+            (order["user"].display_name, lines_str + f"\n**Total: ${order['total']:.2f}** -- {paid_status}")
         )
-    embed.set_footer(text="Updates live as claims and payments come in")
+    _fill_buyer_fields(embed, entries)
     return embed
 
 
@@ -1037,13 +1162,15 @@ async def update_all_live_boards(guild_id):
         except discord.HTTPException:
             pass
 
-    # Update live claim list
+    # Update live claim list (renders the closed/final version once a drop ends,
+    # so it stays in sync with the payment board rather than freezing at close)
     cl_msg = live_claimlist_message.get(guild_id)
     if cl_msg:
         try:
-            await cl_msg.edit(embed=build_live_claimlist_embed(guild_id))
+            await cl_msg.edit(embed=await render_claimlist(guild_id))
         except discord.NotFound:
             live_claimlist_message.pop(guild_id, None)
+            cl_msg = None
         except discord.HTTPException:
             pass
 
@@ -1054,8 +1181,17 @@ async def update_all_live_boards(guild_id):
             await pb_msg.edit(embed=await render_payment_board(guild_id))
         except discord.NotFound:
             payment_board_message.pop(guild_id, None)
+            pb_msg = None
         except discord.HTTPException:
             pass
+
+    # After a restart the in-memory message handles are gone, but a closed
+    # drop's boards are still tracked in the DB (payment_board_ref). Repaint
+    # both from there so a post-close payment shows up on Discord without
+    # needing a dashboard action or !paymentboard first.
+    if (cl_msg is None or pb_msg is None) and session_state.get(guild_id) != "live":
+        if payment_board_ref.get(guild_id):
+            await refresh_payment_board_from_db(guild_id, None)
 
     # Mirror the live drop to the DB so the web dashboard stays in sync
     await mirror_live_drop(guild_id)
@@ -1251,7 +1387,7 @@ async def mirror_live_drop(guild_id):
                      json.dumps(o["items"]), o["total"], o["confirmed_total"],
                      o["paid"])
     except Exception as e:
-        print(f"⚠️  mirror_live_drop failed for {guild_id}: {e}")
+        log.warning(f"mirror_live_drop failed for {guild_id}: {e}")
 
 
 async def apply_pending_action(guild_id, user_id, action, drop_number=None):
@@ -1293,7 +1429,7 @@ async def apply_pending_action(guild_id, user_id, action, drop_number=None):
     try:
         await db_set_claim_confirmed(guild_id, user_id, db_confirmed)
     except Exception as e:
-        print(f"⚠️  db_set_claim_confirmed failed for {guild_id}/{user_id}: {e}")
+        log.warning(f"db_set_claim_confirmed failed for {guild_id}/{user_id}: {e}")
     await mirror_live_drop(guild_id)
     spawn(update_all_live_boards(guild_id))
 
@@ -1315,7 +1451,7 @@ async def poll_pending_actions():
                             r["guild_id"], r["user_id"], r["action"], r["drop_number"]
                         )
                     except Exception as e:
-                        print(f"⚠️  pending_action {r['id']} failed: {e}")
+                        log.warning(f"pending_action {r['id']} failed: {e}")
                     # Mark applied either way so a poison row can't wedge the loop.
                     async with db_pool.acquire() as conn:
                         await conn.execute(
@@ -1323,7 +1459,7 @@ async def poll_pending_actions():
                             r["id"],
                         )
         except Exception as e:
-            print(f"⚠️  poll_pending_actions loop error: {e}")
+            log.warning(f"poll_pending_actions loop error: {e}")
         await asyncio.sleep(15)
 
 
@@ -1439,11 +1575,24 @@ async def close_drop(channel, guild_id):
     # drop_history now includes this drop, so this is its final number.
     current_drop_number[guild_id] = drop_number
 
-    # Save per-user claim records
-    confirmed_users = {
-        uid for uid, pmts in payments[guild_id].items()
-        if any(p["confirmed"] for p in pmts)
-    }
+    # Save per-user claim records. A buyer counts as confirmed only if their
+    # confirmed payments cover what they owe — otherwise a partial payment would
+    # be frozen into the DB as "paid in full" and misreported on the closed
+    # drop's boards, which render paid/unpaid from this flag.
+    owed_by_user = {}
+    for key, claim_list in claims[guild_id].items():
+        if key not in stock[guild_id]:
+            continue
+        price = stock[guild_id][key]["price"]
+        for c in claim_list:
+            owed_by_user[c["user"].id] = owed_by_user.get(c["user"].id, 0.0) + c["qty"] * price
+    confirmed_users = set()
+    for uid, owed in owed_by_user.items():
+        confirmed_total = sum(
+            p["amount"] for p in payments[guild_id].get(uid, []) if p["confirmed"]
+        )
+        if confirmed_total > 0 and confirmed_total >= owed - 0.01:
+            confirmed_users.add(uid)
     await db_save_user_claims(
         guild_id, drop_number, closed_at,
         claims[guild_id], stock[guild_id], confirmed_users
@@ -1464,19 +1613,25 @@ async def close_drop(channel, guild_id):
         except (discord.NotFound, discord.HTTPException):
             pass
 
-    # Post fresh final claim list with paid/unpaid status
+    # Post fresh final claim list with paid/unpaid status. Track it as the live
+    # claim list message so later payments keep it in sync (instead of leaving a
+    # frozen copy above the still-updating payment board).
     final_cl_embed = build_live_claimlist_embed(guild_id)
     final_cl_embed.title = f"🔴  Drop #{drop_number} CLOSED — Final Claim List"
     final_cl_embed.color = discord.Color.red()
-    await channel.send(embed=final_cl_embed)
+    final_cl_msg = await channel.send(embed=final_cl_embed)
+    live_claimlist_message[guild_id] = final_cl_msg
 
     # Always post a fresh payment board on close
     final_pb_embed = build_payment_board_embed(guild_id)
     final_pb_embed.title = "💳  Final Payment Board"
     board_msg = await channel.send(embed=final_pb_embed)
     payment_board_message[guild_id] = board_msg
-    # Track the board so dashboard edits (and restarts) can find it later
-    await db_save_payment_board(guild_id, board_msg.channel.id, board_msg.id, drop_number)
+    # Track both boards so dashboard edits (and restarts) can find them and keep
+    # the claim list and payment board in sync.
+    await db_save_payment_board(
+        guild_id, board_msg.channel.id, board_msg.id, drop_number, final_cl_msg.id
+    )
 
     # Mirror the closed drop so the dashboard's Live page can still mark payments
     await mirror_live_drop(guild_id)
@@ -1670,7 +1825,7 @@ async def on_ready():
     if not _web_sync_started:
         _web_sync_started = True
         spawn(poll_pending_actions())
-    print(f"✅  Logged in as {bot.user} ({bot.user.id})")
+    log.info(f"Logged in as {bot.user} ({bot.user.id})")
 
 
 @bot.event
@@ -2311,10 +2466,11 @@ async def cmd_confirm(ctx, *args):
         p["confirmed"] = True
 
     total_confirmed = sum(p["amount"] for p in pending)
-    spawn(update_all_live_boards(guild_id))
 
-    # Update confirmed status in DB
+    # Persist to the DB first — the closed-drop boards render paid/unpaid from
+    # user_claims, so the write must land before the board refresh reads it.
     await db_update_user_claim_confirmed(guild_id, user.id)
+    spawn(update_all_live_boards(guild_id))
 
     try:
         await user.send(f"✅  Your payment of **${total_confirmed:.2f}** has been confirmed! Thanks so much — enjoy your order! 🎉")
@@ -3266,8 +3422,10 @@ async def cmd_creator(ctx, subcommand: str = "", *args):
             p["confirmed"] = True
         total_confirmed = sum(p["amount"] for p in pending)
 
-        spawn(update_all_live_boards(guild_id))
+        # Persist to the DB first — the closed-drop boards render paid/unpaid
+        # from user_claims, so the write must land before the refresh reads it.
         await db_update_user_claim_confirmed(guild_id, buyer_id)
+        spawn(update_all_live_boards(guild_id))
 
         # Notify the buyer from the bot, exactly like a manager confirm.
         member = guild.get_member(buyer_id)
@@ -4947,13 +5105,14 @@ async def cmd_export(ctx):
 
     try:
         await ctx.author.send(
-            f"📊  **Drop Export — {guild.name}** ({date_str})\\n"
+            f"📊  **Drop Export — {guild.name}** ({date_str})\n"
             f"Sheets: Orders | Payment Summary | Raffles"
             + (" | Previous Drop" if arch_claims_data else ""),
             file=discord.File(buf, filename=filename)
         )
     except discord.Forbidden:
-        await ctx.send("⚠️  I couldn\\'t DM you the file — please open your DMs and try again.")
+        await ctx.send("⚠️  I couldn't DM you the file — please open your DMs and try again.")
 
 
-bot.run(BOT_TOKEN)
+if __name__ == "__main__":
+    bot.run(BOT_TOKEN)
