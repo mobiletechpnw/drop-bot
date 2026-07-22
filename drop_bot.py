@@ -2977,6 +2977,7 @@ async def cmd_creator(ctx, subcommand: str = "", *args):
             "`!creator servers` — List all servers the bot is in\n"
             "`!creator info <guild_id>` — See a server's settings, admin, and managers\n"
             "`!creator confirm <guild_id> <user_id> [drop #]` — Confirm a user's payment, optionally for one drop (buyer is notified)\n"
+            "`!creator paymentboard <guild_id>` — Post or refresh the payment board in a server's drop channel\n"
             "`!creator setpayment <guild_id>` — Update payment info for a server\n"
             "`!creator setdropchannel <guild_id> <channel_id>` — Update drop channel for a server\n"
             "`!creator resetadmin <guild_id> <user_id>` — Reassign the admin for a server\n"
@@ -3227,6 +3228,35 @@ async def cmd_creator(ctx, subcommand: str = "", *args):
         await ctx.author.send(
             f"✅  Confirmed **${total_confirmed:.2f}** from **{buyer_name}** in **{guild.name}**."
         )
+        return
+
+    # ── !creator paymentboard <guild_id> ─────────────────────────────────────
+    if sub == "paymentboard":
+        if not args:
+            await ctx.author.send("Usage: `!creator paymentboard <guild_id>`")
+            return
+        try:
+            guild_id = int(args[0])
+        except ValueError:
+            await ctx.author.send("⚠️  Invalid guild ID.")
+            return
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            await ctx.author.send(f"⚠️  Bot is not in a server with ID `{guild_id}`.")
+            return
+        drop_channel = get_drop_channel(guild)
+        if not drop_channel:
+            drop_channel = next(
+                (c for c in guild.text_channels if c.permissions_for(guild.me).send_messages),
+                None,
+            )
+            if not drop_channel:
+                await ctx.author.send(
+                    f"⚠️  No drop channel set for **{guild.name}** and no accessible channel found."
+                )
+                return
+        result = await post_or_refresh_payment_board(guild, drop_channel)
+        await ctx.author.send(f"✅  Payment board {result} on **{guild.name}**.")
         return
 
     await ctx.author.send(f"⚠️  Unknown subcommand `{subcommand}`. Type `!creator` for a list of commands.")
@@ -4314,6 +4344,26 @@ bot.tree.add_command(raffle_group)
 
 
 
+async def post_or_refresh_payment_board(guild, channel):
+    """Update the tracked payment board if one exists, else post a fresh one in
+    `channel`. Returns a short status string."""
+    guild_id = guild.id
+    embed = await render_payment_board(guild_id)
+    drop_number = await _current_drop_number(guild_id)
+    pb_msg = payment_board_message.get(guild_id)
+    if pb_msg:
+        try:
+            await pb_msg.edit(embed=embed)
+            await db_save_payment_board(guild_id, pb_msg.channel.id, pb_msg.id, drop_number)
+            return "updated"
+        except (discord.NotFound, discord.HTTPException):
+            payment_board_message.pop(guild_id, None)
+    msg = await channel.send(embed=embed)
+    payment_board_message[guild_id] = msg
+    await db_save_payment_board(guild_id, msg.channel.id, msg.id, drop_number)
+    return f"posted in #{msg.channel.name}"
+
+
 @bot.command(name="paymentboard")
 async def cmd_paymentboard(ctx):
     """Post or refresh the payment board in the drop channel."""
@@ -4325,23 +4375,8 @@ async def cmd_paymentboard(ctx):
         return
     await silent(ctx)
     drop_channel = get_drop_channel(ctx.guild) or ctx.channel
-    embed = await render_payment_board(guild_id)
-    drop_number = await _current_drop_number(guild_id)
-    # If a live board already exists update it, otherwise post a new one
-    pb_msg = payment_board_message.get(guild_id)
-    if pb_msg:
-        try:
-            await pb_msg.edit(embed=embed)
-            await db_save_payment_board(guild_id, pb_msg.channel.id, pb_msg.id, drop_number)
-            await dm(ctx, "✅  Payment board updated.")
-            return
-        except (discord.NotFound, discord.HTTPException):
-            payment_board_message.pop(guild_id, None)
-    # Post a fresh one
-    msg = await drop_channel.send(embed=embed)
-    payment_board_message[guild_id] = msg
-    await db_save_payment_board(guild_id, msg.channel.id, msg.id, drop_number)
-    await dm(ctx, "✅  Payment board posted.")
+    result = await post_or_refresh_payment_board(ctx.guild, drop_channel)
+    await dm(ctx, f"✅  Payment board {result}.")
 
 
 @bot.command(name="payments")
