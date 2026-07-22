@@ -1132,6 +1132,7 @@ async def update_all_live_boards(guild_id):
             await cl_msg.edit(embed=await render_claimlist(guild_id))
         except discord.NotFound:
             live_claimlist_message.pop(guild_id, None)
+            cl_msg = None
         except discord.HTTPException:
             pass
 
@@ -1142,8 +1143,17 @@ async def update_all_live_boards(guild_id):
             await pb_msg.edit(embed=await render_payment_board(guild_id))
         except discord.NotFound:
             payment_board_message.pop(guild_id, None)
+            pb_msg = None
         except discord.HTTPException:
             pass
+
+    # After a restart the in-memory message handles are gone, but a closed
+    # drop's boards are still tracked in the DB (payment_board_ref). Repaint
+    # both from there so a post-close payment shows up on Discord without
+    # needing a dashboard action or !paymentboard first.
+    if (cl_msg is None or pb_msg is None) and session_state.get(guild_id) != "live":
+        if payment_board_ref.get(guild_id):
+            await refresh_payment_board_from_db(guild_id, None)
 
     # Mirror the live drop to the DB so the web dashboard stays in sync
     await mirror_live_drop(guild_id)
