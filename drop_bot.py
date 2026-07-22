@@ -1054,6 +1054,98 @@ def _owed_for_user(guild_id, uid):
     return owed
 
 
+async def db_get_drop_numbers_for_user(guild_id, user_id):
+    """Distinct drop numbers a user has saved claims in, newest first."""
+    if db_pool is None:
+        return []
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT DISTINCT drop_number FROM user_claims
+               WHERE guild_id = $1 AND user_id = $2 ORDER BY drop_number DESC""",
+            guild_id, user_id,
+        )
+    return [r["drop_number"] for r in rows]
+
+
+async def db_confirm_drop_for_user(guild_id, user_id, drop_number):
+    """Mark one specific drop's claims confirmed for a user. Returns the drop
+    total (sum of subtotals), or None if the user has no claims in that drop."""
+    if db_pool is None:
+        return None
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT subtotal FROM user_claims
+               WHERE guild_id = $1 AND user_id = $2 AND drop_number = $3""",
+            guild_id, user_id, drop_number,
+        )
+        if not rows:
+            return None
+        await conn.execute(
+            """UPDATE user_claims SET confirmed = TRUE
+               WHERE guild_id = $1 AND user_id = $2 AND drop_number = $3""",
+            guild_id, user_id, drop_number,
+        )
+    return sum(float(r["subtotal"]) for r in rows)
+
+
+async def confirm_drop_payment(guild_id, buyer_id, drop_number, guild):
+    """Confirm a buyer's payment for one specific drop (by number).
+
+    Marks that drop's claims confirmed in the DB, syncs the matching in-memory
+    payments, refreshes that drop's payment board, and DMs the buyer the normal
+    confirmation. Returns a feedback string for the manager/creator."""
+    def _name():
+        m = guild.get_member(buyer_id) if guild else None
+        return m.display_name if m else str(buyer_id)
+
+    current_num = await _current_drop_number(guild_id)
+    is_current = (drop_number == current_num)
+    db_total = await db_confirm_drop_for_user(guild_id, buyer_id, drop_number)
+
+    if is_current:
+        owed = _owed_for_user(guild_id, buyer_id)
+        if db_total is None and owed <= 0.01 and not payments[guild_id].get(buyer_id):
+            drops = await db_get_drop_numbers_for_user(guild_id, buyer_id)
+            hint = f" They have claims in: {', '.join('#' + str(d) for d in drops)}." if drops else ""
+            return f"⚠️  **{_name()}** has no claims in Drop #{drop_number}.{hint}"
+        # Confirm reported payments and top up to cover what's owed.
+        for p in payments[guild_id].get(buyer_id, []):
+            p["confirmed"] = True
+        confirmed_total = sum(
+            p["amount"] for p in payments[guild_id].get(buyer_id, []) if p["confirmed"]
+        )
+        if owed - confirmed_total > 0.01:
+            payments[guild_id][buyer_id].append({
+                "method": "confirmed", "amount": round(owed - confirmed_total, 2),
+                "time": datetime.datetime.utcnow(), "confirmed": True,
+            })
+        total = db_total if db_total is not None else owed
+        asyncio.create_task(update_all_live_boards(guild_id))
+    else:
+        if db_total is None:
+            drops = await db_get_drop_numbers_for_user(guild_id, buyer_id)
+            hint = f" They have claims in: {', '.join('#' + str(d) for d in drops)}." if drops else ""
+            return f"⚠️  **{_name()}** has no claims in Drop #{drop_number}.{hint}"
+        total = db_total
+        # Best-effort: also confirm previous-drop payments held in memory.
+        archived_pmts = archived_payments.get(guild_id, {}).get("payments", {})
+        if isinstance(archived_pmts, dict) and buyer_id in archived_pmts:
+            for p in archived_pmts[buyer_id]:
+                p["confirmed"] = True
+        await refresh_payment_board_from_db(guild_id, drop_number)
+
+    member = guild.get_member(buyer_id) if guild else None
+    if member:
+        try:
+            await member.send(
+                f"✅  Your payment for **Drop #{drop_number}** (**${total:.2f}**) has been "
+                f"confirmed! Thanks so much — enjoy your order! 🎉"
+            )
+        except discord.Forbidden:
+            pass
+    return f"✅  Confirmed **Drop #{drop_number}** (**${total:.2f}**) for **{_name()}**."
+
+
 async def mirror_live_drop(guild_id):
     """Write the current drop's buyers into live_drops / live_orders so the web
     dashboard's Live page reflects Discord. Best-effort: never raises."""
@@ -2098,7 +2190,7 @@ async def cmd_unpaid(ctx):
 
 
 @bot.command(name="confirm")
-async def cmd_confirm(ctx):
+async def cmd_confirm(ctx, *args):
     if not ctx.guild:
         await ctx.author.send("⚠️  Please run `!confirm` in your server channel.")
         return
@@ -2107,9 +2199,17 @@ async def cmd_confirm(ctx):
         return
     await silent(ctx)
     if not ctx.message.mentions:
-        await dm(ctx, "Usage: `!confirm @user`")
+        await dm(ctx, "Usage: `!confirm @user [drop #]`")
         return
     user = ctx.message.mentions[0]
+
+    # Optional trailing drop number: confirm only that drop's payment.
+    drop_number = next((int(a) for a in args if a.isdigit()), None)
+    if drop_number is not None:
+        feedback = await confirm_drop_payment(guild_id, user.id, drop_number, ctx.guild)
+        await dm(ctx, feedback)
+        return
+
     # Check live payments first, then archived
     user_pmts = payments[guild_id][user.id]
     pending = [p for p in user_pmts if not p["confirmed"]]
@@ -2849,7 +2949,7 @@ async def cmd_creator(ctx, subcommand: str = "", *args):
             "**Creator Commands (DM only):**\n"
             "`!creator servers` — List all servers the bot is in\n"
             "`!creator info <guild_id>` — See a server's settings, admin, and managers\n"
-            "`!creator confirm <guild_id> <user_id>` — Confirm a user's payment (buyer is notified by the bot)\n"
+            "`!creator confirm <guild_id> <user_id> [drop #]` — Confirm a user's payment, optionally for one drop (buyer is notified)\n"
             "`!creator setpayment <guild_id>` — Update payment info for a server\n"
             "`!creator setdropchannel <guild_id> <channel_id>` — Update drop channel for a server\n"
             "`!creator resetadmin <guild_id> <user_id>` — Reassign the admin for a server\n"
@@ -3033,7 +3133,7 @@ async def cmd_creator(ctx, subcommand: str = "", *args):
     if sub == "confirm":
         if len(args) < 2:
             await ctx.author.send(
-                "Usage: `!creator confirm <guild_id> <user_id>`  "
+                "Usage: `!creator confirm <guild_id> <user_id> [drop #]`  "
                 "(you can @mention the user instead of the ID)"
             )
             return
@@ -3045,15 +3145,24 @@ async def cmd_creator(ctx, subcommand: str = "", *args):
         # Accept either a raw user ID or an @mention for the buyer
         if ctx.message.mentions:
             buyer_id = ctx.message.mentions[0].id
+            # Optional trailing drop number (a bare digit after the guild id)
+            drop_number = next((int(a) for a in args[1:] if a.isdigit()), None)
         else:
             try:
                 buyer_id = int(args[1])
             except ValueError:
                 await ctx.author.send("⚠️  Invalid user ID.")
                 return
+            drop_number = int(args[2]) if len(args) > 2 and args[2].isdigit() else None
         guild = bot.get_guild(guild_id)
         if not guild:
             await ctx.author.send(f"⚠️  Bot is not in a server with ID `{guild_id}`.")
+            return
+
+        # If a drop number is given, confirm only that drop's payment.
+        if drop_number is not None:
+            feedback = await confirm_drop_payment(guild_id, buyer_id, drop_number, guild)
+            await ctx.author.send(feedback)
             return
 
         # Same logic as !confirm: confirm pending reported payments from the
