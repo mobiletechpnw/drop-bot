@@ -359,7 +359,15 @@ async def rehydrate_payment_drops():
         confirmed_amt = defaultdict(float)
         for r in grows:
             key = r["item_display"]
-            stock[guild_id][key] = {"display": r["item_display"], "price": float(r["price"])}
+            # qty/limit aren't stored in user_claims; reconstruct qty as the
+            # total claimed so the (closed) drop reads as sold out and
+            # build_stock_embed never hits a missing key.
+            if key not in stock[guild_id]:
+                stock[guild_id][key] = {
+                    "display": r["item_display"], "price": float(r["price"]),
+                    "qty": 0, "limit": None,
+                }
+            stock[guild_id][key]["qty"] += r["qty"]
             member = guild.get_member(r["user_id"]) if guild else None
             user_obj = member or _StoredUser(r["user_id"], r["user_name"])
             claims[guild_id][key].append({
@@ -525,6 +533,21 @@ pending_payment_messages = {}
 _pending_board_update    = {}   # guild_id -> bool (debounce flag)
 _web_sync_started        = False  # guard so the outbox poller starts only once
 _rehydrated              = False  # guard so payment-drop rehydration runs once
+
+# Strong references to fire-and-forget background tasks. asyncio keeps only a
+# weak reference to a task, so an un-referenced task can be garbage-collected
+# mid-await — which previously left the board-update debounce flag stuck True
+# and froze the live boards (e.g. stock stuck showing "1 left" after selling out).
+_bg_tasks = set()
+
+
+def spawn(coro):
+    """Schedule a background coroutine and keep a strong reference until it's
+    done, so the event loop can't garbage-collect it mid-flight."""
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
 
 
 class _StoredUser:
@@ -953,8 +976,12 @@ async def update_all_live_boards(guild_id):
     if _pending_board_update.get(guild_id):
         return
     _pending_board_update[guild_id] = True
-    await asyncio.sleep(2)  # debounce — wait 2s then flush
-    _pending_board_update[guild_id] = False
+    try:
+        await asyncio.sleep(2)  # debounce — wait 2s then flush
+    finally:
+        # Always clear the flag — even if this task is cancelled or GC'd during
+        # the sleep — so board updates can never get permanently wedged.
+        _pending_board_update[guild_id] = False
 
     # Update stock embed
     msg = stock_message.get(guild_id)
@@ -1120,7 +1147,7 @@ async def confirm_drop_payment(guild_id, buyer_id, drop_number, guild):
                 "time": datetime.datetime.utcnow(), "confirmed": True,
             })
         total = db_total if db_total is not None else owed
-        asyncio.create_task(update_all_live_boards(guild_id))
+        spawn(update_all_live_boards(guild_id))
     else:
         if db_total is None:
             drops = await db_get_drop_numbers_for_user(guild_id, buyer_id)
@@ -1224,7 +1251,7 @@ async def apply_pending_action(guild_id, user_id, action, drop_number=None):
     except Exception as e:
         print(f"⚠️  db_set_claim_confirmed failed for {guild_id}/{user_id}: {e}")
     await mirror_live_drop(guild_id)
-    asyncio.create_task(update_all_live_boards(guild_id))
+    spawn(update_all_live_boards(guild_id))
 
 
 async def poll_pending_actions():
@@ -1441,7 +1468,7 @@ async def close_drop(channel, guild_id):
     # ── Schedule 5-hour unpaid reminder (once per buyer) ──────────────────────
     for user, items in claimer_totals.items():
         total = sum(subtotal for _, _, subtotal in items)
-        asyncio.create_task(
+        spawn(
             schedule_unpaid_reminder(guild_id, user, total, payment_info)
         )
 
@@ -1596,7 +1623,7 @@ async def on_ready():
     global _web_sync_started
     if not _web_sync_started:
         _web_sync_started = True
-        asyncio.create_task(poll_pending_actions())
+        spawn(poll_pending_actions())
     print(f"✅  Logged in as {bot.user} ({bot.user.id})")
 
 
@@ -1664,7 +1691,7 @@ async def on_reaction_add(reaction, user):
     if pending or archived_pending:
         await db_update_user_claim_confirmed(guild_id, buyer_id)
 
-    asyncio.create_task(update_all_live_boards(guild_id))
+    spawn(update_all_live_boards(guild_id))
 
     guild = reaction.message.guild
     buyer = guild.get_member(buyer_id)
@@ -1963,7 +1990,7 @@ async def cmd_editstock(ctx, *, args=""):
     stock[guild_id][key]["qty"] = qty
     stock[guild_id][key]["price"] = price
     if session_state[guild_id] == "live":
-        asyncio.create_task(update_all_live_boards(guild_id))
+        spawn(update_all_live_boards(guild_id))
     await dm(ctx, f"✅  **{stock[guild_id][key]['display']}** updated — {qty} @ ${price:.2f} each.")
 
 
@@ -2064,7 +2091,7 @@ async def cmd_countdown(ctx, minutes: str = ""):
         except (discord.Forbidden, discord.HTTPException):
             pass
 
-    asyncio.create_task(auto_release())
+    spawn(auto_release())
 
 
 @bot.command(name="autoclose")
@@ -2229,7 +2256,7 @@ async def cmd_confirm(ctx, *args):
         p["confirmed"] = True
 
     total_confirmed = sum(p["amount"] for p in pending)
-    asyncio.create_task(update_all_live_boards(guild_id))
+    spawn(update_all_live_boards(guild_id))
 
     # Update confirmed status in DB
     await db_update_user_claim_confirmed(guild_id, user.id)
@@ -2635,7 +2662,7 @@ async def cmd_claim(ctx, *, args=""):
     new_remaining = remaining - qty
     total_cost = qty * info["price"]
     await ctx.send(f"✅  **{ctx.author.display_name}** claimed **{qty}x {info['display']}** — ${total_cost:.2f}  •  {new_remaining} left")
-    asyncio.create_task(update_all_live_boards(guild_id))
+    spawn(update_all_live_boards(guild_id))
     if autoclose[guild_id] and all_sold_out(guild_id):
         drop_ch = get_drop_channel(ctx.guild) or ctx.channel
         await drop_ch.send("🎉  **Everything is claimed!** Closing the drop...")
@@ -2687,7 +2714,7 @@ async def cmd_unclaim(ctx, *, args=""):
         freed = qty
         existing["qty"] -= qty
         await ctx.send(f"↩️  **{ctx.author.display_name}** removed **{qty}x {stock[guild_id][key]['display']}** from their claim. ({existing['qty']} still claimed)")
-    asyncio.create_task(update_all_live_boards(guild_id))
+    spawn(update_all_live_boards(guild_id))
     await notify_waitlist(guild_id, key, freed)
 
 
@@ -3183,7 +3210,7 @@ async def cmd_creator(ctx, subcommand: str = "", *args):
             p["confirmed"] = True
         total_confirmed = sum(p["amount"] for p in pending)
 
-        asyncio.create_task(update_all_live_boards(guild_id))
+        spawn(update_all_live_boards(guild_id))
         await db_update_user_claim_confirmed(guild_id, buyer_id)
 
         # Notify the buyer from the bot, exactly like a manager confirm.
