@@ -3363,7 +3363,6 @@ async def cmd_myhistory(ctx):
     for dn, drop in sorted(drops.items(), reverse=True):
         date_str = drop["closed_at"].strftime("%b %d, %Y")
         status = "✅  Paid & Confirmed" if drop["confirmed"] else "⏳  Payment Pending"
-        status = "Confirmed" if drop["confirmed"] else "Payment Pending"
         item_lines = []
         for item in drop["items"]:
             item_lines.append(f"- {item['display']}  x{item['qty']}  - ${item['subtotal']:.2f}")
@@ -4351,6 +4350,26 @@ async def post_or_refresh_payment_board(guild, channel):
     embed = await render_payment_board(guild_id)
     drop_number = await _current_drop_number(guild_id)
     pb_msg = payment_board_message.get(guild_id)
+
+    # After a restart the in-memory message is gone but the board is still
+    # tracked in the DB — reuse it so we edit the existing board instead of
+    # posting a duplicate.
+    if pb_msg is None:
+        ref = payment_board_ref.get(guild_id)
+        if ref:
+            ch = bot.get_channel(ref["channel_id"])
+            if ch is None:
+                try:
+                    ch = await bot.fetch_channel(ref["channel_id"])
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    ch = None
+            if ch:
+                try:
+                    pb_msg = await ch.fetch_message(ref["message_id"])
+                    payment_board_message[guild_id] = pb_msg
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pb_msg = None
+
     if pb_msg:
         try:
             await pb_msg.edit(embed=embed)
