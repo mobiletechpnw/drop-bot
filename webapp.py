@@ -35,6 +35,7 @@ from urllib.parse import quote, quote_plus
 
 import asyncpg
 import openpyxl
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from openpyxl.styles import Font, PatternFill, Alignment
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import RedirectResponse, Response
@@ -1061,14 +1062,20 @@ async def raffle_detail(request: Request, name: str, msg: str = ""):
 
 # ── Excel export ──────────────────────────────────────────────────────────────
 
-@app.get("/drops/{drop_number}/export.xlsx")
-async def drop_export(request: Request, drop_number: int):
-    gid, gname = _session_guild(request)
-    if gid is None:
-        return _redirect_login()
-    async with request.app.state.pool.acquire() as conn:
-        orders = await _load_drop_orders(conn, gid, drop_number)
+def _xlsx_safe(value):
+    """Strip characters openpyxl refuses to write.
 
+    Buyer names, item names and tracking numbers are arbitrary user-supplied
+    text. Control characters that are illegal in XML make ``wb.save()`` raise
+    ``IllegalCharacterError``, which used to 500 the whole export.
+    """
+    if isinstance(value, str):
+        return ILLEGAL_CHARACTERS_RE.sub("", value)
+    return value
+
+
+def _build_drop_xlsx(drop_number, orders):
+    """Render a drop's orders into an .xlsx workbook and return its bytes."""
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = f"Drop {drop_number}"
@@ -1086,7 +1093,7 @@ async def drop_export(request: Request, drop_number: int):
     for o in orders:
         first = True
         for item in o["items"]:
-            ws.append([
+            ws.append([_xlsx_safe(v) for v in (
                 o["name"] if first else "",
                 str(o["user_id"]) if first else "",
                 item["display"],
@@ -1095,7 +1102,7 @@ async def drop_export(request: Request, drop_number: int):
                 round(o["total"], 2) if first else "",
                 ("Yes" if o["confirmed"] else "No") if first else "",
                 o["tracking"] if first else "",
-            ])
+            )])
             first = False
 
     for col_cells in ws.columns:
@@ -1105,13 +1112,42 @@ async def drop_export(request: Request, drop_number: int):
 
     buf = io.BytesIO()
     wb.save(buf)
-    buf.seek(0)
+    return buf.getvalue()
+
+
+def _attachment_disposition(filename):
+    """Build a Content-Disposition header that survives non-ASCII filenames.
+
+    Starlette encodes header values as latin-1, so a filename containing emoji
+    or accented characters — common in Discord server names — would raise a
+    ``UnicodeEncodeError`` on send and 500 the export. We emit an ASCII-only
+    ``filename`` fallback alongside the RFC 5987 ``filename*`` UTF-8 variant.
+    """
+    ascii_name = filename.encode("ascii", "ignore").decode("ascii")
+    ascii_name = ascii_name.replace("\\", "").replace('"', "")
+    if not ascii_name.strip(" _"):
+        ascii_name = "export.xlsx"
+    return (
+        f'attachment; filename="{ascii_name}"; '
+        f"filename*=UTF-8''{quote(filename)}"
+    )
+
+
+@app.get("/drops/{drop_number}/export.xlsx")
+async def drop_export(request: Request, drop_number: int):
+    gid, gname = _session_guild(request)
+    if gid is None:
+        return _redirect_login()
+    async with request.app.state.pool.acquire() as conn:
+        orders = await _load_drop_orders(conn, gid, drop_number)
+
+    data = _build_drop_xlsx(drop_number, orders)
     safe_name = (gname or str(gid)).replace(" ", "_")
     filename = f"{safe_name}_Drop_{drop_number}.xlsx"
     return Response(
-        content=buf.getvalue(),
+        content=data,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": _attachment_disposition(filename)},
     )
 
 
