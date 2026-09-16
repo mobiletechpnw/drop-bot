@@ -19,7 +19,8 @@ bot.
 - **Watch a live drop and mark buyers paid / unpaid on it** — the in-progress
   drop mirrors to the **Live** page while it's running (see below)
 - Search all orders by buyer name or Discord user ID
-- Download a per-drop Excel export
+- Download a per-drop **Excel or CSV export** (same rows, one line per claim —
+  the CSV opens and prints anywhere)
 - Browse **raffles** with per-spot claim/paid status, **create & start a
   raffle** (the bot posts it in Discord within ~15-30s), and mark spots
   paid/unpaid — the buyer gets the same confirmation DM as `/raffle confirm`

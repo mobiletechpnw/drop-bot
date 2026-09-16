@@ -7,8 +7,16 @@ tracking, raffles, and per-user order history — backed by PostgreSQL.
 
 - **`drop_bot.py`** — the Discord bot (`worker` process).
 - **`webapp.py`** — an optional web dashboard for managing records (payments,
-  managers, drop history, orders, shipping tracking) from a browser. See
-  [WEB.md](WEB.md).
+  managers, drop history, orders, shipping tracking) from a browser, with
+  per-drop Excel/CSV exports. See [WEB.md](WEB.md).
+
+## Exporting a drop
+
+From Discord (managers): `!export` for an Excel workbook, `!export csv` for a
+CSV, `!export list` for a printable text list of every buyer's claims, or
+`!claimlist full` for that same full list during a drop — the `!claimlist`
+embed trims once a drop gets busy, the file never does. From the dashboard:
+**Excel** / **CSV** on any closed drop.
 
 ## Running the bot
 
