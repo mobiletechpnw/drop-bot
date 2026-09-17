@@ -2,3 +2,5 @@
 *.pyc
 __pycache__/
 .env
+# Database snapshots from scripts/backup_db.py — they hold access keys.
+backups/
