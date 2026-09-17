@@ -228,3 +228,130 @@ def test_dashboard_csv_matches_the_xlsx_rows():
 def test_dashboard_export_requires_a_session():
     anonymous = type("Request", (), {"app": None, "session": {}})()
     assert asyncio.run(webapp.drop_export_csv(anonymous, 13)).status_code == 303
+
+
+# ── Every claim, grouped by buyer (!claims and the dashboard's Buyers page) ───
+
+HISTORY_KEYS = ["user_id", "user_name", "drop_number", "closed_at", "item_display",
+                "qty", "price", "subtotal", "confirmed", "tracking"]
+CLOSED_AT = __import__("datetime").datetime(2026, 8, 1)
+HISTORY = [
+    (111, "alice", 11, CLOSED_AT, "HOODIE", 1, 50.0, 50.0, True, "1Z111"),
+    (111, "alice", 12, CLOSED_AT, "TEE", 2, 25.0, 50.0, False, None),
+    (222, "bob", 12, CLOSED_AT, "HOODIE", 1, 50.0, 50.0, True, "1Z222"),
+    (333, "Cara", 12, CLOSED_AT, "CAP", 3, 15.0, 45.0, True, None),
+]
+
+
+def _history_rows():
+    return [dict(zip(HISTORY_KEYS, r)) for r in HISTORY]
+
+
+def test_ledgers_group_every_claim_under_its_buyer():
+    ledgers = drop_bot.build_buyer_ledgers(_history_rows())
+    assert [led["name"] for led in ledgers] == ["alice", "bob", "Cara"]
+    alice = ledgers[0]
+    assert [d["drop_number"] for d in alice["drops"]] == [11, 12]
+    assert alice["total"] == 100.0 and alice["paid"] == 50.0
+    assert alice["outstanding"] == 50.0 and alice["items"] == 3
+    assert alice["drops"][0]["tracking"] == "1Z111"
+
+
+def test_ledgers_include_the_drop_still_in_memory():
+    """A live drop isn't in user_claims yet — "every claim" has to cover it."""
+    live_rows = drop_bot.build_buyer_rows(STOCK, CLAIMS, PAID)
+    ledgers = drop_bot.build_buyer_ledgers(_history_rows(), live_drop=(13, live_rows))
+    alice = next(led for led in ledgers if led["user_id"] == 111)
+    live = [d for d in alice["drops"] if d["live"]]
+    assert [d["drop_number"] for d in live] == [13]
+    assert alice["total"] == 200.0          # 100 saved + 100 claimed live
+    assert alice["paid"] == 150.0           # 50 saved + 100 confirmed live
+    assert any(led["user_id"] == 222 for led in ledgers)
+
+
+def test_ledger_text_has_a_section_per_buyer():
+    ledgers = drop_bot.build_buyer_ledgers(_history_rows())
+    text = drop_bot.build_buyer_ledger_text(ledgers, "Store — every claim by buyer")
+    assert "3 buyer(s)" in text
+    for name, uid in (("alice", 111), ("bob", 222), ("Cara", 333)):
+        assert f"{name}  (ID: {uid})" in text
+    assert "Drop #11" in text and "Drop #12" in text
+    assert "1Z222" in text
+
+
+def test_ledger_csv_repeats_the_buyer_on_every_claim():
+    ledgers = drop_bot.build_buyer_ledgers(_history_rows())
+    parsed = list(csv.reader(io.StringIO(drop_bot.build_buyer_ledger_csv(ledgers))))
+    assert parsed[0] == drop_bot.BUYER_CSV_HEADERS
+    assert len(parsed) == 1 + len(HISTORY)
+    assert [r[0] for r in parsed[1:]] == ["alice", "alice", "bob", "Cara"]
+    assert all(r[1] for r in parsed[1:]), "every row carries the user ID"
+
+
+@pytest.mark.parametrize("arg, expected", [
+    ("", (False, None, None, None)),
+    ("csv", (True, None, None, None)),
+    ("<@123456789012345678>", (False, 123456789012345678, None, None)),
+    ("123456789012345678 csv", (True, 123456789012345678, None, None)),
+    ("13", (False, None, 13, None)),
+    ("drop 13", (False, None, 13, None)),
+    ("#13", (False, None, 13, None)),
+    ("banana", (False, None, None, "banana")),
+])
+def test_claims_argument_parsing(arg, expected):
+    assert drop_bot.parse_claims_filter(arg) == expected
+
+
+class _RecordingConn:
+    """Captures the query the dashboard builds so the filter can be asserted."""
+
+    def __init__(self, rows):
+        self.rows, self.query, self.args = rows, None, None
+
+    async def fetch(self, query, *args):
+        self.query, self.args = query, args
+        return self.rows
+
+
+def test_dashboard_buyer_ledgers_group_by_user():
+    conn = _RecordingConn(_history_rows())
+    ledgers = asyncio.run(webapp._load_buyer_ledgers(conn, 42))
+    assert [led["name"] for led in ledgers] == ["alice", "bob", "Cara"]
+    # Newest drop first on the page.
+    assert [d["drop_number"] for d in ledgers[0]["drops"]] == [12, 11]
+    assert ledgers[0]["outstanding"] == 50.0
+    assert "user_name ILIKE" not in conn.query
+
+
+def test_dashboard_buyer_filter_is_pushed_into_the_query():
+    conn = _RecordingConn([])
+    asyncio.run(webapp._load_buyer_ledgers(conn, 42, q="ali"))
+    assert "user_name ILIKE $2" in conn.query and conn.args[1] == "%ali%"
+
+    conn = _RecordingConn([])
+    asyncio.run(webapp._load_buyer_ledgers(conn, 42, q="111"))
+    assert "user_id = $2" in conn.query and conn.args[1] == 111
+
+
+def test_dashboard_buyer_exports_carry_every_claim():
+    request = _fake_request("🔥 Vault Drops")
+
+    class _Pool(_FakePool):
+        @asynccontextmanager
+        async def _acquire(self):
+            yield _RecordingConn(_history_rows())
+
+    request.app.state.pool = _Pool()
+
+    response = asyncio.run(webapp.buyers_export_csv(request))
+    response.headers["content-disposition"].encode("latin-1")
+    parsed = list(csv.reader(io.StringIO(response.body.decode("utf-8-sig"))))
+    assert parsed[0] == webapp.BUYER_CSV_HEADERS
+    assert [r[0] for r in parsed[1:]] == ["alice", "alice", "bob", "Cara"]
+
+    response = asyncio.run(webapp.buyers_export_xlsx(request))
+    wb = openpyxl.load_workbook(io.BytesIO(response.body))
+    assert wb.sheetnames == ["Buyers", "Claims"]
+    summary = [r for r in wb["Buyers"].iter_rows(values_only=True)]
+    assert summary[1][:4] == ("alice", "111", 2, 3)
+    assert len([r for r in wb["Claims"].iter_rows(values_only=True)]) == 1 + len(HISTORY)

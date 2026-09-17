@@ -12,11 +12,17 @@ tracking, raffles, and per-user order history — backed by PostgreSQL.
 
 ## Exporting a drop
 
-From Discord (managers): `!export` for an Excel workbook, `!export csv` for a
-CSV, `!export list` for a printable text list of every buyer's claims, or
-`!claimlist full` for that same full list during a drop — the `!claimlist`
-embed trims once a drop gets busy, the file never does. From the dashboard:
-**Excel** / **CSV** on any closed drop.
+**One drop.** From Discord (managers): `!export` for an Excel workbook,
+`!export csv` for a CSV, `!export list` for a printable text list of every
+buyer's claims, or `!claimlist full` for that same full list during a drop —
+the `!claimlist` embed trims once a drop gets busy, the file never does. From
+the dashboard: **Excel** / **CSV** on any closed drop.
+
+**Every claim, grouped by buyer.** `!claims` DMs the whole roster: one section
+per buyer with every claim they have ever made, across every drop, including
+the one still running. `!claims csv` for a spreadsheet, `!claims @user` for a
+single buyer, `!claims 13` for a single drop. The dashboard has the same thing
+under **Buyers**, with Excel and CSV exports.
 
 ## Running the bot
 

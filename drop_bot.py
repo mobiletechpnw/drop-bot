@@ -54,6 +54,8 @@ MANAGER / ADMIN COMMANDS (server or DM after !drop)
     !export                          — Generate Excel spreadsheet: orders, payments, raffles (DM)
     !export csv                      — Same claims as a CSV file (DM)
     !export list                     — Printable text list of every buyer's claims (DM)
+    !claims                          — EVERY claim in the server, grouped by buyer (DM)
+    !claims csv | @user | <drop #>   — Same list as CSV, for one buyer, or for one drop
     !addtracking @user <tracking#>   — Attach a tracking number and notify the buyer
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -101,6 +103,7 @@ import json
 import logging
 import os
 import random
+import re
 import asyncpg
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -5244,6 +5247,273 @@ async def cmd_export(ctx, *, arg=""):
         + (" | Previous Drop" if previous_rows else "")
         + "\n💡  `!export csv` for a CSV, `!export list` for a printable claim list.",
         buf.getvalue(), f"{stem}.xlsx",
+    )
+
+
+# ── Every claim, grouped by buyer ─────────────────────────────────────────────
+#
+# The per-drop exports above cover one drop. This covers the whole server: one
+# section per buyer, every claim they have ever made, read from user_claims (the
+# same table the dashboard reads) plus the in-progress drop, which isn't saved
+# until it closes.
+
+
+async def load_claim_history(guild_id):
+    """Every saved claim for a guild, oldest drop first."""
+    if db_pool is None:
+        return []
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT user_id, user_name, drop_number, closed_at, item_display,
+                   qty, price, subtotal, confirmed, tracking
+            FROM user_claims
+            WHERE guild_id = $1
+            ORDER BY drop_number, user_name, item_display
+        """, guild_id)
+    return [dict(r) for r in rows]
+
+
+def build_buyer_ledgers(history_rows, live_drop=None):
+    """Group claims into one ledger per buyer.
+
+    `live_drop` is an optional (drop_number, rows) pair from build_buyer_rows()
+    for a drop that hasn't been saved yet, so "every claim" really means every
+    claim and not just the closed ones.
+    """
+    ledgers = {}
+
+    def ledger_for(uid, name):
+        led = ledgers.setdefault(uid, {
+            "user_id": uid, "name": name, "drops": {},
+            "total": 0.0, "paid": 0.0, "items": 0,
+        })
+        if name:
+            led["name"] = name  # later drops win — buyers rename themselves
+        return led
+
+    def drop_for(led, number, closed_at=None, live=False):
+        return led["drops"].setdefault(number, {
+            "drop_number": number, "closed_at": closed_at, "live": live,
+            "items": [], "total": 0.0, "paid": 0.0, "tracking": "",
+        })
+
+    for r in history_rows:
+        led = ledger_for(r["user_id"], r["user_name"])
+        drop = drop_for(led, r["drop_number"], r["closed_at"])
+        subtotal = float(r["subtotal"])
+        drop["items"].append({
+            "display":   r["item_display"],
+            "qty":       r["qty"],
+            "price":     float(r["price"]),
+            "subtotal":  subtotal,
+            "confirmed": bool(r["confirmed"]),
+        })
+        drop["total"] += subtotal
+        if r["confirmed"]:
+            drop["paid"] += subtotal
+        if r["tracking"] and not drop["tracking"]:
+            drop["tracking"] = r["tracking"]
+        led["total"] += subtotal
+        led["items"] += r["qty"]
+        if r["confirmed"]:
+            led["paid"] += subtotal
+
+    if live_drop:
+        number, rows = live_drop
+        for r in rows:
+            led = ledger_for(r["user_id"], r["name"])
+            drop = drop_for(led, number, live=True)
+            drop["tracking"] = r["tracking"]
+            for item in r["items"]:
+                drop["items"].append({
+                    "display":   item["display"],
+                    "qty":       item["qty"],
+                    "price":     item["price"],
+                    "subtotal":  item["subtotal"],
+                    "confirmed": r["status"] == "Paid",
+                })
+                led["items"] += item["qty"]
+            drop["total"] += r["owed"]
+            # Payments on a live drop are amounts, not a per-item flag.
+            drop["paid"] += min(r["confirmed"], r["owed"])
+            led["total"] += r["owed"]
+            led["paid"] += min(r["confirmed"], r["owed"])
+
+    out = []
+    for led in ledgers.values():
+        led["drops"] = sorted(led["drops"].values(), key=lambda d: d["drop_number"])
+        led["outstanding"] = max(led["total"] - led["paid"], 0.0)
+        out.append(led)
+    out.sort(key=lambda led: str(led["name"]).lower())
+    return out
+
+
+def build_buyer_ledger_text(ledgers, heading):
+    """The whole roster as plain text: one section per buyer, nothing trimmed."""
+    out = [heading, "=" * len(heading)]
+    if not ledgers:
+        out += ["", "No claims on record."]
+        return "\n".join(out) + "\n"
+
+    total = sum(led["total"] for led in ledgers)
+    paid  = sum(led["paid"] for led in ledgers)
+    items = sum(led["items"] for led in ledgers)
+    drops = {d["drop_number"] for led in ledgers for d in led["drops"]}
+    out += [
+        f"{len(ledgers)} buyer(s)  ·  {items} item(s)  ·  {len(drops)} drop(s)",
+        f"Claimed ${total:.2f}  ·  Paid ${paid:.2f}  ·  Outstanding ${max(total - paid, 0):.2f}",
+        "",
+    ]
+
+    for i, led in enumerate(ledgers, 1):
+        out.append(f"{i}. {led['name']}  (ID: {led['user_id']})")
+        out.append(
+            f"   {len(led['drops'])} drop(s)  ·  {led['items']} item(s)  ·  "
+            f"claimed ${led['total']:.2f}  ·  paid ${led['paid']:.2f}  ·  "
+            f"outstanding ${led['outstanding']:.2f}"
+        )
+        for drop in led["drops"]:
+            when = drop["closed_at"].strftime("%b %d, %Y") if drop["closed_at"] else ""
+            tag = "  (live — not closed yet)" if drop["live"] else (f"  ({when})" if when else "")
+            out.append(f"   Drop #{drop['drop_number']}{tag}")
+            for item in drop["items"]:
+                mark = "✅" if item["confirmed"] else "❌"
+                out.append(
+                    f"        {item['qty']} x {item['display']}"
+                    f"  @ ${item['price']:.2f}  =  ${item['subtotal']:.2f}   {mark}"
+                )
+            line = f"        Drop total ${drop['total']:.2f}   paid ${drop['paid']:.2f}"
+            if drop["tracking"]:
+                line += f"   tracking {drop['tracking']}"
+            out.append(line)
+        out.append("")
+    return "\n".join(out) + "\n"
+
+
+BUYER_CSV_HEADERS = ["Buyer", "User ID", "Drop", "Closed", "Item", "Qty",
+                     "Unit Price", "Subtotal", "Paid", "Tracking #",
+                     "Buyer Total", "Buyer Paid", "Buyer Outstanding"]
+
+
+def build_buyer_ledger_csv(ledgers):
+    """Every claim as one row, buyer repeated so it sorts and pivots."""
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(BUYER_CSV_HEADERS)
+    for led in ledgers:
+        for drop in led["drops"]:
+            for item in drop["items"]:
+                writer.writerow([
+                    led["name"], str(led["user_id"]), drop["drop_number"],
+                    drop["closed_at"].strftime("%Y-%m-%d") if drop["closed_at"] else "live",
+                    item["display"], item["qty"],
+                    f"{item['price']:.2f}", f"{item['subtotal']:.2f}",
+                    "Yes" if item["confirmed"] else "No",
+                    drop["tracking"],
+                    f"{led['total']:.2f}", f"{led['paid']:.2f}",
+                    f"{led['outstanding']:.2f}",
+                ])
+    return buf.getvalue()
+
+
+async def load_buyer_ledgers(guild_id):
+    """Every claim for a guild — saved history plus the drop still in memory."""
+    history = await load_claim_history(guild_id)
+    saved_drops = {r["drop_number"] for r in history}
+
+    live_drop = None
+    stock_ref, claims_ref, payments_ref, from_archive = export_refs(guild_id)
+    number = await exported_drop_number(guild_id, from_archive)
+    if number and number not in saved_drops:
+        rows = build_buyer_rows(stock_ref, claims_ref, payments_ref)
+        if rows:
+            live_drop = (number, rows)
+    return build_buyer_ledgers(history, live_drop)
+
+
+def parse_claims_filter(arg):
+    """Read `!claims` arguments: (as_csv, user_id, drop_number, unknown_token)."""
+    as_csv = False
+    user_id = drop_number = unknown = None
+    for token in arg.split():
+        low = token.lower()
+        if low in ("csv", "excel", "sheet"):
+            as_csv = True
+            continue
+        if low in ("drop", "#", "user", "buyer", "list", "all", "full", "text", "txt"):
+            continue
+        mention = re.fullmatch(r"<@!?(\d+)>", token)
+        digits = mention.group(1) if mention else token.lstrip("#")
+        if not digits.isdigit():
+            unknown = token
+            continue
+        # Discord IDs are 17-19 digits; drop numbers are small.
+        if mention or len(digits) >= 15:
+            user_id = int(digits)
+        else:
+            drop_number = int(digits)
+    return as_csv, user_id, drop_number, unknown
+
+
+@bot.command(name="claims")
+async def cmd_claims(ctx, *, arg=""):
+    """DM every claim in this server, grouped by buyer.
+
+    `!claims`        → every buyer, every drop
+    `!claims csv`    → the same as a spreadsheet-ready CSV
+    `!claims @user`  → one buyer's full history
+    `!claims 13`     → just drop #13
+    """
+    if not ctx.guild:
+        await ctx.author.send("⚠️  Please run `!claims` in your server channel.")
+        return
+    guild_id = ctx.guild.id
+    if not is_manager(guild_id, ctx.author.id):
+        return
+    await silent(ctx)
+
+    as_csv, user_id, drop_number, unknown = parse_claims_filter(arg)
+    if unknown:
+        await dm(ctx, f"⚠️  I didn't understand `{unknown}`. Try `!claims`, "
+                      f"`!claims csv`, `!claims @user`, or `!claims 13`.")
+        return
+
+    ledgers = await load_buyer_ledgers(guild_id)
+    scope = "every claim by buyer"
+    if user_id is not None:
+        ledgers = [led for led in ledgers if led["user_id"] == user_id]
+        scope = f"claims by user {user_id}"
+    if drop_number is not None:
+        ledgers = [
+            dict(led, drops=[d for d in led["drops"] if d["drop_number"] == drop_number])
+            for led in ledgers
+        ]
+        ledgers = [led for led in ledgers if led["drops"]]
+        for led in ledgers:  # totals should describe the filtered drop only
+            led["total"] = sum(d["total"] for d in led["drops"])
+            led["paid"] = sum(d["paid"] for d in led["drops"])
+            led["items"] = sum(i["qty"] for d in led["drops"] for i in d["items"])
+            led["outstanding"] = max(led["total"] - led["paid"], 0.0)
+        scope = f"Drop #{drop_number} claims by buyer"
+
+    if not ledgers:
+        await dm(ctx, "⚠️  No claims on record for that.")
+        return
+
+    date_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+    heading = f"{ctx.guild.name} — {scope} ({date_str})"
+    stem = f"VaultDrop_{ctx.guild.name.replace(' ', '_')}_claims_by_buyer"
+    if as_csv:
+        payload, filename = build_buyer_ledger_csv(ledgers).encode("utf-8"), f"{stem}.csv"
+    else:
+        payload, filename = build_buyer_ledger_text(ledgers, heading).encode("utf-8"), f"{stem}.txt"
+
+    claim_count = sum(len(d["items"]) for led in ledgers for d in led["drops"])
+    await _dm_export_file(
+        ctx,
+        f"🧾  **{heading}**\n{len(ledgers)} buyer(s), {claim_count} claim(s) — "
+        f"nothing trimmed." + ("" if as_csv else "\n💡  `!claims csv` for a spreadsheet."),
+        payload, filename,
     )
 
 

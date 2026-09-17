@@ -19,6 +19,9 @@ bot.
 - **Watch a live drop and mark buyers paid / unpaid on it** — the in-progress
   drop mirrors to the **Live** page while it's running (see below)
 - Search all orders by buyer name or Discord user ID
+- **Claims by buyer** (`/buyers`): every claim on record grouped into one
+  section per buyer — every drop they bought in, what they paid, their
+  tracking — with Excel and CSV exports of the same, filterable by name or ID
 - Download a per-drop **Excel or CSV export** (same rows, one line per claim —
   the CSV opens and prints anywhere)
 - Browse **raffles** with per-spot claim/paid status, **create & start a
