@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}Buyers{% endblock %}
+{% block content %}
+<div class="row-between">
+  <h1>Claims by buyer</h1>
+  <div class="btn-row">
+    <a class="btn ghost" href="/buyers/export.xlsx{% if q %}?q={{ q | urlencode }}{% endif %}">⬇ Excel</a>
+    <a class="btn ghost" href="/buyers/export.csv{% if q %}?q={{ q | urlencode }}{% endif %}">⬇ CSV</a>
+  </div>
+</div>
+<p class="muted">Every claim on record, grouped by buyer — across every closed drop.</p>
+
+<form method="get" action="/buyers" class="inline-form">
+  <input name="q" value="{{ q }}" placeholder="Filter by buyer name or Discord user ID" autocomplete="off">
+  <button type="submit">Filter</button>
+  {% if q %}<a class="btn small ghost" href="/buyers">Clear</a>{% endif %}
+</form>
+
+{% if buyers %}
+<p class="muted small">{{ buyers | length }} buyer{{ '' if buyers | length == 1 else 's' }} ·
+  {{ claim_count }} claim{{ '' if claim_count == 1 else 's' }} ·
+  {{ total | money }} claimed · {{ outstanding | money }} outstanding</p>
+
+{% for b in buyers %}
+<details class="buyer-block" {% if buyers | length <= 3 %}open{% endif %}>
+  <summary>
+    <span class="buyer">{{ b.name }}</span>
+    <code class="muted small">{{ b.user_id }}</code>
+    <span class="muted small">{{ b.drops | length }} drop{{ '' if b.drops | length == 1 else 's' }} ·
+      {{ b.items }} item{{ '' if b.items == 1 else 's' }}</span>
+    <span class="money">{{ b.total | money }}</span>
+    {% if b.outstanding > 0.009 %}
+      <span class="pill warn">{{ b.outstanding | money }} owed</span>
+    {% else %}
+      <span class="pill ok">Paid</span>
+    {% endif %}
+  </summary>
+
+  {% for d in b.drops %}
+  <div class="drop-block">
+    <div class="row-between">
+      <strong><a href="/drops/{{ d.drop_number }}">Drop #{{ d.drop_number }}</a></strong>
+      <span class="muted small">
+        {% if d.closed_at %}{{ d.closed_at.strftime('%b %d, %Y') }} · {% endif %}
+        {{ d.total | money }}{% if d.tracking %} · tracking <code>{{ d.tracking }}</code>{% endif %}
+      </span>
+    </div>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>Item</th><th class="right">Qty</th><th class="right">Unit</th><th class="right">Subtotal</th><th>Paid</th></tr></thead>
+      <tbody>
+        {% for item in d['items'] %}
+        <tr>
+          <td>{{ item.display }}</td>
+          <td class="right">{{ item.qty }}</td>
+          <td class="right money">{{ item.price | money }}</td>
+          <td class="right money">{{ item.subtotal | money }}</td>
+          <td>{% if item.confirmed %}<span class="pill ok">Paid</span>{% else %}<span class="pill warn">Pending</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </div>
+  {% endfor %}
+</details>
+{% endfor %}
+
+{% else %}
+<div class="empty">
+  <div class="ico">🧾</div>
+  <h3>{% if q %}No buyers matched “{{ q }}”{% else %}No claims yet{% endif %}</h3>
+  <p>{% if q %}Try a different spelling, a partial name, or the buyer's Discord user ID.
+    {% else %}Once a drop closes in Discord, every buyer's claims land here and in the
+    Excel/CSV exports.{% endif %}</p>
+  {% if q %}<div class="actions"><a class="btn" href="/buyers">Show every buyer</a></div>{% endif %}
+</div>
+{% endif %}
+{% endblock %}

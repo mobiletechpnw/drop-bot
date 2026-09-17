@@ -118,7 +118,8 @@ def test_core_commands_registered():
     names = {c.name for c in drop_bot.bot.commands}
     expected = {
         "drop", "release", "enddrop", "paid", "confirm", "addtracking",
-        "myhistory", "export", "paymentboard", "claimlist", "stock", "announce",
+        "myhistory", "export", "claims", "paymentboard", "claimlist", "stock",
+        "announce",
     }
     missing = expected - names
     assert not missing, f"missing commands: {sorted(missing)}"

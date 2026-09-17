@@ -25,11 +25,14 @@ Env:  DATABASE_URL (required, shared with the bot)
       PORT         (provided by the host)
 """
 
+import csv
 import datetime
 import io
 import json
 import os
+import re
 import secrets
+import unicodedata
 from contextlib import asynccontextmanager
 from urllib.parse import quote, quote_plus
 
@@ -1059,7 +1062,52 @@ async def raffle_detail(request: Request, name: str, msg: str = ""):
     ))
 
 
-# ── Excel export ──────────────────────────────────────────────────────────────
+# ── Excel / CSV export ────────────────────────────────────────────────────────
+
+EXPORT_HEADERS = ["Buyer", "User ID", "Item", "Qty", "Subtotal",
+                  "Order Total", "Paid", "Tracking #"]
+
+
+def _attachment_disposition(filename: str) -> str:
+    """Content-Disposition for a download, safe for any store name.
+
+    HTTP headers are latin-1 only, so a server whose Discord name contains an
+    emoji — or an em dash, or a curly quote — used to make Starlette raise
+    UnicodeEncodeError while building the response, and the download just 500'd.
+    Send a sanitised ASCII name plus the real one via RFC 5987 filename*, which
+    every current browser prefers.
+    """
+    ascii_name = (unicodedata.normalize("NFKD", filename)
+                  .encode("ascii", "ignore").decode("ascii"))
+    ascii_name = re.sub(r"[^A-Za-z0-9._-]+", "_", ascii_name).strip("._-")
+    if not ascii_name:
+        ascii_name = "export"
+    return (f'attachment; filename="{ascii_name}"; '
+            f"filename*=UTF-8''{quote(filename, safe='')}")
+
+
+def _export_filename(gname, gid, what, ext):
+    return f"{gname or gid}_{what}.{ext}"
+
+
+def _export_rows(orders):
+    """One row per claim line — the buyer's details on their first line only,
+    which is how both the spreadsheet and the CSV read."""
+    for o in orders:
+        first = True
+        for item in o["items"]:
+            yield [
+                o["name"] if first else "",
+                str(o["user_id"]) if first else "",
+                item["display"],
+                item["qty"],
+                round(item["subtotal"], 2),
+                round(o["total"], 2) if first else "",
+                ("Yes" if o["confirmed"] else "No") if first else "",
+                o["tracking"] if first else "",
+            ]
+            first = False
+
 
 @app.get("/drops/{drop_number}/export.xlsx")
 async def drop_export(request: Request, drop_number: int):
@@ -1072,31 +1120,20 @@ async def drop_export(request: Request, drop_number: int):
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = f"Drop {drop_number}"
+    ws.freeze_panes = "A2"
     header_fill = PatternFill("solid", fgColor="1E1E2E")
     header_font = Font(bold=True, color="FFFFFF")
-    headers = ["Buyer", "User ID", "Item", "Qty", "Subtotal",
-               "Order Total", "Paid", "Tracking #"]
-    ws.append(headers)
-    for col in range(1, len(headers) + 1):
+    ws.append(EXPORT_HEADERS)
+    for col in range(1, len(EXPORT_HEADERS) + 1):
         c = ws.cell(row=1, column=col)
         c.fill = header_fill
         c.font = header_font
         c.alignment = Alignment(horizontal="center")
 
-    for o in orders:
-        first = True
-        for item in o["items"]:
-            ws.append([
-                o["name"] if first else "",
-                str(o["user_id"]) if first else "",
-                item["display"],
-                item["qty"],
-                round(item["subtotal"], 2),
-                round(o["total"], 2) if first else "",
-                ("Yes" if o["confirmed"] else "No") if first else "",
-                o["tracking"] if first else "",
-            ])
-            first = False
+    for row in _export_rows(orders):
+        ws.append(row)
+        for col in (5, 6):  # Subtotal / Order Total read as money, not bare numbers
+            ws.cell(row=ws.max_row, column=col).number_format = "$#,##0.00"
 
     for col_cells in ws.columns:
         width = max((len(str(c.value)) for c in col_cells if c.value is not None),
@@ -1105,14 +1142,209 @@ async def drop_export(request: Request, drop_number: int):
 
     buf = io.BytesIO()
     wb.save(buf)
-    buf.seek(0)
-    safe_name = (gname or str(gid)).replace(" ", "_")
-    filename = f"{safe_name}_Drop_{drop_number}.xlsx"
     return Response(
         content=buf.getvalue(),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": _attachment_disposition(
+            _export_filename(gname, gid, f"Drop_{drop_number}", "xlsx"))},
     )
+
+
+@app.get("/drops/{drop_number}/export.csv")
+async def drop_export_csv(request: Request, drop_number: int):
+    """The same rows as the Excel export, as CSV — opens (and prints) anywhere."""
+    gid, gname = _session_guild(request)
+    if gid is None:
+        return _redirect_login()
+    async with request.app.state.pool.acquire() as conn:
+        orders = await _load_drop_orders(conn, gid, drop_number)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(EXPORT_HEADERS)
+    for row in _export_rows(orders):
+        # Money reads as 125.00, not 125.0 — the Excel sheet gets that from its
+        # cell format, a CSV has to carry it in the text.
+        writer.writerow([f"{v:.2f}" if isinstance(v, float) else v for v in row])
+
+    return Response(
+        # BOM so Excel opens a UTF-8 CSV with accents/emoji in buyer names intact.
+        content=buf.getvalue().encode("utf-8-sig"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": _attachment_disposition(
+            _export_filename(gname, gid, f"Drop_{drop_number}", "csv"))},
+    )
+
+
+# ── Buyers: every claim, grouped by user ──────────────────────────────────────
+
+BUYER_CSV_HEADERS = ["Buyer", "User ID", "Drop", "Closed", "Item", "Qty",
+                     "Unit Price", "Subtotal", "Paid", "Tracking #",
+                     "Buyer Total", "Buyer Paid", "Buyer Outstanding"]
+
+
+async def _load_buyer_ledgers(conn, guild_id, q=""):
+    """Every saved claim for the server, grouped into one ledger per buyer.
+
+    The per-drop pages answer "who is in this drop"; this answers "what has this
+    buyer ever claimed", for every buyer at once.
+    """
+    q = (q or "").strip()
+    sql = """SELECT user_id, user_name, drop_number, closed_at, item_display,
+                    qty, price, subtotal, confirmed, tracking
+             FROM user_claims WHERE guild_id = $1"""
+    args = [guild_id]
+    if q.isdigit():
+        sql += " AND user_id = $2"
+        args.append(int(q))
+    elif q:
+        sql += " AND user_name ILIKE $2"
+        args.append(f"%{q}%")
+    sql += " ORDER BY drop_number, item_display"
+    rows = await conn.fetch(sql, *args)
+
+    ledgers = {}
+    for r in rows:
+        led = ledgers.setdefault(r["user_id"], {
+            "user_id": r["user_id"], "name": r["user_name"], "drops": {},
+            "total": 0.0, "paid": 0.0, "items": 0,
+        })
+        led["name"] = r["user_name"] or led["name"]  # latest drop's name wins
+        drop = led["drops"].setdefault(r["drop_number"], {
+            "drop_number": r["drop_number"], "closed_at": r["closed_at"],
+            "items": [], "total": 0.0, "paid": 0.0, "tracking": "",
+        })
+        subtotal = float(r["subtotal"])
+        drop["items"].append({
+            "display": r["item_display"], "qty": r["qty"],
+            "price": float(r["price"]), "subtotal": subtotal,
+            "confirmed": bool(r["confirmed"]),
+        })
+        drop["total"] += subtotal
+        led["total"] += subtotal
+        led["items"] += r["qty"]
+        if r["confirmed"]:
+            drop["paid"] += subtotal
+            led["paid"] += subtotal
+        if r["tracking"] and not drop["tracking"]:
+            drop["tracking"] = r["tracking"]
+
+    out = []
+    for led in ledgers.values():
+        led["drops"] = sorted(led["drops"].values(), key=lambda d: d["drop_number"],
+                              reverse=True)
+        led["outstanding"] = max(led["total"] - led["paid"], 0.0)
+        out.append(led)
+    out.sort(key=lambda led: str(led["name"]).lower())
+    return out
+
+
+def _buyer_claim_rows(ledgers):
+    """One row per claim, with the buyer repeated so it sorts and pivots."""
+    for led in ledgers:
+        for drop in led["drops"]:
+            for item in drop["items"]:
+                yield [
+                    led["name"], str(led["user_id"]), drop["drop_number"],
+                    drop["closed_at"].strftime("%Y-%m-%d") if drop["closed_at"] else "",
+                    item["display"], item["qty"],
+                    f"{item['price']:.2f}", f"{item['subtotal']:.2f}",
+                    "Yes" if item["confirmed"] else "No", drop["tracking"],
+                    f"{led['total']:.2f}", f"{led['paid']:.2f}",
+                    f"{led['outstanding']:.2f}",
+                ]
+
+
+@app.get("/buyers")
+async def buyers_list(request: Request, q: str = ""):
+    gid, gname = _session_guild(request)
+    if gid is None:
+        return _redirect_login()
+    async with request.app.state.pool.acquire() as conn:
+        ledgers = await _load_buyer_ledgers(conn, gid, q)
+    return templates.TemplateResponse(request, "buyers.html", _ctx(
+        request, gid, gname, q=q, buyers=ledgers,
+        total=sum(b["total"] for b in ledgers),
+        outstanding=sum(b["outstanding"] for b in ledgers),
+        claim_count=sum(len(d["items"]) for b in ledgers for d in b["drops"]),
+    ))
+
+
+@app.get("/buyers/export.csv")
+async def buyers_export_csv(request: Request, q: str = ""):
+    gid, gname = _session_guild(request)
+    if gid is None:
+        return _redirect_login()
+    async with request.app.state.pool.acquire() as conn:
+        ledgers = await _load_buyer_ledgers(conn, gid, q)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(BUYER_CSV_HEADERS)
+    for row in _buyer_claim_rows(ledgers):
+        writer.writerow(row)
+    return Response(
+        content=buf.getvalue().encode("utf-8-sig"),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": _attachment_disposition(
+            _export_filename(gname, gid, "claims_by_buyer", "csv"))},
+    )
+
+
+@app.get("/buyers/export.xlsx")
+async def buyers_export_xlsx(request: Request, q: str = ""):
+    """Two sheets: one row per buyer, and every claim behind those totals."""
+    gid, gname = _session_guild(request)
+    if gid is None:
+        return _redirect_login()
+    async with request.app.state.pool.acquire() as conn:
+        ledgers = await _load_buyer_ledgers(conn, gid, q)
+
+    header_fill = PatternFill("solid", fgColor="1E1E2E")
+    header_font = Font(bold=True, color="FFFFFF")
+    money = "$#,##0.00"
+
+    def finish(ws, money_cols):
+        for col in range(1, ws.max_column + 1):
+            c = ws.cell(row=1, column=col)
+            c.fill = header_fill
+            c.font = header_font
+            c.alignment = Alignment(horizontal="center")
+        for row in range(2, ws.max_row + 1):
+            for col in money_cols:
+                ws.cell(row=row, column=col).number_format = money
+        for col_cells in ws.columns:
+            width = max((len(str(c.value)) for c in col_cells if c.value is not None),
+                        default=10)
+            ws.column_dimensions[col_cells[0].column_letter].width = min(width + 3, 45)
+        ws.freeze_panes = "A2"
+
+    wb = openpyxl.Workbook()
+    ws1 = wb.active
+    ws1.title = "Buyers"
+    ws1.append(["Buyer", "User ID", "Drops", "Items", "Claimed", "Paid", "Outstanding"])
+    for led in ledgers:
+        ws1.append([led["name"], str(led["user_id"]), len(led["drops"]), led["items"],
+                    round(led["total"], 2), round(led["paid"], 2),
+                    round(led["outstanding"], 2)])
+    finish(ws1, (5, 6, 7))
+
+    ws2 = wb.create_sheet("Claims")
+    ws2.append(BUYER_CSV_HEADERS)
+    for row in _buyer_claim_rows(ledgers):
+        ws2.append(row[:6] + [float(row[6]), float(row[7])] + row[8:10]
+                   + [float(row[10]), float(row[11]), float(row[12])])
+    finish(ws2, (7, 8, 11, 12, 13))
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": _attachment_disposition(
+            _export_filename(gname, gid, "claims_by_buyer", "xlsx"))},
+    )
+
 
 
 @app.get("/healthz")

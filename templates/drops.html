@@ -17,6 +17,7 @@
       <td class="right">
         <a class="btn small" href="/drops/{{ d.drop_number }}">View</a>
         <a class="btn small ghost" href="/drops/{{ d.drop_number }}/export.xlsx">Excel</a>
+        <a class="btn small ghost" href="/drops/{{ d.drop_number }}/export.csv">CSV</a>
       </td>
     </tr>
     {% endfor %}
@@ -28,7 +29,7 @@
   <div class="ico">📦</div>
   <h3>No closed drops yet</h3>
   <p>Once you close a drop in Discord it lands here with full order and
-    payment detail, plus a one-click Excel export.</p>
+    payment detail, plus one-click Excel and CSV exports.</p>
   <div class="actions">
     <a class="btn" href="/live">Watch a live drop</a>
   </div>
