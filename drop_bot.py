@@ -58,6 +58,10 @@ MANAGER / ADMIN COMMANDS (server or DM after !drop)
     !claims csv | @user | <drop #>   — Same list as CSV, for one buyer, or for one drop
     !addtracking @user <tracking#>   — Attach a tracking number and notify the buyer
 
+  Web dashboard:
+    !webkey                          — DM yourself this server's dashboard login key
+    !webkey reset                    — Mint a new key and invalidate the old one
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PUBLIC COMMANDS (anyone, in server only)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -104,6 +108,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import asyncpg
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -115,6 +120,9 @@ log = logging.getLogger("dropbot")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 CREATOR_ID = int(os.environ.get("CREATOR_ID", "0"))  # Bot creator — cross-server super admin
+# Public URL of the web dashboard, if it's deployed. Only used so !webkey can
+# hand out a direct login link instead of just the key.
+WEB_BASE_URL = os.environ.get("WEB_BASE_URL", "").rstrip("/")
 PREFIX = "!"
 
 intents = discord.Intents.default()
@@ -216,6 +224,39 @@ async def init_db():
         """)
         await conn.execute(
             "ALTER TABLE pending_actions ADD COLUMN IF NOT EXISTS drop_number INT"
+        )
+        # DM outbox shared with the web dashboard: the dashboard enqueues buyer
+        # notifications (tracking numbers, raffle confirmations) and the bot
+        # delivers them. Created here too, same reasoning as pending_actions.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_notifications (
+                id         SERIAL PRIMARY KEY,
+                guild_id   BIGINT NOT NULL,
+                user_id    BIGINT NOT NULL,
+                message    TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+                sent_at    TIMESTAMP
+            )
+        """)
+        # Delivery attempts, so a DM that keeps failing is retried a few times
+        # and then dropped instead of being retried forever.
+        await conn.execute(
+            "ALTER TABLE pending_notifications "
+            "ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0"
+        )
+        # Dashboard login: !webkey mints the per-server access key, and the
+        # guild name gives the dashboard something friendlier than a raw ID.
+        await conn.execute(
+            "ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS web_access_key TEXT"
+        )
+        await conn.execute(
+            "ALTER TABLE server_settings ADD COLUMN IF NOT EXISTS guild_name TEXT"
+        )
+        # The dashboard looks a server up by key alone, so a key must never be
+        # shared by two servers.
+        await conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS server_settings_web_access_key_idx "
+            "ON server_settings (web_access_key) WHERE web_access_key IS NOT NULL"
         )
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS raffles (
@@ -537,6 +578,46 @@ async def db_save_settings(guild_id):
             s.get("raffle_channel_id"),
         )
 
+
+async def db_get_web_key(guild_id):
+    """The server's existing dashboard key, or None if it has never had one."""
+    if db_pool is None:
+        return None
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT web_access_key FROM server_settings WHERE guild_id = $1",
+            guild_id,
+        )
+    return row["web_access_key"] if row else None
+
+
+async def db_set_web_key(guild_id, guild_name=None):
+    """Mint a fresh dashboard access key for a server and return it.
+
+    Replaces any existing key, which is what makes `!webkey reset` a real
+    revocation. The guild name rides along so the dashboard can show it.
+    """
+    key = secrets.token_urlsafe(32)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO server_settings (guild_id, web_access_key, guild_name)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (guild_id) DO UPDATE SET
+                web_access_key = $2,
+                guild_name     = COALESCE($3, server_settings.guild_name)
+        """, guild_id, key, guild_name)
+    return key
+
+
+async def db_get_or_create_web_key(guild_id, guild_name=None, reset=False):
+    """Return the server's dashboard key, minting one if missing or reset."""
+    if not reset:
+        existing = await db_get_web_key(guild_id)
+        if existing:
+            return existing
+    return await db_set_web_key(guild_id, guild_name)
+
+
 # ── PER-SERVER STATE ──────────────────────────────────────────────────────────
 
 server_admins = {}
@@ -565,6 +646,17 @@ _rehydrated              = False  # guard so payment-drop rehydration runs once
 # mid-await — which previously left the board-update debounce flag stuck True
 # and froze the live boards (e.g. stock stuck showing "1 left" after selling out).
 _bg_tasks = set()
+
+# Dashboard DM outbox tuning. The batch cap keeps a big backlog (e.g. "push
+# tracking to every buyer") from monopolising one poll pass, and the attempt
+# cap stops an undeliverable row being retried forever.
+NOTIFY_BATCH        = 50
+NOTIFY_MAX_ATTEMPTS = 3
+# A queued DM older than this is retired undelivered. In normal running nothing
+# is ever more than ~15s old, so this only fires for rows that were stranded
+# while the bot had no poller at all — and a buyer should not suddenly get a
+# tracking DM for a drop that finished months ago.
+NOTIFY_MAX_AGE_HOURS = 72
 
 
 def spawn(coro):
@@ -1208,9 +1300,10 @@ async def update_all_live_boards(guild_id):
 #
 # The web dashboard shares this bot's PostgreSQL database. Two-way sync works
 # through the DB: the bot mirrors the current live drop into live_drops /
-# live_orders (read by the dashboard's Live page), and the dashboard writes
-# paid/unpaid clicks into the pending_actions outbox, which poll_pending_actions
-# below applies back into the bot's in-memory payments and the Discord board.
+# live_orders (read by the dashboard's Live page), and the dashboard writes to
+# two outboxes that poll_web_outbox below drains — pending_actions (paid/unpaid
+# clicks, folded back into in-memory payments and the Discord board) and
+# pending_notifications (buyer DMs the dashboard queued, e.g. tracking numbers).
 
 def _live_orders_snapshot(guild_id):
     """Per-buyer order rows for the current drop, shaped for the dashboard's
@@ -1441,32 +1534,120 @@ async def apply_pending_action(guild_id, user_id, action, drop_number=None):
     spawn(update_all_live_boards(guild_id))
 
 
-async def poll_pending_actions():
-    """Background loop: drain the dashboard's pending_actions outbox every ~15s."""
+async def _drain_pending_actions():
+    """Apply the dashboard's queued paid/unpaid actions to in-memory state."""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT id, guild_id, user_id, action, drop_number
+            FROM pending_actions WHERE applied_at IS NULL ORDER BY id
+        """)
+    for r in rows:
+        try:
+            await apply_pending_action(
+                r["guild_id"], r["user_id"], r["action"], r["drop_number"]
+            )
+        except Exception as e:
+            log.warning(f"pending_action {r['id']} failed: {e}")
+        # Mark applied either way so a poison row can't wedge the loop.
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE pending_actions SET applied_at = NOW() WHERE id = $1",
+                r["id"],
+            )
+
+
+async def _resolve_dm_target(guild_id, user_id):
+    """Find a user object to DM, falling back to the API when uncached."""
+    user = bot.get_user(user_id)
+    if user is not None:
+        return user
+    guild = bot.get_guild(guild_id)
+    member = guild.get_member(user_id) if guild else None
+    if member is not None:
+        return member
+    return await bot.fetch_user(user_id)
+
+
+async def _drain_pending_notifications():
+    """Deliver the buyer DMs the dashboard queued (tracking numbers, raffle
+    confirmations).
+
+    A DM that fails for a transient reason is retried on later passes; after
+    NOTIFY_MAX_ATTEMPTS it's given up on, so one undeliverable row can't stall
+    the queue behind it. A buyer with DMs closed is a permanent failure and is
+    dropped on the first try — retrying can't help. Anything older than
+    NOTIFY_MAX_AGE_HOURS is retired unsent rather than delivered late.
+    """
+    async with db_pool.acquire() as conn:
+        stale = await conn.execute("""
+            UPDATE pending_notifications SET sent_at = NOW()
+            WHERE sent_at IS NULL
+              AND created_at < NOW() - make_interval(hours => $1)
+        """, NOTIFY_MAX_AGE_HOURS)
+        rows = await conn.fetch("""
+            SELECT id, guild_id, user_id, message, attempts
+            FROM pending_notifications
+            WHERE sent_at IS NULL AND attempts < $1
+            ORDER BY id LIMIT $2
+        """, NOTIFY_MAX_ATTEMPTS, NOTIFY_BATCH)
+    # asyncpg returns the command tag, e.g. "UPDATE 3".
+    retired = int(stale.split()[-1]) if stale and stale.split()[-1].isdigit() else 0
+    if retired:
+        log.warning(
+            f"Retired {retired} dashboard DM(s) queued over "
+            f"{NOTIFY_MAX_AGE_HOURS}h ago without sending them."
+        )
+
+    for r in rows:
+        delivered, permanent, reason = False, False, ""
+        try:
+            user = await _resolve_dm_target(r["guild_id"], r["user_id"])
+            await user.send(r["message"])
+            delivered = True
+        except discord.Forbidden:
+            permanent, reason = True, "buyer has DMs closed"
+        except discord.NotFound:
+            permanent, reason = True, "user no longer exists"
+        except Exception as e:
+            reason = str(e)
+
+        async with db_pool.acquire() as conn:
+            if delivered or permanent:
+                await conn.execute(
+                    "UPDATE pending_notifications SET sent_at = NOW(), "
+                    "attempts = attempts + 1 WHERE id = $1",
+                    r["id"],
+                )
+            else:
+                await conn.execute(
+                    "UPDATE pending_notifications SET attempts = attempts + 1 "
+                    "WHERE id = $1",
+                    r["id"],
+                )
+        if not delivered:
+            last_try = r["attempts"] + 1 >= NOTIFY_MAX_ATTEMPTS
+            outcome = "dropped" if (permanent or last_try) else "failed, will retry"
+            log.warning(
+                f"pending_notification {r['id']} → user {r['user_id']} "
+                f"{outcome}: {reason}"
+            )
+
+
+async def poll_web_outbox():
+    """Background loop: drain the dashboard's outboxes every ~15s.
+
+    Two queues, both written by webapp.py: pending_actions (paid/unpaid marks
+    to fold back into the bot's in-memory drop state) and pending_notifications
+    (buyer DMs the dashboard promised to send).
+    """
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
             if db_pool is not None:
-                async with db_pool.acquire() as conn:
-                    rows = await conn.fetch("""
-                        SELECT id, guild_id, user_id, action, drop_number
-                        FROM pending_actions WHERE applied_at IS NULL ORDER BY id
-                    """)
-                for r in rows:
-                    try:
-                        await apply_pending_action(
-                            r["guild_id"], r["user_id"], r["action"], r["drop_number"]
-                        )
-                    except Exception as e:
-                        log.warning(f"pending_action {r['id']} failed: {e}")
-                    # Mark applied either way so a poison row can't wedge the loop.
-                    async with db_pool.acquire() as conn:
-                        await conn.execute(
-                            "UPDATE pending_actions SET applied_at = NOW() WHERE id = $1",
-                            r["id"],
-                        )
+                await _drain_pending_actions()
+                await _drain_pending_notifications()
         except Exception as e:
-            log.warning(f"poll_pending_actions loop error: {e}")
+            log.warning(f"poll_web_outbox loop error: {e}")
         await asyncio.sleep(15)
 
 
@@ -1831,7 +2012,7 @@ async def on_ready():
     global _web_sync_started
     if not _web_sync_started:
         _web_sync_started = True
-        spawn(poll_pending_actions())
+        spawn(poll_web_outbox())
     log.info(f"Logged in as {bot.user} ({bot.user.id})")
 
 
@@ -2023,6 +2204,82 @@ async def cmd_managers(ctx):
     else:
         lines.append("No additional managers yet.")
     await ctx.send("\n".join(lines))
+
+
+@bot.command(name="webkey")
+async def cmd_webkey(ctx, action: str = ""):
+    """DM the caller this server's web-dashboard access key.
+
+    `!webkey` returns the current key (minting one on first use); `!webkey
+    reset` mints a new one, which immediately invalidates the old key.
+    """
+    guild_id, _ = get_manager_context(ctx)
+    if guild_id is None:
+        if ctx.guild:
+            await silent(ctx)
+            await dm(ctx, "⚠️  Only drop managers can get the dashboard key.")
+        else:
+            await ctx.author.send(
+                "⚠️  Run `!webkey` in your server's channel so I know which "
+                "server's key you mean."
+            )
+        return
+
+    # The key is a password — never let it sit in a channel.
+    await silent(ctx)
+
+    guild = ctx.guild or bot.get_guild(guild_id)
+    reset = action.strip().lower() == "reset"
+    try:
+        key = await db_get_or_create_web_key(
+            guild_id, guild.name if guild else None, reset=reset
+        )
+    except Exception as e:
+        log.warning(f"webkey failed for {guild_id}: {e}")
+        await dm(ctx, "⚠️  Couldn't reach the database — try `!webkey` again in a moment.")
+        return
+
+    heading = (
+        "🔑  **New dashboard key** — the previous one no longer works."
+        if reset else
+        "🔑  **Dashboard access key**"
+    )
+    lines = [
+        heading,
+        f"Server: **{guild.name if guild else guild_id}**",
+        "",
+        f"```\n{key}\n```",
+    ]
+    if WEB_BASE_URL:
+        lines.append(f"Sign in here: {WEB_BASE_URL}/login")
+    else:
+        lines.append("Paste it on the dashboard's login page.")
+    lines += [
+        "",
+        "⚠️  Treat this like a password — anyone with it can manage this "
+        "server's records. Run `!webkey reset` if it ever leaks.",
+    ]
+
+    try:
+        await ctx.author.send("\n".join(lines))
+    except discord.Forbidden:
+        # DMs are closed, so the key has nowhere safe to go. Say so in the
+        # channel — without the key in it.
+        if ctx.guild:
+            await ctx.send(
+                f"{ctx.author.mention} — I couldn't DM you the dashboard key. "
+                "Enable direct messages from server members, then run `!webkey` again.",
+                delete_after=30,
+                allowed_mentions=discord.AllowedMentions(users=True),
+            )
+        return
+
+    if ctx.guild:
+        await ctx.send(
+            f"{ctx.author.mention} — dashboard key sent to your DMs. 📬",
+            delete_after=10,
+            allowed_mentions=discord.AllowedMentions(users=True),
+        )
 
 
 # ── DROP COMMANDS ─────────────────────────────────────────────────────────────

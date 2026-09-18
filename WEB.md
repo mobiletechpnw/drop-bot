@@ -50,7 +50,15 @@ If the buyer has DMs closed, the notification is marked delivered (attempted)
 rather than retried forever; the tracking number itself is still saved and
 visible in `!myhistory` and the dashboard either way. Re-saving the same
 tracking value, or clearing it, does **not** send a DM — only a genuinely new
-value does.
+value does. A DM that fails for a transient reason is retried on the next few
+passes and then given up on, so one bad row can't stall the queue behind it.
+
+Two safety limits on the outbox, both in `drop_bot.py`: one pass sends at most
+`NOTIFY_BATCH` (50) DMs, so a whole-drop push doesn't monopolise a poll, and a
+queued DM older than `NOTIFY_MAX_AGE_HOURS` (72) is retired **unsent**. The age
+limit only matters after the bot has been down or unable to drain the queue for
+days — it stops a backlog turning into a burst of tracking DMs about drops that
+finished long ago. Raise it if you deliberately want an old backlog delivered.
 
 **Pushing DMs for tracking already saved:** because a single save only DMs on a
 *new* value, tracking numbers entered before this notify feature existed — or

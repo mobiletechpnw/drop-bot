@@ -83,6 +83,13 @@ async def ensure_schema(pool):
                created_at TIMESTAMP NOT NULL DEFAULT NOW(),
                sent_at    TIMESTAMP
            )""",
+        # Delivery attempts, read by the bot's outbox poller.
+        "ALTER TABLE pending_notifications "
+        "ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0",
+        # A dashboard key must never be shared by two servers — login looks a
+        # server up by key alone.
+        "CREATE UNIQUE INDEX IF NOT EXISTS server_settings_web_access_key_idx "
+        "ON server_settings (web_access_key) WHERE web_access_key IS NOT NULL",
         # Live-drop mirror (written by the bot) + write-back outbox (written here).
         """CREATE TABLE IF NOT EXISTS live_drops (
                guild_id    BIGINT PRIMARY KEY,
